@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Reference audio / scores / built artifacts are large and project-specific.
+# Keep them outside version control.
+data/scores/*
+data/reference_audio/*
+data/built/*
+!data/scores/.gitkeep
+!data/reference_audio/.gitkeep
+!data/built/.gitkeep
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Plots / scratch
+*.png
+*.pdf
+scratch/
+
+# Claude
+.claude/
