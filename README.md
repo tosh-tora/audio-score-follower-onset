@@ -32,22 +32,35 @@
 
 ## セットアップ
 
-### 1. 環境
+オフラインビルド・本番追随の両方が **Windows ネイティブ**で動く (WSL2 不要)。
+合成は MuseScore 4 CLI に委ねる。
 
-```bash
-# Windows 本番 (オンライン追随用)
+### 1. 前提
+
+- Python 3.10+
+- MuseScore 4 ([公式インストーラ](https://musescore.org/ja/download)、無料)
+  - 自動検出パス: `C:\Program Files\MuseScore 4\bin\MuseScore4.exe`
+  - 別の場所にある場合は環境変数 `MSCORE_EXE` か `--mscore-exe` で指定
+
+### 2. Python 環境
+
+```powershell
 python -m venv .venv
 .venv\Scripts\activate
-pip install -e .
+pip install -e ".[dev]"
 playwright install chromium
-
-# WSL2 (オフラインビルド用 — pymatchmaker の合成エンジン依存)
-python -m venv .venv-wsl
-source .venv-wsl/bin/activate
-pip install -e ".[synth,dev]"
 ```
 
-### 2. ディレクトリ配置
+**synctoolbox の注意**: 上記 `pip install` で synctoolbox は古い numpy / pandas / music21 を
+要求して解決に失敗することがある (1.4.1 時点)。失敗した場合は `--no-deps` で入れ直す:
+
+```powershell
+pip install --no-deps synctoolbox libfmp ipython
+```
+
+実行時の numpy 2.x 互換問題は `reference_builder.py` 側でモンキーパッチ済み。
+
+### 3. ディレクトリ配置
 
 ```
 data/
@@ -56,22 +69,21 @@ data/
 └── built/<piece>/           # asf-build の出力
 ```
 
-### 3. オフラインビルド (WSL2)
+### 4. オフラインビルド
 
-```bash
-asf-build \
-    --score data/scores/beethoven5.xml \
-    --reference data/reference_audio/karajan_1977.wav \
-    --output data/built/beethoven5_karajan/ \
-    [--start-offset 0.5] \
+```powershell
+asf-build `
+    --score data/scores/beethoven5.xml `
+    --reference data/reference_audio/karajan_1977.wav `
+    --output data/built/beethoven5_karajan/ `
+    [--start-offset 0.5] `
     [--plot]
 ```
 
-### 4. ライブ追随 (Windows)
+### 5. ライブ追随
 
-```bash
-asf-follow config/beethoven5.json \
-    --built data/built/beethoven5_karajan/ \
+```powershell
+asf-follow config/beethoven5.json `
     --slide-url "https://docs.google.com/presentation/d/<ID>/present"
 ```
 
@@ -120,7 +132,7 @@ audio_score_follower/
 │   └── follow.py             # 新規: ライブ追随 CLI
 └── main.py                   # 新規: GUI エントリ
 tasks/
-└── generate_score_wav.py     # 流用: XML → 合成 WAV (WSL2)
+└── generate_score_wav.py     # XML → 合成 WAV (MuseScore 4 CLI, Windows ネイティブ)
 tests/
 data/                         # gitignore
 ```

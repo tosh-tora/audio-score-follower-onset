@@ -10,12 +10,14 @@
 
 本プロジェクトは:
 
-1. **オフライン**: スコア合成 WAV と、実演奏 (プロ録音 → リハ録音) を **synctoolbox の MrMsDTW** で対応付け、
+1. **オフライン**: スコア合成 WAV (MuseScore 4 CLI でレンダリング) と、実演奏
+   (プロ録音 → リハ録音) を **synctoolbox の MrMsDTW** で対応付け、
    `warping_path` (score_time ↔ reference_time) を保存。
 2. **オンライン**: マイク入力を **同じリファレンス録音** に対して Online DTW で追随。
    出力 reference_time を warp で逆引きして score_time → 小節へ。
 
 本番 OLTW のリファレンスが「実演奏の音響」になるため、特徴空間の SN 比が劇的に上がる。
+全工程 Windows ネイティブで完結する (WSL2 不要)。
 
 ## ワークフロー管理
 
@@ -52,10 +54,12 @@
 - `audio_score_follower/core/feature_extractor.py` を **唯一の経路** として、両側から呼ぶ
 - パラメータを変えたらビルド済み `reference_cens.npy` も作り直す (`asf-build` を再実行)
 
-### 合成 WAV の WSL2 依存
-- `tasks/generate_score_wav.py` は `pymatchmaker.utils.misc.generate_score_audio` (FluidSynth) を借用
-- pymatchmaker の Windows wheel が無い → **オフラインビルドは WSL2 で実行**
-- 本番追随 (`asf-follow`) は Windows ホストでも動く想定
+### 合成は MuseScore 4 CLI で行う (Windows ネイティブ)
+- `tasks/generate_score_wav.py` は MuseScore 4 の CLI (`mscore --export-to`) を呼ぶ
+- music21 で XML のテンポマーキングを剥がし、冒頭に単一 MetronomeMark を入れて
+  定テンポ合成を保証する
+- 検出: 環境変数 `MSCORE_EXE` → PATH → 既知パス (`C:\Program Files\MuseScore 4\bin\MuseScore4.exe` 等)
+- WSL2 は **不要**。オフラインビルドも本番追随も Windows で完結する
 
 ### リハ録音冒頭の指揮ブレス
 - リハ録音冒頭の指揮者ブレス・椅子の音は **スコアに無い**ので、warp が外れやすい

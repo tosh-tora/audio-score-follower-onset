@@ -15,18 +15,18 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "librosa>=0.10",
-    "synctoolbox>=1.3",
     "partitura>=0.3.10",
     "sounddevice>=0.4.6",
     "playwright>=1.40",
     "music21>=8.0",
+    # NOTE: synctoolbox is NOT listed here because synctoolbox 1.4.1 pins
+    # numpy<2 / pandas<2 / music21<6 which conflict with our modern stack.
+    # Install separately: pip install --no-deps synctoolbox libfmp ipython
+    # See README.md for details. The numpy-2 incompat is monkey-patched in
+    # audio_score_follower.core.reference_builder.
 ]
 
 [project.optional-dependencies]
-# Offline reference building reuses pymatchmaker's FluidSynth-based
-# generate_score_audio. pymatchmaker has no Windows wheels, so install
-# this extras group only inside WSL2 / Linux.
-synth = ["pymatchmaker>=0.2.1"]
 dev = [
     "pytest>=7.4",
     "matplotlib>=3.7",

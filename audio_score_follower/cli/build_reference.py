@@ -2,11 +2,11 @@
 """
 asf-build — offline reference builder CLI.
 
-Synthesises the score MusicXML (via tasks/generate_score_wav.py — runs
-inside WSL2 because pymatchmaker has no Windows wheels), then runs
-MrMsDTW to align the synthesis against a real performance recording.
-Output is a directory containing ``warping_path.npz``,
-``reference_cens.npy``, and a JSON metadata sidecar.
+Synthesises the score MusicXML via MuseScore 4 CLI (see
+tasks/generate_score_wav.py), then runs MrMsDTW to align the synthesis
+against a real performance recording. Output is a directory containing
+``warping_path.npz``, ``reference_cens.npy``, and a JSON metadata
+sidecar. Runs entirely on Windows native — no WSL2 needed.
 
 Usage:
 
@@ -72,14 +72,16 @@ def _synth_score_wav(score_xml: Path, bpm: float, sample_rate: int) -> Path:
         "--samplerate", str(sample_rate),
     ]
     logger.info("Synthesising score: %s", " ".join(cmd))
-    completed = subprocess.run(cmd, capture_output=True, text=True)
+    completed = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     if completed.returncode != 0:
         raise RuntimeError(
             f"generate_score_wav.py failed (exit {completed.returncode}):\n"
             f"  stdout: {completed.stdout}\n"
             f"  stderr: {completed.stderr}\n"
-            f"  NOTE: this script requires WSL2 (pymatchmaker has no "
-            f"Windows wheels). Run asf-build inside WSL2 for builds."
+            f"  NOTE: requires MuseScore 4 installed. Set MSCORE_EXE env "
+            f"var or pass --mscore-exe if auto-detection fails."
         )
     logger.info("Score synth complete: %s", tmp_path)
     return tmp_path
@@ -92,7 +94,7 @@ def main() -> int:
     parser.add_argument("--score", required=True, type=Path,
                         help="MusicXML / MXL file")
     parser.add_argument("--reference", required=True, type=Path,
-                        help="Reference recording (WAV / FLAC / MP3)")
+                        help="Reference recording (WAV / FLAC / OGG / MP3 / M4A)")
     parser.add_argument("--output", required=True, type=Path,
                         help="Output directory")
     parser.add_argument(
@@ -134,6 +136,12 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # synctoolbox / librosa drag in numba which floods -v output with
+    # JIT bytecode dumps. Pin those loggers to INFO so we can read our
+    # own DEBUG messages.
+    for noisy in ("numba", "matplotlib", "PIL", "fontTools",
+                  "music21", "libfmp"):
+        logging.getLogger(noisy).setLevel(logging.INFO)
 
     if not args.score.exists():
         logger.error("Score file not found: %s", args.score)

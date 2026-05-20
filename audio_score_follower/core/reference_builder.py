@@ -59,12 +59,83 @@ class BuildResult:
     feature_config: FeatureConfig
 
 
-def _load_wav_mono(path: Path, target_sr: int) -> np.ndarray:
-    """Load a WAV at ``target_sr`` as mono float32."""
+def _load_audio_mono(path: Path, target_sr: int) -> np.ndarray:
+    """Load an audio file at ``target_sr`` as mono float32.
+
+    Supported formats:
+        WAV, FLAC, OGG, AIFF — via soundfile (no extra tools needed)
+        MP3, M4A, AAC, WMA   — via audioread, which uses:
+            * Windows Media Foundation (built-in on Windows 7+) — no ffmpeg needed
+            * FFmpeg if installed and in PATH (most reliable cross-platform)
+            * GStreamer / libav on Linux/macOS
+
+    If an unsupported-format error occurs, a clear hint is printed.
+    """
     import librosa  # type: ignore — heavy
 
-    audio, _ = librosa.load(str(path), sr=target_sr, mono=True)
+    try:
+        audio, _ = librosa.load(str(path), sr=target_sr, mono=True)
+    except Exception as exc:
+        suffix = path.suffix.lower()
+        if suffix in (".mp3", ".m4a", ".aac", ".wma", ".ogg"):
+            raise RuntimeError(
+                f"{suffix.upper()} の読み込みに失敗しました: {path}\n"
+                f"  librosa が対応するオーディオバックエンドを見つけられませんでした。\n"
+                f"  Windows の場合: ffmpeg をインストールして PATH に追加するか、\n"
+                f"  Windows Media Foundation コーデックが有効になっているか確認してください。\n"
+                f"  代替手段: ffmpeg -i input.mp3 output.wav で WAV に変換してから使用。\n"
+                f"  (元のエラー: {exc})"
+            ) from exc
+        raise
     return audio.astype(np.float32, copy=False)
+
+
+def _patch_synctoolbox_for_numpy2() -> None:
+    """Monkey-patch synctoolbox to work with numpy >= 2.0.
+
+    synctoolbox 1.4.1 has ``find_anchor_indices_in_warping_path`` that
+    does ``indices[k] = np.where(...)[0]`` — a 1-element array assigned
+    to a scalar slot. numpy 2.x rejects this with
+    ``ValueError: setting an array element with a sequence.``
+
+    We replace the function with a version that pulls out a scalar
+    via ``[0]``. This is applied once on first call; harmless if
+    synctoolbox is later upgraded since we only patch a single name.
+    """
+    import numpy as _np
+    from synctoolbox.dtw import utils as _u
+
+    if getattr(_u, "_asf_patched", False):
+        return
+
+    def _fixed(warping_path, anchors):
+        indices = _np.zeros(anchors.shape[1], dtype=_np.int64)
+        for k in range(anchors.shape[1]):
+            a = anchors[:, k]
+            hits = _np.where(
+                (a[0] == warping_path[0, :]) & (a[1] == warping_path[1, :])
+            )[0]
+            if hits.size == 0:
+                # Anchor not present exactly — fall back to the closest
+                # cell on the path (rare; happens at endpoint snapping).
+                dist = _np.abs(warping_path[0, :] - a[0]) + _np.abs(
+                    warping_path[1, :] - a[1]
+                )
+                indices[k] = int(_np.argmin(dist))
+            else:
+                indices[k] = int(hits[0])
+        return indices
+
+    _u.find_anchor_indices_in_warping_path = _fixed
+    # synctoolbox.dtw.mrmsdtw imports the symbol by name, so patch the
+    # already-imported module-level binding too.
+    try:
+        from synctoolbox.dtw import mrmsdtw as _m
+        _m.find_anchor_indices_in_warping_path = _fixed
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
+    _u._asf_patched = True
+    logger.info("Applied numpy 2.x compatibility patch to synctoolbox")
 
 
 def _run_mrmsdtw(
@@ -78,16 +149,19 @@ def _run_mrmsdtw(
 
     We catch the import lazily and translate the import error into a
     clear hint, because synctoolbox installation can fail on systems
-    missing libsndfile.
+    missing libsndfile. We also patch a numpy-2.x incompatibility in
+    synctoolbox 1.4.1 (see ``_patch_synctoolbox_for_numpy2``).
     """
     try:
         from synctoolbox.dtw.mrmsdtw import sync_via_mrmsdtw  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
             "synctoolbox is required for offline reference building.\n"
-            "  → pip install synctoolbox\n"
+            "  → pip install --no-deps synctoolbox libfmp ipython\n"
             f"  (original error: {exc})"
         ) from exc
+
+    _patch_synctoolbox_for_numpy2()
 
     logger.info(
         "Running MrMsDTW: score=(%d,%d) ref=(%d,%d) rate=%.2f Hz",
@@ -118,7 +192,9 @@ def build_reference(
 
     Args:
         score_wav: WAV synthesised from the MusicXML at constant tempo.
-        reference_wav: Real performance recording (any tempo).
+        reference_wav: Real performance recording (any tempo). Accepted
+            formats: WAV / FLAC / OGG (soundfile) and MP3 / M4A / WMA
+            (audioread via Windows Media Foundation or ffmpeg).
         output_dir: Destination directory. Created if missing. Two files
             written: ``warping_path.npz`` and ``reference_cens.npy``.
         score_bpm: BPM used when synthesising ``score_wav``. Saved into
@@ -140,14 +216,14 @@ def build_reference(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Loading score synth: %s", score_wav)
-    score_audio = _load_wav_mono(score_wav, cfg.sample_rate)
+    score_audio = _load_audio_mono(score_wav, cfg.sample_rate)
     logger.info(
         "Score audio: %d samples (%.2f s @ %d Hz)",
         len(score_audio), len(score_audio) / cfg.sample_rate, cfg.sample_rate,
     )
 
     logger.info("Loading reference recording: %s", reference_wav)
-    ref_audio = _load_wav_mono(reference_wav, cfg.sample_rate)
+    ref_audio = _load_audio_mono(reference_wav, cfg.sample_rate)
     if reference_start_offset_sec > 0:
         skip = int(reference_start_offset_sec * cfg.sample_rate)
         if skip >= len(ref_audio):
