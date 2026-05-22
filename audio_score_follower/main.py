@@ -36,6 +36,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
+from typing import Dict, Optional
 
 # Windows cp932/cp1252 stdout cannot encode em-dashes or Japanese. Force
 # UTF-8 so logging, argparse help, and Japanese error messages survive.
@@ -69,7 +70,10 @@ class _NullSlideController:
         logger.info("[dry-run] SlideController: stop")
 
     def press(self, action: str) -> None:
-        logger.info("[dry-run] slide press: %s (no browser)", action)
+        # No log here — the canonical "slide press" log is emitted by
+        # AudioScoreFollowerApp._execute_action so it can include the
+        # source tag (manual/auto) and the triggering measure.
+        return None
 
     @property
     def last_error(self) -> None:
@@ -448,12 +452,7 @@ class AudioScoreFollowerApp:
                         continue
 
                     action = trig.get("action", "right")
-                    note = trig.get("note", "")
-                    self._execute_action(action)
-                    logger.info(
-                        "Trigger fired at measure %d: action=%s note=%s",
-                        current_measure, action, note,
-                    )
+                    self._execute_action(action, source="auto", trigger=trig)
                     self.cooldown.mark_triggered(current_measure)
                     self.state.activate_cooldown(self.config.get_cooldown_seconds())
                     self._fired_trigger_measures.add(current_measure)
@@ -463,11 +462,151 @@ class AudioScoreFollowerApp:
             time.sleep(interval)
         logger.info("Trigger loop exiting")
 
-    def _execute_action(self, action: str) -> None:
+    def _execute_action(
+        self,
+        action: str,
+        *,
+        source: str = "auto",
+        trigger: Optional[Dict] = None,
+    ) -> None:
+        """Send a single slide keypress and log it with provenance.
+
+        Args:
+            action: "right" or "left".
+            source: "auto" (fired by trigger loop from OLTW position) or
+                "manual" (user pressed ← / → / Space). Goes into the
+                log line so post-hoc review can tell which advances
+                were the human compensating for tracking drift.
+            trigger: the trigger dict (with measure, note) when known;
+                included in the log for context.
+        """
         try:
             self.slide_controller.press(action)
         except Exception as exc:  # noqa: BLE001
-            logger.error("Slide action %s failed: %s", action, exc, exc_info=True)
+            logger.error(
+                "Slide action %s failed [%s]: %s", action, source, exc, exc_info=True
+            )
+            return
+        if trigger is not None:
+            logger.info(
+                "Slide %s [%s] measure=%d note=%s",
+                action, source, trigger.get("measure"),
+                trigger.get("note", ""),
+            )
+        else:
+            logger.info("Slide %s [%s]", action, source)
+
+    # ----------------------- manual override helpers -----------------
+    def _find_next_pending_trigger(self) -> Optional[Dict]:
+        """Lowest-measure trigger that hasn't been fired yet.
+
+        Returns None when every trigger in the current movement has
+        already fired.
+        """
+        triggers = self.state.current_triggers
+        pending = [
+            t for t in triggers
+            if t["measure"] not in self._fired_trigger_measures
+        ]
+        if not pending:
+            return None
+        return min(pending, key=lambda t: t["measure"])
+
+    def _find_last_fired_trigger(self) -> Optional[Dict]:
+        """Highest-measure trigger that has been fired so far.
+
+        We use "highest measure" rather than "most-recently-fired by
+        wall-clock time" because triggers naturally fire in score order
+        during live performance; if the user has been pressing manual
+        overrides out of order they probably want to undo the latest
+        position in the score, not the latest in time.
+        """
+        if not self._fired_trigger_measures:
+            return None
+        last_measure = max(self._fired_trigger_measures)
+        triggers = self.state.current_triggers
+        for t in triggers:
+            if t["measure"] == last_measure:
+                return t
+        return None
+
+    def _seek_oltw_to_ref_time(self, ref_time_sec: float) -> None:
+        if self.oltw is None or self.warp_lookup is None:
+            return
+        fr = self.warp_lookup.feature_config.effective_frame_rate()
+        target_frame = int(round(ref_time_sec * fr))
+        self.oltw.seek(target_frame)
+
+    def _manual_advance_to_next_trigger(self) -> None:
+        """User pressed →: send slide right, then re-sync OLTW.
+
+        The user is saying "the performance is at or past the next
+        trigger measure" — so we (1) send the press, (2) mark that
+        trigger as fired so the auto loop doesn't double-fire, and
+        (3) seek OLTW to that measure's reference time so future
+        auto-triggers fire from the correct downstream context.
+        """
+        nxt = self._find_next_pending_trigger()
+        if nxt is None or self.warp_lookup is None or self.score_mapper is None:
+            # No trigger to consume — fall back to bare slide press.
+            self._execute_action("right", source="manual")
+            return
+
+        measure = int(nxt["measure"])
+        try:
+            ref_t = self.warp_lookup.measure_to_ref_time(measure, self.score_mapper)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("measure_to_ref_time failed for m=%d: %s", measure, exc)
+            self._execute_action("right", source="manual")
+            return
+
+        self._execute_action(nxt.get("action", "right"), source="manual", trigger=nxt)
+        self.cooldown.mark_triggered(measure)
+        self.state.activate_cooldown(self.config.get_cooldown_seconds())
+        self._fired_trigger_measures.add(measure)
+        self._seek_oltw_to_ref_time(ref_t)
+        logger.info(
+            "Manual sync: OLTW re-anchored to measure %d (ref_t=%.2fs)",
+            measure, ref_t,
+        )
+
+    def _manual_back_to_prev_trigger(self) -> None:
+        """User pressed ←: send slide left, then re-sync OLTW backwards.
+
+        The user is saying "the performance is BEFORE the most-recent
+        slide change". We (1) send the left press, (2) un-fire the
+        most-recently fired trigger so it can fire again when the
+        music re-enters that region, and (3) seek OLTW back to just
+        BEFORE that measure so we won't immediately re-trigger it
+        on the next live frame.
+        """
+        last = self._find_last_fired_trigger()
+        if last is None or self.warp_lookup is None or self.score_mapper is None:
+            self._execute_action("left", source="manual")
+            return
+
+        measure = int(last["measure"])
+        try:
+            ref_t = self.warp_lookup.measure_to_ref_time(measure, self.score_mapper)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("measure_to_ref_time failed for m=%d: %s", measure, exc)
+            self._execute_action("left", source="manual")
+            return
+
+        self._execute_action("left", source="manual", trigger=last)
+        self.cooldown.unmark_triggered(measure)
+        self._fired_trigger_measures.discard(measure)
+        # Seek to a frame slightly BEFORE the measure's start so the
+        # auto loop won't immediately re-fire on the next OLTW tick.
+        fr = self.warp_lookup.feature_config.effective_frame_rate()
+        pre_frame = max(0, int(round(ref_t * fr)) - max(1, int(round(0.2 * fr))))
+        if self.oltw is not None:
+            self.oltw.seek(pre_frame)
+        logger.info(
+            "Manual sync: OLTW re-anchored before measure %d "
+            "(ref_frame=%d, ~%.2fs)",
+            measure, pre_frame, pre_frame / fr,
+        )
 
     # ---------------------------------------------------- key bindings
     def _bind_keys(self) -> None:
@@ -478,10 +617,10 @@ class AudioScoreFollowerApp:
             self._load_current_movement()
 
         def _on_next(_e: tk.Event) -> None:
-            self._execute_action("right")
+            self._manual_advance_to_next_trigger()
 
         def _on_prev(_e: tk.Event) -> None:
-            self._execute_action("left")
+            self._manual_back_to_prev_trigger()
 
         self.root.bind("<KeyPress-n>", _on_n)
         self.root.bind("<KeyPress-N>", _on_n)

@@ -668,6 +668,46 @@ class OnlineDTWFollower:
                 self._frozen_pos = None
                 logger.info("OLTW unfrozen")
 
+    def seek(self, ref_frame: int) -> None:
+        """Jump the alignment to a specific reference frame.
+
+        Used by manual slide-override controls (the human pressing
+        ← / →) to tell the follower "the music is actually here now".
+        Wipes the cumulative DP cost and re-anchors at ``ref_frame``
+        with cost 0, so subsequent live frames start a fresh DP
+        recurrence from there. This is the safe alternative to a
+        global rematch: it trusts the human's signal rather than
+        chroma argmin.
+
+        Args:
+            ref_frame: target reference frame index. Clamped to
+                ``[0, N_ref - 1]``.
+        """
+        ref_frame = max(0, min(int(ref_frame), self._N - 1))
+        with self._state_lock:
+            self._D_prev[:] = np.inf
+            self._D_prev[ref_frame] = 0.0
+            self._prev_band_lo = ref_frame
+            self._prev_band_hi = ref_frame + 1
+            self._current_ref_pos = ref_frame
+            # If we haven't processed any live frame yet, the next call
+            # would otherwise go through the (init_search_width-limited)
+            # first-frame path and overwrite our seek. Bumping the index
+            # routes it through the subsequent-frame DP, which will use
+            # the seeded D_prev we just set.
+            if self._live_frame_idx == 0:
+                self._live_frame_idx = 1
+            self._cost_history.clear()
+            self._stuck_counter = 0
+            self._stuck_window_start_pos = ref_frame
+            self._stuck_dp_counter = 0
+            self._stuck_dp_window_start_pos = ref_frame
+            self._backward_attempts_in_window = 0
+        logger.info(
+            "OLTW seek: ref_frame=%d (%.2fs)",
+            ref_frame, ref_frame / self._cfg.effective_frame_rate(),
+        )
+
     def reset(self) -> None:
         """Wipe DP state — used when loading a new movement."""
         with self._state_lock:

@@ -65,6 +65,19 @@ class CooldownTimer:
         self.triggered_measures[measure] = time.time()
         logger.debug(f"Measure {measure}: marked triggered, cooldown {self.duration}s")
 
+    def unmark_triggered(self, measure: int) -> bool:
+        """Reverse of mark_triggered — used by manual ← override so a
+        previously-fired trigger can fire again when the music genuinely
+        re-enters that region.
+
+        Returns True if the measure was in the triggered set.
+        """
+        if measure in self.triggered_measures:
+            del self.triggered_measures[measure]
+            logger.debug(f"Measure {measure}: unmarked (manual override)")
+            return True
+        return False
+
     def cleanup_old(self, max_age_sec: float = 10.0):
         """
         Remove old entries to prevent memory leak.

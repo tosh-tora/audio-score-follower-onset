@@ -100,6 +100,39 @@ class WarpLookup:
         beat = self.ref_to_beat(ref_time_sec)
         return score_mapper.beat_to_measure(beat)
 
+    # ---------------------------------------------------------- inverse lookups
+    def beat_to_score_time(self, beat: float) -> float:
+        """Inverse of ``score_time_to_beat``: beat → score time (sec)."""
+        return float(beat) * 60.0 / self.score_bpm
+
+    def score_time_to_ref_time(self, score_time_sec: float) -> float:
+        """Inverse of ``ref_to_score_time`` (sec → sec).
+
+        The forward direction uses np.interp on (ref_times → score_times).
+        For the inverse we interpolate on (score_times → ref_times). Both
+        arrays are monotonic non-decreasing because the warp path is, but
+        ``score_times`` may contain repeated values where the reference
+        recording paused on the same score position; np.interp handles
+        this by returning the first matching index, which is fine for
+        our "seek to position" use case (we just want some valid ref_t).
+        """
+        return float(np.interp(score_time_sec, self.score_times, self.ref_times))
+
+    def beat_to_ref_time(self, beat: float) -> float:
+        """Convenience: beat → reference time (sec)."""
+        return self.score_time_to_ref_time(self.beat_to_score_time(beat))
+
+    def measure_to_ref_time(
+        self, measure: int, score_mapper: "ScoreMapper"
+    ) -> float:
+        """Measure number → reference time (sec) of that measure's downbeat.
+
+        Used by manual ← / → slide overrides to re-anchor the OLTW
+        follower's position to where the user says the music actually is.
+        """
+        start_beat, _end_beat = score_mapper.beat_range_for_measure(measure)
+        return self.beat_to_ref_time(start_beat)
+
     def ref_to_measure_and_beat(
         self, ref_time_sec: float, score_mapper: "ScoreMapper"
     ) -> tuple[int, float, float]:

@@ -102,6 +102,34 @@ def test_mismatched_shapes_raise():
         )
 
 
+def test_inverse_lookups_roundtrip():
+    """ref → score → ref should yield ~identity on the recorded grid."""
+    ref_times = np.array([0.0, 2.0, 4.0, 7.0], dtype=np.float32)
+    score_times = np.array([0.0, 1.0, 2.0, 4.0], dtype=np.float32)
+    lookup = WarpLookup(
+        ref_times=ref_times,
+        score_times=score_times,
+        score_bpm=120.0,
+        feature_config=FeatureConfig(),
+    )
+    for ref_t in (0.0, 1.5, 3.0, 5.5, 7.0):
+        score_t = lookup.ref_to_score_time(ref_t)
+        ref_t_back = lookup.score_time_to_ref_time(score_t)
+        assert ref_t_back == pytest.approx(ref_t, abs=1e-3)
+
+
+def test_beat_to_ref_time():
+    """beat → score_time → ref_time, all sec."""
+    lookup = WarpLookup(
+        ref_times=np.array([0.0, 4.0], dtype=np.float32),
+        score_times=np.array([0.0, 2.0], dtype=np.float32),  # half-speed
+        score_bpm=120.0,
+        feature_config=FeatureConfig(),
+    )
+    # beat 2 at 120 bpm = score_time 1.0 = ref_time 2.0 (half-speed warp)
+    assert lookup.beat_to_ref_time(2.0) == pytest.approx(2.0, abs=1e-3)
+
+
 def test_nonpositive_bpm_raises():
     with pytest.raises(ValueError, match="positive"):
         WarpLookup(

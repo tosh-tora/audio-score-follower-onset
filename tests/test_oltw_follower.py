@@ -99,6 +99,49 @@ def test_freeze_stops_advancement():
     assert follower.current_ref_frame >= frozen_pos
 
 
+def test_seek_jumps_to_target_and_resumes_dp():
+    """seek(ref_frame) は位置を指定値に飛ばし、DP 状態をリセットする。
+
+    Used by manual ← / → keyboard overrides in main.py to tell OLTW
+    "the music is here now, restart tracking from this frame".
+    """
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(80)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20, init_search_width=10)
+    # advance a bit so cumulative state builds up
+    for j in range(10):
+        follower.process_frame(ref[:, j])
+    pos_before = follower.current_ref_frame
+    assert pos_before > 0
+
+    # jump forward to frame 50
+    follower.seek(50)
+    assert follower.current_ref_frame == 50
+    # cumulative cost should be wiped except at the target
+    finite_count = int(np.isfinite(follower._D_prev).sum())
+    assert finite_count == 1, (
+        f"seek did not wipe D_prev: {finite_count} finite cells"
+    )
+
+    # next process_frame should stay near 50 (live still matches frame 50
+    # which is the same chroma class we just seeded).
+    r = follower.process_frame(ref[:, 50])
+    assert r.ref_frame >= 50, (
+        f"after seek to 50, expected position >= 50; got {r.ref_frame}"
+    )
+
+
+def test_seek_clamps_out_of_range():
+    """seek to a negative or past-end frame clamps to the valid range."""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(40)
+    follower = OnlineDTWFollower(ref, cfg, search_width=10)
+    follower.seek(-5)
+    assert follower.current_ref_frame == 0
+    follower.seek(10**9)
+    assert follower.current_ref_frame == 39  # N - 1
+
+
 def test_reset_clears_state():
     cfg = FeatureConfig()
     ref = _make_chroma_sequence(40)
