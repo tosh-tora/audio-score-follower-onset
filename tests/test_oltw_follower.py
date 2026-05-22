@@ -50,9 +50,22 @@ def test_self_alignment_returns_monotonic_positions():
 
 
 def test_self_alignment_high_confidence():
-    """Self-alignment should yield confidence close to 1."""
+    """Self-alignment with non-periodic data should yield confidence close to 1.
+
+    Uses random unit chroma vectors (not one-hot cyclic) so each ref
+    frame has a unique signature within the search band. With the
+    margin-based confidence formula this requires both a good local
+    match AND a sharply-peaked DP minimum — the periodic one-hot
+    sequence used elsewhere is too ambiguous (12 pitch classes recur)
+    and legitimately gives ~0.5 confidence; not a regression but a
+    correctly-pessimistic reading.
+    """
     cfg = FeatureConfig()
-    ref = _make_chroma_sequence(80)
+    rng = np.random.default_rng(123)
+    ref = rng.standard_normal((12, 80)).astype(np.float32)
+    ref = np.abs(ref)  # chroma is non-negative
+    norms = np.linalg.norm(ref, axis=0, keepdims=True)
+    ref = (ref / norms).astype(np.float32)
     follower = OnlineDTWFollower(ref, cfg, search_width=20)
 
     confidences = []
@@ -118,6 +131,145 @@ def test_rejects_bad_live_frame_shape():
     follower = OnlineDTWFollower(ref, cfg, search_width=10)
     with pytest.raises(ValueError, match="must be"):
         follower.process_frame(np.zeros(13, dtype=np.float32))
+
+
+def test_advances_with_smoothed_similar_frames():
+    """連続 live frame が極めて似ている場合でも DP は前進する。
+
+    実機バグの回帰防止: CENS の cens_win=41 平滑化により live frame の
+    chroma が緩慢にしか変化しない状況で、step_penalty + 前進 tie-break
+    が無いと DP は現位置に貼り付く。50 frame chunks で chroma class を
+    切り替え、chunk 内は微小ノイズのみという平滑化済みチロマの簡易
+    モデルで、1 live ≒ 1 ref の進行が維持されることを確認する。
+    """
+    cfg = FeatureConfig()
+    rng = np.random.default_rng(42)
+    n = 400
+    ref = np.zeros((12, n), dtype=np.float32)
+    for j in range(n):
+        pc = (j // 50) % 12
+        ref[pc, j] = 1.0
+        ref[:, j] += 0.05 * rng.standard_normal(12).astype(np.float32)
+    norms = np.linalg.norm(ref, axis=0, keepdims=True)
+    ref = (ref / norms).astype(np.float32)
+
+    follower = OnlineDTWFollower(ref, cfg, search_width=100)
+    positions = []
+    for j in range(n):
+        result = follower.process_frame(ref[:, j])
+        positions.append(result.ref_frame)
+
+    advancement = positions[-1] - positions[0]
+    assert advancement >= 200, (
+        f"position stuck: {positions[0]} → {positions[-1]} "
+        f"(expected advancement >= 200, got {advancement}). "
+        f"last 10 positions: {positions[-10:]}"
+    )
+
+
+def test_step_penalty_zero_disables_forward_bias():
+    """step_penalty=0.0 で旧挙動 (前進バイアスなし) に戻ることを確認。
+
+    後方互換テスト: step_penalty を 0 にすると tie-break が前進方向に
+    残るが、DP のペナルティ自体は消える。ambiguous なシナリオでは
+    旧挙動と同程度の動きになるはず。
+    """
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60, period=4)
+    follower = OnlineDTWFollower(ref, cfg, search_width=15, step_penalty=0.0)
+
+    # Should not raise; should produce monotonic positions.
+    positions = []
+    for j in range(60):
+        result = follower.process_frame(ref[:, j])
+        positions.append(result.ref_frame)
+    diffs = np.diff(positions)
+    assert (diffs >= 0).all(), f"non-monotonic with step_penalty=0: diffs={diffs}"
+
+
+def test_back_inhibit_prevents_self_similar_capture():
+    """自己類似テーマがあっても、過去テーマに引き戻されないことを確認。
+
+    回帰防止: Marche au supplice 別演奏の追従テストで、行進曲テーマの
+    2 回目に DP が 1 回目の位置に飛び戻る (`would step backward (102→68)`
+    連発) → stuck になる現象の最小再現。
+
+    シナリオ:
+      - ref[0..50]   = テーマ A (pitch class 0)
+      - ref[50..100] = 別の部分 (pitch class 6)
+      - ref[100..150] = テーマ A の再現 (pitch class 0)
+      - live は ref[100..150] と「ほぼ同じだが微妙に違う」chroma
+    back_inhibit=10 なら、live が ref[100..150] を流れたとき、DP は
+    ref[0..50] (テーマ A の 1 回目) に戻れない → 前進し続ける。
+    """
+    cfg = FeatureConfig()
+    rng = np.random.default_rng(7)
+
+    def _theme_a(n):
+        x = np.zeros((12, n), dtype=np.float32)
+        x[0, :] = 1.0
+        return x
+
+    def _theme_b(n):
+        x = np.zeros((12, n), dtype=np.float32)
+        x[6, :] = 1.0
+        return x
+
+    ref = np.concatenate([_theme_a(50), _theme_b(50), _theme_a(50)], axis=1)
+    ref += 0.02 * rng.standard_normal(ref.shape).astype(np.float32)
+    ref = (ref / np.linalg.norm(ref, axis=0, keepdims=True)).astype(np.float32)
+
+    # live = ref[100:150] with a small perturbation (a "different recording"
+    # of the second theme-A statement). We seed the follower at frame 100
+    # by feeding the first live frame and letting the wide search_width
+    # initialise there; then the back-inhibit must keep it from collapsing
+    # back to frames 0..50.
+    live = ref[:, 100:150].copy()
+    live += 0.05 * rng.standard_normal(live.shape).astype(np.float32)
+    live = (live / np.linalg.norm(live, axis=0, keepdims=True)).astype(np.float32)
+
+    # Wide search_width so symmetric band could reach back to frame 0,
+    # but tight back_inhibit keeps it forward.
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=120, back_inhibit_frames=10
+    )
+
+    positions = []
+    for j in range(50):
+        result = follower.process_frame(live[:, j])
+        positions.append(result.ref_frame)
+
+    # After the first few frames we should have locked somewhere past
+    # frame 80 (i.e. inside the second theme-A statement, not the first).
+    assert min(positions[5:]) >= 80, (
+        f"back-inhibit failed: positions dropped into first theme. "
+        f"min(positions[5:])={min(positions[5:])}, last 10={positions[-10:]}"
+    )
+
+
+def test_back_inhibit_zero_forbids_all_backward_motion():
+    """back_inhibit_frames=0 で band の左端が前フレーム位置に張り付く。
+
+    band_lo はフレーム開始時点の current_ref_pos から計算され、ref_frame
+    は DP 後の新位置 (>= 開始位置) なので、不変条件は band_lo <= ref_frame
+    かつ band_lo の単調非減少。
+    """
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=30, back_inhibit_frames=0
+    )
+
+    prev_lo = 0
+    for j in range(60):
+        result = follower.process_frame(ref[:, j])
+        assert result.band_lo <= result.ref_frame, (
+            f"frame {j}: band_lo={result.band_lo} > ref_frame={result.ref_frame}"
+        )
+        assert result.band_lo >= prev_lo, (
+            f"frame {j}: band_lo={result.band_lo} < prev_lo={prev_lo}"
+        )
+        prev_lo = result.band_lo
 
 
 def test_offset_input_tracks_with_lag():

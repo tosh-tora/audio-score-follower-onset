@@ -2,9 +2,7 @@
   "settings": {
     "cooldown_seconds": 3.0,
     "silence_threshold_db": -55.0,
-    "mic_device": null,
-    "oltw_search_width": 240,
-    "oltw_step_size": 1
+    "mic_device": null
   },
   "movements": [
     {

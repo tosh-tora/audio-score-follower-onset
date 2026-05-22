@@ -47,13 +47,33 @@ if hasattr(sys.stderr, "reconfigure"):
 from audio_score_follower.config.loader import ConfigError, ConfigLoader
 from audio_score_follower.core.audio_level import AudioLevelMonitor
 from audio_score_follower.core.cooldown_timer import CooldownTimer
-from audio_score_follower.core.follower_worker import FollowerWorker
+from audio_score_follower.core.follower_worker import FileWorker, FollowerWorker
 from audio_score_follower.core.oltw_follower import (
     FollowResult,
     OnlineDTWFollower,
 )
 from audio_score_follower.core.score_mapper import ScoreMapper
 from audio_score_follower.core.slide_controller import SlideController
+
+
+class _NullSlideController:
+    """No-op slide controller used when --slide-url is omitted (dry-run / test mode)."""
+
+    def start(self) -> None:
+        logger.info("[dry-run] SlideController: start (no browser)")
+
+    def wait_ready(self, timeout: float = 30.0) -> bool:  # noqa: ARG002
+        return True
+
+    def stop(self) -> None:
+        logger.info("[dry-run] SlideController: stop")
+
+    def press(self, action: str) -> None:
+        logger.info("[dry-run] slide press: %s (no browser)", action)
+
+    @property
+    def last_error(self) -> None:
+        return None
 from audio_score_follower.core.state_manager import AppState
 from audio_score_follower.core.warp_lookup import WarpLookup, load_reference_cens
 from audio_score_follower.ui.gui_tkinter import FollowerGUI
@@ -74,11 +94,21 @@ _TRIGGER_CONFIDENCE_FLOOR = 0.30
 class AudioScoreFollowerApp:
     """Top-level orchestrator."""
 
-    def __init__(self, config_path: str, slide_url: str) -> None:
-        logger.info("Initialising AudioScoreFollowerApp (config=%s)", config_path)
+    def __init__(
+        self,
+        config_path: str,
+        slide_url: str | None,
+        *,
+        input_wav: Path | None = None,
+    ) -> None:
+        logger.info(
+            "Initialising AudioScoreFollowerApp (config=%s, input_wav=%s)",
+            config_path, input_wav,
+        )
 
         self.config = ConfigLoader(config_path)
         self.slide_url = slide_url
+        self.input_wav = input_wav
 
         self.state = AppState()
         self.cooldown = CooldownTimer(self.config.get_cooldown_seconds())
@@ -91,11 +121,21 @@ class AudioScoreFollowerApp:
         self.score_mapper: ScoreMapper | None = None
         self.warp_lookup: WarpLookup | None = None
         self.oltw: OnlineDTWFollower | None = None
-        self.worker: FollowerWorker | None = None
+        # Worker is either the live FollowerWorker (mic) or the FileWorker
+        # (--input-wav diagnostic mode). Both share the same lifecycle
+        # interface so callers don't need to special-case them.
+        self.worker: FollowerWorker | FileWorker | None = None
 
         self._fired_trigger_measures: set[int] = set()
 
-        self.slide_controller = SlideController(slide_url=slide_url)
+        if slide_url:
+            self.slide_controller = SlideController(slide_url=slide_url)
+        else:
+            logger.warning(
+                "--slide-url 未指定: ドライランモードで起動します。"
+                "スライドは操作されません。"
+            )
+            self.slide_controller = _NullSlideController()  # type: ignore[assignment]
 
         # Tk root + GUI (built before worker so update callbacks have
         # something to push into).
@@ -106,18 +146,29 @@ class AudioScoreFollowerApp:
         self._trigger_thread: threading.Thread | None = None
         self._prev_gate_active = False
 
+        # Diagnostic log throttle: emit one OLTW state log per wall-clock
+        # second. Set from _on_oltw_result, which fires per CENS frame
+        # (~10 Hz) and would otherwise flood the log.
+        self._last_diag_log_sec = 0
+
         logger.info("Initialisation complete")
 
     # ---------------------------------------------------- lifecycle
     def run(self) -> None:
-        logger.info("Launching AudioLevelMonitor …")
-        try:
-            self.audio_monitor.start()
-        except BaseException as exc:  # noqa: BLE001
-            logger.warning(
-                "AudioLevelMonitor.start raised (%s: %s); continuing "
-                "without silence gate",
-                type(exc).__name__, exc,
+        if self.input_wav is None:
+            logger.info("Launching AudioLevelMonitor …")
+            try:
+                self.audio_monitor.start()
+            except BaseException as exc:  # noqa: BLE001
+                logger.warning(
+                    "AudioLevelMonitor.start raised (%s: %s); continuing "
+                    "without silence gate",
+                    type(exc).__name__, exc,
+                )
+        else:
+            logger.info(
+                "--input-wav mode: skipping AudioLevelMonitor "
+                "(no mic to gate on)"
             )
 
         logger.info("Launching SlideController …")
@@ -137,7 +188,14 @@ class AudioScoreFollowerApp:
         )
         self._trigger_thread.start()
 
-        self.root.after(_GATE_POLL_MS, self._check_silence_gate)
+        if self.input_wav is None:
+            self.root.after(_GATE_POLL_MS, self._check_silence_gate)
+        else:
+            # File-input mode: no mic is open, so silence-gate polling
+            # would just report "no audio" every tick. Skip it, and mark
+            # the monitor as unavailable so the GUI dBFS readout says
+            # "n/a" rather than a misleading -120 dBFS.
+            self.state.set_mic_level(-120.0, gate_active=False, monitor_available=False)
 
         logger.info("Ready. N=next movement, R=reload, →/Space=manual next slide.")
         self.root.protocol("WM_DELETE_WINDOW", self._on_gui_closing)
@@ -162,7 +220,8 @@ class AudioScoreFollowerApp:
         if self.worker is not None:
             self.worker.stop()
             self.worker = None
-        self.audio_monitor.stop()
+        if self.input_wav is None:
+            self.audio_monitor.stop()
         self.slide_controller.stop()
         logger.info("Shutdown complete")
 
@@ -257,12 +316,21 @@ class AudioScoreFollowerApp:
         if triggers:
             self.state.set_next_trigger(min(t["measure"] for t in triggers))
 
-        self.worker = FollowerWorker(
-            oltw_follower=self.oltw,
-            feature_config=self.warp_lookup.feature_config,
-            mic_device=self.config.get_mic_device(),
-            on_result=self._on_oltw_result,
-        )
+        if self.input_wav is not None:
+            self.worker = FileWorker(
+                oltw_follower=self.oltw,
+                feature_config=self.warp_lookup.feature_config,
+                input_wav=self.input_wav,
+                on_result=self._on_oltw_result,
+                realtime=True,
+            )
+        else:
+            self.worker = FollowerWorker(
+                oltw_follower=self.oltw,
+                feature_config=self.warp_lookup.feature_config,
+                mic_device=self.config.get_mic_device(),
+                on_result=self._on_oltw_result,
+            )
         self.worker.start()
 
         def _ready_check() -> None:
@@ -294,6 +362,31 @@ class AudioScoreFollowerApp:
             continuous_beat, measure, beat_in_measure_display
         )
         self.state.set_confidence(result.confidence)
+
+        # Throttled diagnostic log: emit once per wall-clock second so
+        # `--verbose` doesn't drown in per-frame entries. Lets the
+        # operator watch measure / confidence / cost / band live to
+        # diagnose stuck or skipping behaviour. Includes mic dBFS in
+        # live-mic mode so the user can spot "mic too quiet → noise
+        # dominates chroma → OLTW stuck" failure modes.
+        now_sec = int(time.time())
+        if now_sec != self._last_diag_log_sec:
+            self._last_diag_log_sec = now_sec
+            try:
+                snap = self.state.get_all()
+                mic_db = snap.get("mic_level_db")
+                mic_part = (
+                    f" mic={mic_db:+.0f}dBFS" if mic_db is not None else ""
+                )
+            except Exception:  # noqa: BLE001
+                mic_part = ""
+            logger.info(
+                "OLTW: m=%d β=%.2f conf=%.2f raw_cost=%.3f ref_t=%.1fs "
+                "band=[%d,%d)%s",
+                measure, beat_in_measure_display, result.confidence,
+                result.raw_local_cost, result.ref_time_sec,
+                result.band_lo, result.band_hi, mic_part,
+            )
 
     # ---------------------------------------------------- silence gate
     def _check_silence_gate(self) -> None:
@@ -406,8 +499,13 @@ def main() -> int:
     )
     parser.add_argument("config", help="Path to config.json")
     parser.add_argument(
-        "--slide-url", required=True,
-        help="Google Slides /present URL",
+        "--slide-url", required=False, default=None,
+        help="Google Slides /present URL。省略するとドライランモード（スライド操作なし）。",
+    )
+    parser.add_argument(
+        "--input-wav", type=Path, default=None,
+        help="マイクの代わりに指定の音源ファイル (WAV/MP3/...) を OLTW に流す。"
+             "切り分けデバッグ用。silence gate は自動的に無効化される。",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -424,8 +522,16 @@ def main() -> int:
         logger.error("Config not found: %s", config_path)
         return 1
 
+    if args.input_wav is not None and not args.input_wav.exists():
+        logger.error("--input-wav not found: %s", args.input_wav)
+        return 1
+
     try:
-        app = AudioScoreFollowerApp(str(config_path), slide_url=args.slide_url)
+        app = AudioScoreFollowerApp(
+            str(config_path),
+            slide_url=args.slide_url,
+            input_wav=args.input_wav,
+        )
         app.run()
         return 0
     except ConfigError as exc:

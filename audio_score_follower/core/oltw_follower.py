@@ -63,8 +63,11 @@ class OnlineDTWFollower:
         reference_cens: np.ndarray,
         feature_config: FeatureConfig,
         *,
-        search_width: int = 240,
+        search_width: int = 100,
         step_size: int = 1,
+        step_penalty: float = 0.02,
+        back_inhibit_frames: int = 30,
+        init_search_width: int | None = None,
         confidence_smoothing: int = 5,
     ) -> None:
         """
@@ -74,10 +77,42 @@ class OnlineDTWFollower:
             search_width: half-width of the band (frames). The band
                 spans [current - search_width, current + search_width].
                 Wider = more tolerant to tempo deviation but allows
-                more drift. ``ConfigLoader.get_oltw_kwargs`` exposes this.
+                more drift. Default 100 ≈ 9s at hop=2048/sr=22050;
+                widening past ~150 risks self-similarity collapses in
+                repetitive music. ``ConfigLoader.get_oltw_kwargs``
+                exposes this.
             step_size: maximum number of reference frames the alignment
                 can advance per live frame. Always 1 in the current
                 recurrence; reserved for future tuning.
+            step_penalty: extra cost added to "horizontal" (stay at the
+                same reference frame) and "vertical" (advance multiple
+                reference frames per live frame) DP transitions. The
+                diagonal (1 ref ↔ 1 live) is the preferred path; when
+                costs are nearly equal across the band, this penalty
+                breaks the tie toward forward motion. Set to 0.0 to
+                disable (pre-fix behaviour, useful for testing). Default
+                0.02 — small enough to allow tempo flexibility, large
+                enough to escape "stuck position" local minima within
+                a few frames of accumulation.
+            back_inhibit_frames: maximum number of reference frames the
+                search band may look BACKWARD from the current position.
+                Forward search is governed by ``search_width``; backward
+                is capped by this (smaller) value to prevent the DP from
+                being captured by self-similar material earlier in the
+                score (e.g. an earlier statement of the same theme in
+                marches/repeats). Default 30 ≈ 2.8s at hop=2048/sr=22050,
+                enough room to settle from small overshoots but far less
+                than a typical theme period. Set very large (>=search_width)
+                to restore the symmetric pre-fix band.
+            init_search_width: search range used ONLY for the very first
+                live frame, before any DP history exists. Decoupled from
+                ``search_width`` because a wide initial range lets the
+                first frame land anywhere in the first N seconds of the
+                reference — usually wrong. Default None = same as
+                ``search_width`` (legacy behaviour). Recommended: 30
+                (~2.8s) so the follower always starts near the score's
+                beginning, even when ``search_width`` is large for
+                tempo flexibility downstream.
             confidence_smoothing: window (frames) for confidence EMA.
         """
         if reference_cens.ndim != 2 or reference_cens.shape[0] != 12:
@@ -90,12 +125,25 @@ class OnlineDTWFollower:
             # Wider step sizes give pymatchmaker-style "race ahead" failures
             # we explicitly want to avoid in this project. Reject loudly.
             raise ValueError("step_size > 1 not implemented (intentionally)")
+        if step_penalty < 0:
+            raise ValueError("step_penalty must be >= 0")
+        if back_inhibit_frames < 0:
+            raise ValueError("back_inhibit_frames must be >= 0")
 
         self._ref = np.ascontiguousarray(reference_cens, dtype=np.float32)
         self._N = reference_cens.shape[1]
         self._cfg = feature_config
         self._search_width = int(search_width)
         self._step_size = int(step_size)
+        self._step_penalty = float(step_penalty)
+        self._back_inhibit_frames = int(back_inhibit_frames)
+        self._init_search_width = (
+            int(init_search_width)
+            if init_search_width is not None
+            else int(search_width)
+        )
+        if self._init_search_width <= 0:
+            raise ValueError("init_search_width must be > 0")
 
         # DP previous column, size N_ref. Initialised to +inf except the
         # initial seed at frame 0 = 0.0 (we let the first live frame "land"
@@ -118,8 +166,9 @@ class OnlineDTWFollower:
 
         logger.info(
             "OnlineDTWFollower initialised: N_ref=%d, search_width=%d, "
-            "feature_rate=%.2f Hz",
-            self._N, self._search_width, self._cfg.effective_frame_rate(),
+            "back_inhibit=%d, step_penalty=%.3f, feature_rate=%.2f Hz",
+            self._N, self._search_width, self._back_inhibit_frames,
+            self._step_penalty, self._cfg.effective_frame_rate(),
         )
 
     # ------------------------------------------------------------ runtime
@@ -159,8 +208,14 @@ class OnlineDTWFollower:
         return self._process_subsequent_frame(live)
 
     def _process_first_frame(self, live: np.ndarray) -> FollowResult:
-        """Initial alignment: search the first ``search_width`` reference frames."""
-        hi = min(self._N, self._search_width)
+        """Initial alignment: search the first ``init_search_width`` reference frames.
+
+        ``init_search_width`` (not ``search_width``) is used so a wide
+        downstream search band — needed to accommodate tempo deviation
+        as alignment progresses — doesn't cause the very first frame to
+        land arbitrarily far into the score.
+        """
+        hi = min(self._N, self._init_search_width)
         local_costs = 1.0 - self._ref[:, :hi].T @ live  # (hi,)
 
         D_curr = np.full(self._N, np.inf, dtype=np.float32)
@@ -188,8 +243,17 @@ class OnlineDTWFollower:
         )
 
     def _process_subsequent_frame(self, live: np.ndarray) -> FollowResult:
-        """Standard DP update for live frames > 0."""
-        lo = max(0, self._current_ref_pos - self._search_width)
+        """Standard DP update for live frames > 0.
+
+        The search band is *asymmetric*: forward extent is
+        ``search_width`` (tolerate tempo deviation / dropped frames),
+        backward extent is capped at ``back_inhibit_frames`` (prevent
+        the DP from latching onto self-similar material — e.g. an
+        earlier statement of the same theme — which is the dominant
+        failure mode on march/repeat-heavy orchestral material).
+        """
+        back = min(self._search_width, self._back_inhibit_frames)
+        lo = max(0, self._current_ref_pos - back)
         hi = min(self._N, self._current_ref_pos + self._search_width + 1)
 
         # Vectorised local cost — single matmul over the band.
@@ -223,22 +287,33 @@ class OnlineDTWFollower:
         elif lo == 0 and hi > 1:
             # i = 0 has no i-1; leave diag[0] = inf, copy the rest.
             diag[1:] = D_prev[lo:hi - 1]
-        horiz = D_prev[lo:hi]
+        # Add step_penalty to horizontal (stay) so diagonal (advance by 1)
+        # is preferred when costs are similar across the band. Without
+        # this, tightly-smoothed CENS features (cens_win=41 ≈ 3.8s) give
+        # the DP a nearly-flat local cost field, and argmin picks the
+        # leftmost minimum → the position gets stuck.
+        horiz = D_prev[lo:hi] + self._step_penalty
         partial = local_costs + np.minimum(diag, horiz)
 
-        # Serial pass for vertical (left-in-band) — Python loop on a small
-        # array is fast enough at our frame rates.
+        # Serial pass for vertical (left-in-band, ref advancing faster
+        # than live) — same penalty applied so the DP doesn't race
+        # forward gratuitously either.
         partial_list = partial.tolist()
         local_list = local_costs.tolist()
         D_curr_band = [partial_list[0]]
         for k in range(1, band_width):
-            vert = D_curr_band[k - 1] + local_list[k]
+            vert = D_curr_band[k - 1] + local_list[k] + self._step_penalty
             D_curr_band.append(min(partial_list[k], vert))
         D_curr_band_arr = np.asarray(D_curr_band, dtype=np.float32)
         D_curr[lo:hi] = D_curr_band_arr
 
-        # Find new best.
-        best_in_band = int(np.argmin(D_curr_band_arr))
+        # Find new best. When multiple positions tie at the minimum,
+        # prefer the *rightmost* (most-advanced) — this is the second
+        # half of the forward bias: even if step_penalty doesn't fully
+        # separate them, the tie-break still moves us forward.
+        min_cost = float(D_curr_band_arr.min())
+        candidates = np.where(D_curr_band_arr <= min_cost + 1e-6)[0]
+        best_in_band = int(candidates.max())
         new_pos = lo + best_in_band
         local_cost_at_best = float(local_costs[best_in_band])
 
@@ -263,7 +338,20 @@ class OnlineDTWFollower:
         with self._state_lock:
             self._cost_history.append(local_cost_at_best)
             smoothed_cost = float(np.mean(self._cost_history))
-        confidence = max(0.0, min(1.0, 1.0 - smoothed_cost))
+        match_score = max(0.0, 1.0 - smoothed_cost)
+
+        # Decisiveness: how much better is the best position than the
+        # second-best? If the DP cost is uniform across the band (the
+        # "stuck position" pathology), margin ≈ 0 and confidence is
+        # heavily suppressed — high confidence requires both a good
+        # local match AND a sharply-peaked minimum.
+        if D_curr_band_arr.size > 1:
+            sorted_costs = np.sort(D_curr_band_arr)
+            margin = float(sorted_costs[1] - sorted_costs[0])
+        else:
+            margin = 0.05  # degenerate band: treat as decisive
+        margin_score = min(1.0, margin / 0.05)  # 0.05 of cost diff = full score
+        confidence = max(0.0, min(1.0, match_score * (0.3 + 0.7 * margin_score)))
 
         return FollowResult(
             ref_frame=new_pos,

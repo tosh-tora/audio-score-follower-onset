@@ -185,13 +185,33 @@ class ConfigLoader:
         """Return kwargs forwarded to OnlineDTWFollower.
 
         Keys:
-            search_width: half-width of the search band on the reference
-                axis (frames). Wider = more tolerant to tempo deviation
-                but more drift-prone. Default 240 ≈ 11s at 22050/512.
+            search_width: forward extent of the search band on the
+                reference axis (frames). Wider = more tolerant to tempo
+                deviation but more drift-prone. Default 240 ≈ 22s at
+                hop=2048/sr=22050 — enough to absorb the 5–10% tempo
+                differences typical between recordings of the same work.
+            back_inhibit_frames: backward extent of the search band.
+                Asymmetric with ``search_width``: forward is wide for
+                tempo flexibility, back is narrow so the DP can't latch
+                onto an earlier repetition of the same theme. Default
+                30 ≈ 2.8s.
             step_size: max reference frames advanced per live frame.
                 Default 1 (no skipping).
+            step_penalty: extra cost on horizontal/vertical DP transitions
+                to bias the alignment toward "1 ref ↔ 1 live" diagonal
+                motion. Default 0.02. Critical for escaping "stuck
+                position" plateaus where DP's accumulated cost glues the
+                position in place despite live audio moving on — measured
+                in benchmark to drop different-recording coverage from
+                96% to 47% if reduced to 0.005.
         """
-        defaults = {"search_width": 240, "step_size": 1}
+        defaults = {
+            "search_width": 240,
+            "back_inhibit_frames": 30,
+            "init_search_width": 30,
+            "step_size": 1,
+            "step_penalty": 0.02,
+        }
         user_kwargs = self.settings.get("oltw_kwargs", {})
         if not isinstance(user_kwargs, dict):
             logger.warning(
