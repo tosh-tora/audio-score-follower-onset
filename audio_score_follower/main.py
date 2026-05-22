@@ -530,12 +530,14 @@ class AudioScoreFollowerApp:
                 return t
         return None
 
-    def _seek_oltw_to_ref_time(self, ref_time_sec: float) -> None:
+    def _seek_oltw_to_ref_time(
+        self, ref_time_sec: float, *, allow_catchup: bool = True
+    ) -> None:
         if self.oltw is None or self.warp_lookup is None:
             return
         fr = self.warp_lookup.feature_config.effective_frame_rate()
         target_frame = int(round(ref_time_sec * fr))
-        self.oltw.seek(target_frame)
+        self.oltw.seek(target_frame, allow_catchup=allow_catchup)
 
     def _manual_advance_to_next_trigger(self) -> None:
         """User pressed →: send slide right, then re-sync OLTW.
@@ -598,10 +600,13 @@ class AudioScoreFollowerApp:
         self._fired_trigger_measures.discard(measure)
         # Seek to a frame slightly BEFORE the measure's start so the
         # auto loop won't immediately re-fire on the next OLTW tick.
+        # No post-seek catchup: the operator says the music is BEFORE
+        # this point, so an automatic forward scan would re-defeat
+        # the back-step.
         fr = self.warp_lookup.feature_config.effective_frame_rate()
         pre_frame = max(0, int(round(ref_t * fr)) - max(1, int(round(0.2 * fr))))
         if self.oltw is not None:
-            self.oltw.seek(pre_frame)
+            self.oltw.seek(pre_frame, allow_catchup=False)
         logger.info(
             "Manual sync: OLTW re-anchored before measure %d "
             "(ref_frame=%d, ~%.2fs)",

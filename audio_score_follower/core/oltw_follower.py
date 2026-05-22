@@ -248,6 +248,11 @@ class OnlineDTWFollower:
         # backward attempts is a *different* failure mode (degraded
         # chroma matching) that DP reset can only hurt, not help.
         self._backward_attempts_in_window = 0
+        # One-shot flag set by seek(...allow_catchup=True). On the next
+        # live frame, run a bounded forward local rematch before the
+        # main DP so manual "→ catch up" overrides can close gaps
+        # larger than the DP can traverse in one live frame.
+        self._post_seek_catchup_pending = False
         self._stuck_rematch_seconds = float(stuck_rematch_seconds)
         self._stuck_rematch_min_advance = int(stuck_rematch_min_advance)
         self._stuck_rematch_cost_margin = float(stuck_rematch_cost_margin)
@@ -443,6 +448,14 @@ class OnlineDTWFollower:
         earlier statement of the same theme — which is the dominant
         failure mode on march/repeat-heavy orchestral material).
         """
+        # If the operator just pressed → (manual seek with catchup
+        # armed), let the live frame find the actual performance
+        # position within the band before normal DP starts from a
+        # possibly-still-too-early anchor. One-shot.
+        if self._post_seek_catchup_pending:
+            self._post_seek_catchup_pending = False
+            self._try_post_seek_catchup(live)
+
         back = min(self._search_width, self._back_inhibit_frames)
         lo = max(0, self._current_ref_pos - back)
         hi = min(self._N, self._current_ref_pos + self._search_width + 1)
@@ -668,20 +681,30 @@ class OnlineDTWFollower:
                 self._frozen_pos = None
                 logger.info("OLTW unfrozen")
 
-    def seek(self, ref_frame: int) -> None:
+    def seek(self, ref_frame: int, *, allow_catchup: bool = True) -> None:
         """Jump the alignment to a specific reference frame.
 
         Used by manual slide-override controls (the human pressing
         ← / →) to tell the follower "the music is actually here now".
         Wipes the cumulative DP cost and re-anchors at ``ref_frame``
         with cost 0, so subsequent live frames start a fresh DP
-        recurrence from there. This is the safe alternative to a
-        global rematch: it trusts the human's signal rather than
-        chroma argmin.
+        recurrence from there.
 
         Args:
             ref_frame: target reference frame index. Clamped to
                 ``[0, N_ref - 1]``.
+            allow_catchup: if True (default), the very next call to
+                ``process_frame`` will scan the band forward of the
+                seek target for a strongly-better local match, before
+                running normal DP. This is what lets a "→ slide
+                forward" override actually catch up when the real
+                performance is *past* the trigger we seeked to:
+                without it, the DP can only inch forward 1 frame per
+                live frame via the vertical chain, never closing the
+                gap. Pass False for ← (backward) overrides where the
+                operator says the music is *before* the target —
+                catching up would jump forward again, defeating the
+                point of the manual back-step.
         """
         ref_frame = max(0, min(int(ref_frame), self._N - 1))
         with self._state_lock:
@@ -703,10 +726,77 @@ class OnlineDTWFollower:
             self._stuck_dp_counter = 0
             self._stuck_dp_window_start_pos = ref_frame
             self._backward_attempts_in_window = 0
+            self._post_seek_catchup_pending = bool(allow_catchup)
         logger.info(
-            "OLTW seek: ref_frame=%d (%.2fs)",
+            "OLTW seek: ref_frame=%d (%.2fs)%s",
             ref_frame, ref_frame / self._cfg.effective_frame_rate(),
+            " [catchup armed]" if allow_catchup else "",
         )
+
+    def _try_post_seek_catchup(self, live: np.ndarray) -> bool:
+        """Bounded forward local rematch after a manual seek().
+
+        The operator pressed → because the real performance is at or
+        past the seeked trigger measure. After seek, current_ref_pos
+        equals that trigger, but the live frame's chroma may match a
+        position somewhere further forward in the search band — that's
+        where the conductor actually is. Normal DP can't find that
+        position in a single live frame because the vertical chain
+        through D_curr accumulates ``local + step_penalty`` per cell,
+        making far-forward cells arbitrarily expensive regardless of
+        their local match quality.
+
+        This routine bypasses the cumulative-cost barrier by directly
+        comparing local cost at the seek target vs. the band forward
+        of it, and jumping when the best forward position is decisive
+        (same discriminability_ratio guard the stuck_rematch path uses).
+        Bounded to ``[current, current + search_width]`` so it cannot
+        teleport to a self-similar passage far ahead — the worst case
+        is a small overshoot within the band.
+
+        Returns True if a jump was performed.
+        """
+        min_jump_pos = self._current_ref_pos + 1
+        max_jump_pos = min(self._N, self._current_ref_pos + self._search_width + 1)
+        if max_jump_pos <= min_jump_pos:
+            return False
+        forward_block = self._ref[:, min_jump_pos:max_jump_pos]
+        global_costs = 1.0 - forward_block.T @ live
+        best_offset = int(np.argmin(global_costs))
+        best_cost = float(global_costs[best_offset])
+        current_cost = float(1.0 - self._ref[:, self._current_ref_pos] @ live)
+
+        # Guard 1: must beat the current position.
+        if current_cost - best_cost < self._stuck_rematch_cost_margin:
+            return False
+
+        # Guard 2: relative discriminability.
+        median_cost = float(np.median(global_costs))
+        if median_cost <= 0:
+            return False
+        ratio = (median_cost - best_cost) / median_cost
+        if ratio < self._stuck_rematch_min_discriminability_ratio:
+            logger.debug(
+                "OLTW post-seek catchup: skipping, low discriminability "
+                "ratio %.2f (best %.3f, median %.3f)",
+                ratio, best_cost, median_cost,
+            )
+            return False
+
+        new_pos = min_jump_pos + best_offset
+        logger.info(
+            "OLTW post-seek catchup: %d→%d (local cost %.3f→%.3f, "
+            "discrim_ratio %.2f, +%.2fs forward)",
+            self._current_ref_pos, new_pos, current_cost, best_cost, ratio,
+            (new_pos - self._current_ref_pos) / self._cfg.effective_frame_rate(),
+        )
+        # Re-seed DP at the corrected position.
+        self._D_prev[:] = np.inf
+        self._D_prev[new_pos] = best_cost
+        self._prev_band_lo = new_pos
+        self._prev_band_hi = new_pos + 1
+        self._current_ref_pos = new_pos
+        return True
 
     def reset(self) -> None:
         """Wipe DP state — used when loading a new movement."""
@@ -724,6 +814,7 @@ class OnlineDTWFollower:
             self._stuck_dp_counter = 0
             self._stuck_dp_window_start_pos = 0
             self._backward_attempts_in_window = 0
+            self._post_seek_catchup_pending = False
         logger.info("OLTW reset")
 
     # ------------------------------------------------------------ getters

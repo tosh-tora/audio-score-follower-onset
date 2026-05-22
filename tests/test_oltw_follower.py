@@ -131,6 +131,81 @@ def test_seek_jumps_to_target_and_resumes_dp():
     )
 
 
+def test_seek_with_catchup_finds_real_position_ahead():
+    """seek + post-seek catchup: 操作者が早すぎる位置に seek した場合、
+    次の live frame で実際の演奏位置に飛び直す。
+
+    シナリオ: 演奏は ref frame 50 にいるが、操作者は trigger m=17
+    相当の frame 30 にしか seek できない (trigger 配置の制約)。
+    catchup ありなら、次フレームで chroma が一致する frame 50 を
+    band 内検索して再 anchor する。
+    """
+    cfg = FeatureConfig()
+    rng = np.random.default_rng(23)
+    ref = _make_chroma_sequence(120)
+    # Build a discriminative ref: each 10-frame block uses a distinct
+    # pitch class so live-vs-ref chroma at any other position is high.
+    ref = np.zeros((12, 120), dtype=np.float32)
+    for j in range(120):
+        ref[(j // 10) % 12, j] = 1.0
+    ref += 0.02 * rng.standard_normal(ref.shape).astype(np.float32)
+    ref = (ref / np.linalg.norm(ref, axis=0, keepdims=True)).astype(np.float32)
+
+    follower = OnlineDTWFollower(
+        ref, cfg,
+        search_width=60, back_inhibit_frames=20, init_search_width=10,
+        step_penalty=0.06, max_advance_per_frame=50,
+        stuck_dp_reset_seconds=0.0, stuck_rematch_seconds=0.0,
+    )
+    # Step the follower a few frames so it's "warm"
+    for j in range(5):
+        follower.process_frame(ref[:, j])
+
+    # seek too-early to frame 30 (with catchup armed)
+    follower.seek(30, allow_catchup=True)
+    assert follower.current_ref_frame == 30
+
+    # Feed a live frame whose chroma matches frame 50, NOT frame 30
+    r = follower.process_frame(ref[:, 50])
+
+    # post-seek catchup should have jumped us forward toward 50
+    assert r.ref_frame >= 45, (
+        f"post-seek catchup did not advance: ref_frame={r.ref_frame} "
+        f"(expected ≥45, seeked to 30, live matches 50)"
+    )
+
+
+def test_seek_without_catchup_stays_put():
+    """allow_catchup=False で post-seek catchup が走らないことを確認。
+
+    ← (back-step) 用途: 操作者が「演奏はもっと手前」と言っているので、
+    自動 forward scan は本末転倒。
+    """
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(120)
+    rng = np.random.default_rng(29)
+    ref = np.zeros((12, 120), dtype=np.float32)
+    for j in range(120):
+        ref[(j // 10) % 12, j] = 1.0
+    ref += 0.02 * rng.standard_normal(ref.shape).astype(np.float32)
+    ref = (ref / np.linalg.norm(ref, axis=0, keepdims=True)).astype(np.float32)
+
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=60, back_inhibit_frames=20,
+        init_search_width=10, step_penalty=0.06,
+        stuck_dp_reset_seconds=0.0, stuck_rematch_seconds=0.0,
+    )
+    for j in range(5):
+        follower.process_frame(ref[:, j])
+    follower.seek(30, allow_catchup=False)
+    # Live frame matches frame 50 but we don't want to jump there.
+    r = follower.process_frame(ref[:, 50])
+    # No catchup → DP should advance at most 1 frame (or stay).
+    assert r.ref_frame <= 35, (
+        f"allow_catchup=False but position jumped forward to {r.ref_frame}"
+    )
+
+
 def test_seek_clamps_out_of_range():
     """seek to a negative or past-end frame clamps to the valid range."""
     cfg = FeatureConfig()
