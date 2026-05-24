@@ -13,6 +13,7 @@ Tkinter-based GUI showing:
 import logging
 import tkinter as tk
 from tkinter import font
+from typing import Callable, Optional
 
 from audio_score_follower.core.state_manager import AppState
 
@@ -49,6 +50,16 @@ _TRIGGER_FONT_SIZE = 28
 _INERTIA_FONT_SIZE = 24
 _COOLDOWN_FONT_SIZE = 22
 _HINT_FONT_SIZE = 18
+_MODE_FONT_SIZE = 28
+_BUTTON_FONT_SIZE = 22
+
+# Colour palette for the follower-mode panel. Picked for high contrast
+# from the operator's reading distance (~5m across the pit).
+_MODE_COLOR_WAITING = ("#888888", "white")    # gray bg, white fg
+_MODE_COLOR_TRACKING = ("#2a7", "white")      # green bg
+_MODE_COLOR_INERTIA = ("#e87b00", "white")    # orange bg
+_MODE_COLOR_CAPPED = ("#c00", "white")        # red bg
+_MODE_COLOR_FLASH = ("#2255ff", "white")      # blue bg for force-lock-in flash
 
 # Window + confidence bar geometry, also scaled ~2x to match the new fonts.
 # Height bumped to 1000 so the mic-level / inertia / cooldown / hint rows
@@ -83,16 +94,28 @@ class FollowerGUI:
     Displays playback status in real-time without blocking.
     """
 
-    def __init__(self, root: tk.Tk, state: AppState):
+    def __init__(
+        self,
+        root: tk.Tk,
+        state: AppState,
+        *,
+        on_force_lock_in: Optional[Callable[[], None]] = None,
+    ):
         """
         Initialize GUI.
 
         Args:
             root: tkinter root window
             state: Shared AppState object
+            on_force_lock_in: callback fired when the operator clicks
+                the "▶ 楽章開始" button. Wired by ``main.py`` to
+                ``AudioScoreFollowerApp.manual_force_lock_in``. Optional;
+                passes a no-op if omitted so the GUI can run standalone
+                in tests.
         """
         self.root = root
         self.state = state
+        self._on_force_lock_in = on_force_lock_in or (lambda: None)
 
         self.root.title("Sequential Live Follower")
         self.root.geometry(_WINDOW_GEOMETRY)
@@ -102,6 +125,11 @@ class FollowerGUI:
         # hard-coded "Arial" has no CJK glyphs, so Japanese filenames (e.g.
         # "運命_冒頭_guide.mxl") rendered as tofu boxes.
         self._font_family = _pick_font_family(self.root)
+
+        # Force-lock-in button flash state (drives a 1s blue label
+        # immediately after the button is pressed, then reverts to
+        # the regular mode rendering).
+        self._flash_until_ms: int = 0
 
         # Create widgets
         self._create_widgets()
@@ -183,6 +211,42 @@ class FollowerGUI:
         )
         self.label_mic_level.pack(pady=2)
 
+        # ----- 追随モード表示パネル + 楽章開始ボタン -----
+        # 「いま OLTW が音を追えているのか / 慣性で進めているのか / 慣性 cap
+        # で止まっているのか」を運用者が一目で判別できるようにする。
+        # waiting (lock-in 前) / tracking (通常) / inertia / capped の 4 状態を
+        # 背景色付きラベルで明示。「▶ 楽章開始」ボタンは指揮者の振り出しに
+        # 合わせて押すと OLTW を強制 lock-in する — lock-in 成立後は
+        # no-op になるため `_render_follower_mode` で自動的に非表示に切り替える
+        # （音楽が進行しているのに「楽章開始」ボタンが残っていると運用上
+        # 違和感があるため）。
+        self.mode_frame = tk.Frame(self.root, bg="#f0f0f0")
+        self.mode_frame.pack(pady=8, fill="x", padx=20)
+
+        self.label_mode = tk.Label(
+            self.mode_frame,
+            text="⏸ 待機中",
+            font=(family, _MODE_FONT_SIZE, "bold"),
+            bg=_MODE_COLOR_WAITING[0],
+            fg=_MODE_COLOR_WAITING[1],
+            padx=20, pady=10,
+            anchor="w",
+        )
+        self.label_mode.pack(side=tk.LEFT, fill="x", expand=True)
+
+        self.button_force_lock_in = tk.Button(
+            self.mode_frame,
+            text="▶ 楽章開始",
+            font=(family, _BUTTON_FONT_SIZE, "bold"),
+            command=self._on_force_lock_in_clicked,
+            padx=12, pady=6,
+        )
+        self.button_force_lock_in.pack(side=tk.RIGHT, padx=(10, 0))
+        # Track current button visibility so we only call pack/forget when
+        # the state actually changes (cheap; avoids spurious geometry work
+        # on every 100ms poll tick).
+        self._button_visible = True
+
         # 次のトリガー
         trigger_font = font.Font(family=family, size=_TRIGGER_FONT_SIZE)
         self.label_next_trigger = tk.Label(
@@ -207,13 +271,90 @@ class FollowerGUI:
             self.root,
             text=(
                 "→/Space: スライドを進める   ←: スライドを戻す   "
-                "N: 次の楽章   R: 現在の楽章を再ロード"
+                "N: 次の楽章   R: 現在の楽章を再ロード   "
+                "L / ボタン: 楽章開始（強制 lock-in）"
             ),
             font=(family, _HINT_FONT_SIZE),
             bg="#f0f0f0",
             fg="#888",
         )
         self.label_hints.pack(side=tk.BOTTOM, pady=8)
+
+    def _on_force_lock_in_clicked(self) -> None:
+        """Button handler — forward to the application callback and
+        trigger a brief blue flash on the mode label as visual
+        confirmation that the press registered."""
+        try:
+            self._on_force_lock_in()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("force_lock_in callback raised: %s", exc, exc_info=True)
+        # Schedule a 1-second flash so the operator sees the click landed.
+        now_ms = int(self.root.tk.call("clock", "milliseconds"))
+        self._flash_until_ms = now_ms + 1000
+
+    def _render_follower_mode(self, state: dict) -> None:
+        """Render the follower-mode panel based on the AppState snapshot.
+
+        Five visual states, in priority order:
+          - flash    : just clicked the force-lock-in button (1s)
+          - capped   : inertia ran past max_inertia_seconds → position
+                       fixed, operator intervention needed (red)
+          - inertia  : inertia advancing, countdown shown (orange)
+          - tracking : DP tracking with confidence (green)
+          - waiting  : pre-lock-in, awaiting downbeat (gray)
+
+        Also toggles the "▶ 楽章開始" button visibility: shown only
+        pre-lock-in (where it has a useful effect). After lock-in the
+        button is a no-op so we hide it to keep the panel uncluttered;
+        the L keybind is still available if the operator ever needs
+        to re-arm lock-in after a reset.
+        """
+        now_ms = int(self.root.tk.call("clock", "milliseconds"))
+        if now_ms < self._flash_until_ms:
+            bg, fg = _MODE_COLOR_FLASH
+            self.label_mode.config(text="🎯 lock-in 強制発動", bg=bg, fg=fg)
+            # Don't touch button visibility during the flash — it will be
+            # re-evaluated on the next poll tick once the flash expires.
+            return
+
+        is_locked = state.get('is_locked_in', False)
+        in_inertia = state.get('is_in_inertia', False)
+        elapsed = float(state.get('inertia_elapsed_sec', 0.0))
+        cap = float(state.get('inertia_cap_sec', 10.0))
+        conf = float(state.get('confidence', 0.0))
+
+        if not is_locked:
+            bg, fg = _MODE_COLOR_WAITING
+            text = "⏸ 待機中（楽章開始を待っています）"
+        elif in_inertia and elapsed >= cap:
+            bg, fg = _MODE_COLOR_CAPPED
+            text = (
+                f"⛔ 慣性停止（位置固定）　"
+                f"手動 → / L で復帰してください"
+            )
+        elif in_inertia:
+            remaining = max(0.0, cap - elapsed)
+            bg, fg = _MODE_COLOR_INERTIA
+            text = (
+                f"🌀 慣性進行中　残り {remaining:.1f}s / {cap:.0f}s"
+                f"（音が戻れば自動復帰）"
+            )
+        else:
+            bg, fg = _MODE_COLOR_TRACKING
+            text = f"🎵 追随中　conf: {conf:.2f}"
+
+        self.label_mode.config(text=text, bg=bg, fg=fg)
+
+        # Hide the "▶ 楽章開始" button after lock-in so the panel stops
+        # showing a control that has no effect. Re-show it if lock-in
+        # somehow drops (e.g. movement reload via R clears _locked_in).
+        should_show_button = not is_locked
+        if should_show_button and not self._button_visible:
+            self.button_force_lock_in.pack(side=tk.RIGHT, padx=(10, 0))
+            self._button_visible = True
+        elif not should_show_button and self._button_visible:
+            self.button_force_lock_in.pack_forget()
+            self._button_visible = False
 
     def update_display(self):
         """Update GUI with current state."""
@@ -274,11 +415,12 @@ class FollowerGUI:
             else:
                 self.label_next_trigger.config(text="次のトリガー: --")
 
-            # 慣性モード
-            if state['inertia_mode']:
-                self.label_inertia.config(text="⚠ 慣性モード（推定）")
-            else:
-                self.label_inertia.config(text="")
+            # 慣性モード (legacy field — kept for backward compat; the
+            # primary follower-mode rendering is in label_mode below).
+            self.label_inertia.config(text="")
+
+            # ----- 追随モード表示の更新 -----
+            self._render_follower_mode(state)
 
             # クールダウン
             if state['cooldown_active']:

@@ -23,6 +23,9 @@ Usage::
 Keys (on the operator GUI window):
     N            : load next movement
     R            : reload current movement
+    L            : force OLTW lock-in (operator says "music has started";
+                   arms inertia mode immediately so silence-gate freezes
+                   become inertia progression instead of position-fix)
     → / Space    : manual slide advance
     ←            : manual slide back
 """
@@ -144,7 +147,11 @@ class AudioScoreFollowerApp:
         # Tk root + GUI (built before worker so update callbacks have
         # something to push into).
         self.root = tk.Tk()
-        self.gui = FollowerGUI(self.root, self.state)
+        self.gui = FollowerGUI(
+            self.root,
+            self.state,
+            on_force_lock_in=self.manual_force_lock_in,
+        )
 
         self._workers_stop = threading.Event()
         self._trigger_thread: threading.Thread | None = None
@@ -201,7 +208,10 @@ class AudioScoreFollowerApp:
             # "n/a" rather than a misleading -120 dBFS.
             self.state.set_mic_level(-120.0, gate_active=False, monitor_available=False)
 
-        logger.info("Ready. N=next movement, R=reload, →/Space=manual next slide.")
+        logger.info(
+            "Ready. N=next movement, R=reload, L=force lock-in, "
+            "→/Space=manual next slide, ←=manual back."
+        )
         self.root.protocol("WM_DELETE_WINDOW", self._on_gui_closing)
         try:
             self.root.mainloop()
@@ -366,6 +376,15 @@ class AudioScoreFollowerApp:
             continuous_beat, measure, beat_in_measure_display
         )
         self.state.set_confidence(result.confidence)
+        # Mirror OLTW follower mode into AppState so the GUI tracking
+        # panel reflects lock-in / inertia transitions in real time.
+        if self.oltw is not None:
+            self.state.set_follower_mode(
+                is_locked_in=self.oltw.is_locked_in,
+                is_in_inertia=self.oltw.is_in_inertia,
+                inertia_elapsed_sec=self.oltw.inertia_elapsed_sec,
+                inertia_cap_sec=self.oltw.max_inertia_seconds,
+            )
 
         # Throttled diagnostic log: emit once per wall-clock second so
         # `--verbose` doesn't drown in per-frame entries. Lets the
@@ -613,6 +632,27 @@ class AudioScoreFollowerApp:
             measure, pre_frame, pre_frame / fr,
         )
 
+    def manual_force_lock_in(self) -> None:
+        """Operator-triggered lock-in (L key or GUI "楽章開始" button).
+
+        Forces the OLTW lock-in latch ON immediately so silence-gate
+        freezes become inertia progression instead of position-fixed
+        holds. Typically pressed right at the conductor's downbeat
+        before the first sound has built up enough confidence streak
+        for the auto-latch.
+
+        Public (no leading underscore) so the GUI can wire a button
+        click directly to it.
+        """
+        if self.oltw is None:
+            logger.warning("force_lock_in pressed but OLTW not initialised yet")
+            return
+        if self.oltw.is_locked_in:
+            logger.info("force_lock_in pressed but already locked in (no-op)")
+            return
+        self.oltw.force_lock_in()
+        logger.info("Manual lock-in triggered by operator")
+
     # ---------------------------------------------------- key bindings
     def _bind_keys(self) -> None:
         def _on_n(_e: tk.Event) -> None:
@@ -620,6 +660,9 @@ class AudioScoreFollowerApp:
 
         def _on_r(_e: tk.Event) -> None:
             self._load_current_movement()
+
+        def _on_l(_e: tk.Event) -> None:
+            self.manual_force_lock_in()
 
         def _on_next(_e: tk.Event) -> None:
             self._manual_advance_to_next_trigger()
@@ -631,10 +674,12 @@ class AudioScoreFollowerApp:
         self.root.bind("<KeyPress-N>", _on_n)
         self.root.bind("<KeyPress-r>", _on_r)
         self.root.bind("<KeyPress-R>", _on_r)
+        self.root.bind("<KeyPress-l>", _on_l)
+        self.root.bind("<KeyPress-L>", _on_l)
         self.root.bind("<KeyPress-Right>", _on_next)
         self.root.bind("<KeyPress-space>", _on_next)
         self.root.bind("<KeyPress-Left>", _on_prev)
-        logger.info("Keys bound: N R → ← Space")
+        logger.info("Keys bound: N R L → ← Space")
 
 
 def main() -> int:

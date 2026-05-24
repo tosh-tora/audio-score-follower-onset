@@ -56,6 +56,15 @@ class AppState:
         self.inertia_mode: bool = False
         self.inertia_tempo_bpm: Optional[float] = None
 
+        # OLTW lock-in / inertia state — mirrored from OnlineDTWFollower
+        # by the result callback so the GUI tracking panel can render
+        # the current follower mode (waiting / tracking / inertia /
+        # inertia capped) without taking a lock on the OLTW itself.
+        self.is_locked_in: bool = False
+        self.is_in_inertia: bool = False
+        self.inertia_elapsed_sec: float = 0.0
+        self.inertia_cap_sec: float = 10.0
+
         # Live microphone level (dBFS) and whether the silence gate is
         # currently suppressing matcher confidence.  Surfaced to the GUI
         # so the operator can tell whether the mic is actually being heard.
@@ -95,6 +104,10 @@ class AppState:
                 'mic_level_db': self.mic_level_db,
                 'silence_gate_active': self.silence_gate_active,
                 'mic_monitor_available': self.mic_monitor_available,
+                'is_locked_in': self.is_locked_in,
+                'is_in_inertia': self.is_in_inertia,
+                'inertia_elapsed_sec': self.inertia_elapsed_sec,
+                'inertia_cap_sec': self.inertia_cap_sec,
             }
 
     def update_beat_measure(
@@ -202,6 +215,26 @@ class AppState:
             self.mic_level_db = level_db
             self.silence_gate_active = gate_active
             self.mic_monitor_available = monitor_available
+        self.ui_update_event.set()
+
+    def set_follower_mode(
+        self,
+        *,
+        is_locked_in: bool,
+        is_in_inertia: bool,
+        inertia_elapsed_sec: float,
+        inertia_cap_sec: float,
+    ) -> None:
+        """Update OLTW follower mode fields atomically.
+
+        Called from the result callback so the GUI can render the
+        current mode (waiting / tracking / inertia / inertia capped).
+        """
+        with self._lock:
+            self.is_locked_in = is_locked_in
+            self.is_in_inertia = is_in_inertia
+            self.inertia_elapsed_sec = inertia_elapsed_sec
+            self.inertia_cap_sec = inertia_cap_sec
         self.ui_update_event.set()
 
     def set_load_error(self, message: str) -> None:

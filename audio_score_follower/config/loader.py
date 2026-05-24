@@ -246,6 +246,40 @@ class ConfigLoader:
             "stuck_rematch_min_jump_frames": 60,
             "stuck_rematch_max_jump_frames": 480,
             "stuck_rematch_min_discriminability_ratio": 0.75,
+            # Lock-in latch: confidence>=lock_in_confidence sustained
+            # for lock_in_frames consecutive frames after the init
+            # window establishes that "the piece has been caught".
+            # After lock-in, silence-gate freezes switch from
+            # position-fixed to inertia progression. Defaults pick
+            # ~3 seconds of confident tracking (30 frames at 10.77 Hz).
+            "lock_in_frames": 30,
+            "lock_in_confidence": 0.45,
+            # Inertia mode: entered ONLY via silence-gate freeze()
+            # (post-lock-in). Low DP confidence alone does NOT enter
+            # inertia — orchestral pp passages can produce low conf
+            # while DP is still finding the right position, and
+            # overriding with inertia would degrade alt-recording
+            # coverage. Exited via _maybe_resync_from_dp when DP
+            # confidence recovers within inertia_resync_max_gap_frames.
+            # inertia_enter_frames is reserved for future use.
+            "inertia_enter_frames": 5,
+            "inertia_exit_frames": 3,
+            # Position-history window for inertia-rate estimation.
+            # 40 frames ≈ 3.7s — long enough to smooth out beat-to-beat
+            # jitter, short enough to react to gradual tempo changes.
+            "inertia_history_frames": 40,
+            # Hard cap on how long inertia may progress before falling
+            # back to position-fixed mode. Past this horizon the
+            # accumulated rate-estimate error can't be trusted; the
+            # operator must manually resync via → or L. 10s covers
+            # typical fermatas and tutti rests; for Bruckner-scale long
+            # rests, raise this to 20–30s in user config. Set 0.0 to
+            # disable inertia entirely (legacy "freeze locks position").
+            "max_inertia_seconds": 10.0,
+            # Maximum gap (ref frames) between DP estimate and inertia
+            # position for _maybe_resync_from_dp to accept the DP and
+            # exit inertia. None → use search_width (≈22s).
+            "inertia_resync_max_gap_frames": None,
         }
         user_kwargs = self.settings.get("oltw_kwargs", {})
         if not isinstance(user_kwargs, dict):
