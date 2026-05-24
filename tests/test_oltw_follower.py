@@ -78,7 +78,12 @@ def test_self_alignment_high_confidence():
     assert min(settled) > 0.7, f"low confidence: min={min(settled):.2f}"
 
 
-def test_freeze_stops_advancement():
+def test_freeze_holds_position_before_lockin():
+    """lock-in 前の freeze は位置固定 (legacy 挙動)。
+
+    冒頭ノイズで誤発火しないようにするため、曲開始を捉えるまで
+    (lock-in 未確立の間) は silence gate による freeze で位置を固定する。
+    """
     cfg = FeatureConfig()
     ref = _make_chroma_sequence(60)
     follower = OnlineDTWFollower(ref, cfg, search_width=20)
@@ -86,17 +91,268 @@ def test_freeze_stops_advancement():
     for j in range(10):
         follower.process_frame(ref[:, j])
 
+    assert not follower.is_locked_in, (
+        "10 frames of cyclic chroma should not have established lock-in"
+    )
+
     frozen_pos = follower.current_ref_frame
     follower.freeze()
     for j in range(10, 20):
         r = follower.process_frame(ref[:, j])
-        assert r.ref_frame == frozen_pos
+        assert r.ref_frame == frozen_pos, (
+            f"pre-lock-in freeze should hold position, got {r.ref_frame}"
+        )
         assert r.confidence == 0.0
 
     follower.unfreeze()
     for j in range(20, 40):
         follower.process_frame(ref[:, j])
     assert follower.current_ref_frame >= frozen_pos
+
+
+def test_freeze_continues_inertia_after_lockin():
+    """lock-in 後の freeze は慣性進行: 位置が止まらず動き続ける。
+
+    シナリオ: random unit chroma (test_self_alignment_high_confidence
+    と同じ前提) で 高 confidence を 30 frame 維持 → 自動 lock-in。
+    その後 freeze → confidence=0 のまま位置が前進し続ける。
+    """
+    cfg = FeatureConfig()
+    rng = np.random.default_rng(7)
+    ref = rng.standard_normal((12, 200)).astype(np.float32)
+    ref = np.abs(ref)
+    norms = np.linalg.norm(ref, axis=0, keepdims=True)
+    ref = (ref / norms).astype(np.float32)
+
+    # Use the natural defaults: lock_in_frames=30, lock_in_confidence=0.45
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=20, init_search_width=10,
+    )
+
+    # Drive 80 self-aligned frames so lock-in latches and history fills.
+    for j in range(80):
+        follower.process_frame(ref[:, j])
+
+    assert follower.is_locked_in, (
+        f"expected lock-in after 80 high-conf frames; "
+        f"current_ref_frame={follower.current_ref_frame}"
+    )
+
+    frozen_pos = follower.current_ref_frame
+    follower.freeze()
+    assert follower.is_in_inertia, "freeze() post-lock-in must enter inertia"
+
+    # 20 frozen frames → inertia should advance position.
+    for _ in range(20):
+        r = follower.process_frame(np.zeros(12, dtype=np.float32))  # input ignored while frozen
+        assert r.confidence == 0.0, "inertia must report confidence=0"
+
+    new_pos = follower.current_ref_frame
+    advance = new_pos - frozen_pos
+    # At rate ~1.0 (self-aligned), 20 frames → ~20 ref frames forward.
+    # Allow generous tolerance because the rate is estimated from finite history.
+    assert advance > 10, (
+        f"inertia did not advance: frozen_pos={frozen_pos} → {new_pos} "
+        f"(advance={advance}, expected > 10)"
+    )
+    assert advance <= 25, (
+        f"inertia advanced too far: advance={advance} (expected ~20, max ~25)"
+    )
+
+
+def test_inertia_capped_by_max_seconds():
+    """慣性は max_inertia_seconds で打ち止め、それ以降は位置固定。"""
+    cfg = FeatureConfig()
+    rng = np.random.default_rng(11)
+    ref = rng.standard_normal((12, 500)).astype(np.float32)
+    ref = np.abs(ref)
+    ref = (ref / np.linalg.norm(ref, axis=0, keepdims=True)).astype(np.float32)
+
+    # Tight cap so test runs quickly: 1 second = ~10 frames at default rate.
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=20, init_search_width=10,
+        max_inertia_seconds=1.0,
+    )
+
+    # Establish lock-in.
+    for j in range(80):
+        follower.process_frame(ref[:, j])
+    assert follower.is_locked_in
+
+    frozen_pos = follower.current_ref_frame
+    follower.freeze()
+
+    # Drive 60 frames during freeze. Cap is ~10 frames; rest should be
+    # held at the capped position.
+    positions = []
+    for _ in range(60):
+        r = follower.process_frame(np.zeros(12, dtype=np.float32))
+        positions.append(r.ref_frame)
+
+    # The last position should be stationary for many frames (cap engaged).
+    last_n = positions[-20:]
+    assert max(last_n) - min(last_n) == 0, (
+        f"position should be stationary after cap; last 20={last_n}"
+    )
+    # The capped position should not have advanced more than the cap allows.
+    cap_frames = int(round(1.0 * cfg.effective_frame_rate()))
+    advance = positions[-1] - frozen_pos
+    assert advance <= cap_frames + 1, (
+        f"advance {advance} exceeds cap {cap_frames} (frozen at {frozen_pos}, "
+        f"capped at {positions[-1]})"
+    )
+
+
+def test_inertia_persists_after_unfreeze_until_dp_resync():
+    """unfreeze() 直後は inertia を即座に解除せず、DP-resync を待つ。
+
+    シナリオ:
+      1. 自己整列で lock-in 確立
+      2. freeze() で inertia 開始
+      3. unfreeze() — _frozen=False だが _inertia_active=True のまま
+      4. 正しい chroma を流すと _process_subsequent_frame の DP が
+         走り、_maybe_resync_from_dp が発火して inertia を抜ける
+    """
+    cfg = FeatureConfig()
+    rng = np.random.default_rng(41)
+    ref = rng.standard_normal((12, 200)).astype(np.float32)
+    ref = np.abs(ref)
+    ref = (ref / np.linalg.norm(ref, axis=0, keepdims=True)).astype(np.float32)
+
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=30, init_search_width=10,
+        inertia_exit_frames=3,
+    )
+    for j in range(80):
+        follower.process_frame(ref[:, j])
+    assert follower.is_locked_in
+
+    follower.freeze()
+    assert follower.is_in_inertia
+    # Run inertia for some frames (input ignored while frozen).
+    for _ in range(15):
+        follower.process_frame(np.zeros(12, dtype=np.float32))
+
+    follower.unfreeze()
+    # Inertia must still be active immediately after unfreeze.
+    assert follower.is_in_inertia, (
+        "unfreeze() should not immediately exit inertia — DP resync handles it"
+    )
+
+    # Feed correct chroma. DP runs and _maybe_resync_from_dp fires
+    # once high_conf_streak >= inertia_exit_frames.
+    dp_pos = follower._current_ref_pos
+    for j in range(dp_pos, min(dp_pos + 30, ref.shape[1])):
+        follower.process_frame(ref[:, j])
+
+    assert not follower.is_in_inertia, (
+        "DP recovery did not exit inertia after correct chroma resumed"
+    )
+
+
+def test_inertia_does_not_global_rematch(monkeypatch):
+    """慣性中は _try_global_rematch が呼ばれないことを spy で検証。
+
+    回帰防止: 慣性中に global rematch が走ると、distant self-similar
+    位置へのテレポートで慣性追従が破壊される。本テストは freeze() →
+    unfreeze() 後の慣性継続中に DP が走るシナリオで rematch 抑制を
+    確認する。
+
+    実テストでは confidence smoothing の影響で resync が早期発火し
+    inertia がすぐ抜けてしまうため、_maybe_resync_from_dp を mock
+    して常に False を返すように固定し、inertia 状態を maintainal。
+    """
+    cfg = FeatureConfig()
+    rng = np.random.default_rng(53)
+    ref = rng.standard_normal((12, 200)).astype(np.float32)
+    ref = np.abs(ref)
+    ref = (ref / np.linalg.norm(ref, axis=0, keepdims=True)).astype(np.float32)
+
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=30, init_search_width=10,
+        stuck_rematch_seconds=0.5,  # 5 frames — would normally fire
+        stuck_rematch_min_advance=3,
+        stuck_rematch_cost_margin=0.01,
+        stuck_rematch_min_discriminability_ratio=0.0,
+    )
+    for j in range(80):
+        follower.process_frame(ref[:, j])
+    assert follower.is_locked_in
+
+    follower.freeze()
+    follower.unfreeze()
+    assert follower.is_in_inertia
+
+    # Force resync to never fire so inertia stays active throughout.
+    monkeypatch.setattr(follower, "_maybe_resync_from_dp", lambda *_a, **_kw: False)
+
+    # Spy on _try_global_rematch.
+    calls = []
+    original = follower._try_global_rematch
+
+    def spy(live, cost):
+        calls.append(cost)
+        return original(live, cost)
+    monkeypatch.setattr(follower, "_try_global_rematch", spy)
+
+    # Feed mixed input — some self-aligned (would normally let DP
+    # advance) and some zeros (stuck). Either way rematch must NOT
+    # fire during inertia.
+    for j in range(30):
+        # Feed the same frame repeatedly to make DP appear stuck —
+        # the exact stuck_rematch trigger condition.
+        follower.process_frame(ref[:, 50])
+
+    assert follower.is_in_inertia, "inertia state should persist throughout"
+    assert not calls, (
+        f"_try_global_rematch called {len(calls)} times during inertia"
+    )
+
+
+def test_force_lock_in_immediate():
+    """force_lock_in() で即座に lock-in 状態になる (GUI ボタン用 API)。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20)
+
+    assert not follower.is_locked_in
+    follower.force_lock_in()
+    assert follower.is_locked_in
+
+    # Idempotent: second call is a no-op
+    follower.force_lock_in()
+    assert follower.is_locked_in
+
+
+def test_force_lock_in_enables_inertia_on_freeze():
+    """force_lock_in() 後の freeze は inertia mode に入る。
+
+    指揮者の振り出しに合わせてオペレータが「楽章開始」ボタンを
+    押した直後、まだ自動 lock-in は確立していなくても、強制 lock-in
+    で慣性経路が即座に有効化されることを確認。
+    """
+    cfg = FeatureConfig()
+    rng = np.random.default_rng(23)
+    ref = rng.standard_normal((12, 100)).astype(np.float32)
+    ref = np.abs(ref)
+    ref = (ref / np.linalg.norm(ref, axis=0, keepdims=True)).astype(np.float32)
+
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=20, init_search_width=10,
+    )
+
+    # Drive a few frames so history begins to fill.
+    for j in range(20):
+        follower.process_frame(ref[:, j])
+
+    # Force lock-in (operator action).
+    follower.force_lock_in()
+    assert follower.is_locked_in
+
+    follower.freeze()
+    assert follower.is_in_inertia, (
+        "force_lock_in() + freeze() should enter inertia mode"
+    )
 
 
 def test_seek_jumps_to_target_and_resumes_dp():
@@ -525,6 +781,64 @@ def test_back_inhibit_zero_forbids_all_backward_motion():
             f"frame {j}: band_lo={result.band_lo} < prev_lo={prev_lo}"
         )
         prev_lo = result.band_lo
+
+
+def test_compute_inertia_rate_returns_fallback_when_history_short():
+    """履歴が 5 件未満の時は fallback 1.0 を返す。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    f = OnlineDTWFollower(ref, cfg, search_width=20)
+    # No history at all
+    assert f._compute_inertia_rate() == 1.0
+    # Seed 4 entries (under the 5-required threshold)
+    for j in range(4):
+        f._pos_history.append((j, j))
+    assert f._compute_inertia_rate() == 1.0
+
+
+def test_compute_inertia_rate_diagonal_history_yields_unit_rate():
+    """live/ref が 1 対 1 で進んだ履歴は rate=1.0 になる。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    f = OnlineDTWFollower(ref, cfg, search_width=20)
+    for j in range(20):
+        f._pos_history.append((j, j))
+    assert abs(f._compute_inertia_rate() - 1.0) < 1e-6
+
+
+def test_compute_inertia_rate_estimates_half_speed():
+    """ref が live の半分の速度で進む履歴は rate≈0.5。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    f = OnlineDTWFollower(ref, cfg, search_width=20)
+    for j in range(20):
+        # live frame j → ref pos j // 2 (half speed)
+        f._pos_history.append((j, j // 2))
+    rate = f._compute_inertia_rate()
+    # 19 live frames span (0→9) ref → rate = 9/19 ≈ 0.474
+    assert 0.4 < rate < 0.55, f"expected ~0.5, got {rate}"
+
+
+def test_compute_inertia_rate_clamps_extreme_slow():
+    """異常に遅い rate (<0.3) はクランプされる。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    f = OnlineDTWFollower(ref, cfg, search_width=20)
+    # live advances 20 frames, ref barely moves (1 frame)
+    for j in range(20):
+        f._pos_history.append((j, j // 20))
+    assert f._compute_inertia_rate() == 0.3
+
+
+def test_compute_inertia_rate_clamps_extreme_fast():
+    """異常に速い rate (>2.0) はクランプされる。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(200)
+    f = OnlineDTWFollower(ref, cfg, search_width=20)
+    # live advances 10 frames, ref advances 100 (10x rate)
+    for j in range(10):
+        f._pos_history.append((j, j * 10))
+    assert f._compute_inertia_rate() == 2.0
 
 
 def test_offset_input_tracks_with_lag():

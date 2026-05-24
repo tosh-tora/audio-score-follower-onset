@@ -77,6 +77,13 @@ class OnlineDTWFollower:
         stuck_rematch_max_jump_frames: int = 480,
         stuck_rematch_min_discriminability_ratio: float = 0.75,
         confidence_smoothing: int = 5,
+        lock_in_frames: int = 30,
+        lock_in_confidence: float = 0.45,
+        inertia_enter_frames: int = 5,
+        inertia_exit_frames: int = 3,
+        inertia_history_frames: int = 40,
+        max_inertia_seconds: float = 10.0,
+        inertia_resync_max_gap_frames: int | None = None,
     ) -> None:
         """
         Args:
@@ -194,6 +201,37 @@ class OnlineDTWFollower:
                 from an initial mislock shows ratios > 0.95 (decisive
                 peak in chroma space).
             confidence_smoothing: window (frames) for confidence EMA.
+            lock_in_frames: number of consecutive frames with
+                ``confidence >= lock_in_confidence`` required to consider
+                "the piece has been caught" and switch from position-fixed
+                freeze to inertia-progression behaviour. Default 30
+                (≈3s at 10.77 Hz). Once lock-in is set, it stays set for
+                the lifetime of this follower (monotonic).
+            lock_in_confidence: confidence threshold for lock-in counter
+                and for ``_maybe_resync_from_dp`` recovery. Default 0.45.
+            inertia_enter_frames: number of consecutive low-confidence
+                frames required to enter inertia mode automatically.
+                Default 5. (silence-gate ``freeze()`` enters inertia
+                immediately, bypassing this counter.)
+            inertia_exit_frames: number of consecutive high-confidence
+                DP frames required to exit inertia mode via
+                ``_maybe_resync_from_dp``. Default 3.
+            inertia_history_frames: window (frames) of position history
+                kept for inertia-rate estimation. Default 40 (≈3.7s at
+                10.77 Hz). Larger = smoother inertia rate but slower to
+                react to tempo changes.
+            max_inertia_seconds: hard cap on how long inertia
+                progression may continue before falling back to
+                position-fixed mode (operator-recoverable via manual
+                seek). Default 10.0s. Prevents accumulated rate-estimate
+                error from growing without bound during arbitrarily
+                long silences. Set 0.0 to disable inertia entirely
+                (=legacy "freeze locks position" behaviour).
+            inertia_resync_max_gap_frames: maximum gap (in ref frames)
+                between DP-estimated position and inertia position for
+                ``_maybe_resync_from_dp`` to accept the DP and exit
+                inertia. None (default) = use ``search_width`` (≈22s)
+                so the resync follows the DP search band.
         """
         if reference_cens.ndim != 2 or reference_cens.shape[0] != 12:
             raise ValueError(
@@ -286,13 +324,75 @@ class OnlineDTWFollower:
 
         self._cost_history: deque[float] = deque(maxlen=int(confidence_smoothing))
 
+        # Lock-in + inertia state ------------------------------------------
+        # Lock-in is a monotonic latch: once the piece has been "caught"
+        # (sustained high confidence after init phase, OR operator pressed
+        # the GUI "楽章開始" button), freeze() / low-confidence no longer
+        # parks the position; instead inertia progression advances ref_pos
+        # at the most recently observed live-to-ref rate, while the DP
+        # keeps running underneath and _maybe_resync_from_dp recovers when
+        # the DP regains a confident match.
+        if lock_in_frames < 0:
+            raise ValueError("lock_in_frames must be >= 0")
+        if not 0.0 <= lock_in_confidence <= 1.0:
+            raise ValueError("lock_in_confidence must be in [0, 1]")
+        if inertia_enter_frames < 1:
+            raise ValueError("inertia_enter_frames must be >= 1")
+        if inertia_exit_frames < 1:
+            raise ValueError("inertia_exit_frames must be >= 1")
+        if inertia_history_frames < 2:
+            raise ValueError("inertia_history_frames must be >= 2")
+        if max_inertia_seconds < 0:
+            raise ValueError("max_inertia_seconds must be >= 0")
+
+        self._lock_in_frames = int(lock_in_frames)
+        self._lock_in_confidence = float(lock_in_confidence)
+        self._inertia_enter_frames = int(inertia_enter_frames)
+        self._inertia_exit_frames = int(inertia_exit_frames)
+        self._inertia_history_frames = int(inertia_history_frames)
+        self._max_inertia_seconds = float(max_inertia_seconds)
+        self._max_inertia_frames = int(
+            round(self._max_inertia_seconds * self._cfg.effective_frame_rate())
+        )
+        self._inertia_resync_max_gap_frames = (
+            int(inertia_resync_max_gap_frames)
+            if inertia_resync_max_gap_frames is not None
+            else int(search_width)
+        )
+
+        self._locked_in: bool = False
+        self._high_conf_streak: int = 0
+        self._low_conf_streak: int = 0
+        self._pos_history: deque[tuple[int, int]] = deque(
+            maxlen=self._inertia_history_frames
+        )
+
+        # Inertia mode: when active, _current_ref_pos advances by
+        # _compute_inertia_rate() per live frame instead of by DP argmin.
+        # _inertia_ref_pos holds the fractional position (int truncation
+        # only on output to _current_ref_pos) so accumulated drift stays
+        # bounded across many frames at non-integer rates.
+        self._inertia_active: bool = False
+        self._inertia_ref_pos: float = 0.0
+        self._inertia_frames_elapsed: int = 0
+        # Cached last-good inertia rate so quick re-entries (where
+        # _pos_history hasn't yet refilled past the 5-sample minimum)
+        # don't degenerate to the 1.0 fallback. Updated whenever
+        # _compute_inertia_rate produces a valid estimate.
+        # 1.0 is the bootstrap fallback used at the very first inertia
+        # entry, before any history has accumulated.
+        self._last_good_rate: float = 1.0
+
         self._state_lock = threading.Lock()
 
         logger.info(
             "OnlineDTWFollower initialised: N_ref=%d, search_width=%d, "
-            "back_inhibit=%d, step_penalty=%.3f, feature_rate=%.2f Hz",
+            "back_inhibit=%d, step_penalty=%.3f, feature_rate=%.2f Hz, "
+            "lock_in=%d frames @ conf>=%.2f, max_inertia=%.1fs",
             self._N, self._search_width, self._back_inhibit_frames,
             self._step_penalty, self._cfg.effective_frame_rate(),
+            self._lock_in_frames, self._lock_in_confidence,
+            self._max_inertia_seconds,
         )
 
     # ------------------------------------------------------------ runtime
@@ -307,19 +407,7 @@ class OnlineDTWFollower:
             FollowResult with the new reference position and confidence.
         """
         if self._frozen:
-            # While frozen, keep returning the frozen position. We still
-            # update _live_frame_idx so resumes don't re-trigger the
-            # initial-frame branch.
-            pos = self._frozen_pos if self._frozen_pos is not None else self._current_ref_pos
-            self._live_frame_idx += 1
-            return FollowResult(
-                ref_frame=pos,
-                ref_time_sec=pos / self._cfg.effective_frame_rate(),
-                confidence=0.0,
-                raw_local_cost=float("nan"),
-                band_lo=pos,
-                band_hi=pos + 1,
-            )
+            return self._run_frozen_step()
 
         live = live_cens_frame.astype(np.float32, copy=False).reshape(-1)
         if live.shape[0] != 12:
@@ -612,7 +700,12 @@ class OnlineDTWFollower:
         self._stuck_counter += 1
         if self._stuck_window_frames > 0 and self._stuck_counter >= self._stuck_window_frames:
             advance = self._current_ref_pos - self._stuck_window_start_pos
-            if advance < self._stuck_rematch_min_advance:
+            # During inertia, the DP's _current_ref_pos is the band
+            # anchor under the inertia overlay — its "stuck" reading
+            # is meaningless for global rematch decisions, and a forward
+            # teleport on top of inertia would defeat the whole point
+            # of bounding recovery to the resync gap. Skip.
+            if advance < self._stuck_rematch_min_advance and not self._inertia_active:
                 jumped = self._try_global_rematch(live, local_cost_at_best)
                 if jumped:
                     new_pos = self._current_ref_pos
@@ -646,40 +739,334 @@ class OnlineDTWFollower:
         margin_score = min(1.0, margin / 0.05)  # 0.05 of cost diff = full score
         confidence = max(0.0, min(1.0, match_score * (0.3 + 0.7 * margin_score)))
 
+        # ---- lock-in + inertia bookkeeping -----------------------------
+        # Track high/low confidence streaks for lock-in latching and
+        # inertia entry. Position history is only updated on
+        # high-conf, locked-in, non-inertia frames so the rate
+        # estimator isn't polluted by DP wandering during low-conf
+        # passages or by stale samples during inertia.
+        if confidence >= self._lock_in_confidence:
+            self._high_conf_streak += 1
+            self._low_conf_streak = 0
+            if self._locked_in and not self._inertia_active:
+                self._pos_history.append(
+                    (self._live_frame_idx, self._current_ref_pos)
+                )
+        else:
+            self._low_conf_streak += 1
+            self._high_conf_streak = 0
+        self._update_lock_in()
+
+        # Inertia management: ONLY enter via the explicit silence-gate
+        # freeze() path (handled in process_frame's frozen branch).
+        # Low DP confidence alone is NOT enough — orchestral pp / pizz
+        # passages can produce low conf for many frames while DP is
+        # still finding the right position (just with reduced margin
+        # because chroma is less discriminative). Overriding DP with
+        # inertia in those cases caused a regression where alt-recording
+        # coverage dropped from 100% to 34%.
+        #
+        # If we ARE in inertia (entered via freeze, then unfreeze called
+        # while DP keeps running), try DP-based recovery on this frame
+        # and either snap back or continue inertia.
+        out_pos = new_pos
+        out_conf = confidence
+        if self._inertia_active:
+            recovered = self._maybe_resync_from_dp(new_pos, confidence)
+            if recovered:
+                # seek() updated _current_ref_pos to dp_pos.
+                out_pos = self._current_ref_pos
+                out_conf = confidence
+            else:
+                # Inertia still active — advance the displayed inertia
+                # position. DP keeps running underneath (its
+                # _current_ref_pos was already updated and remains the
+                # DP's anchor) so the next resync attempt has fresh data.
+                self._advance_inertia()
+                out_pos = int(self._inertia_ref_pos)
+                out_conf = 0.0  # mute so triggers don't fire on a guess
+
         return FollowResult(
-            ref_frame=new_pos,
-            ref_time_sec=new_pos / self._cfg.effective_frame_rate(),
-            confidence=confidence,
+            ref_frame=out_pos,
+            ref_time_sec=out_pos / self._cfg.effective_frame_rate(),
+            confidence=out_conf,
             raw_local_cost=local_cost_at_best,
             band_lo=lo,
             band_hi=hi,
         )
 
+    # ------------------------------------------------------------ frozen path
+    def _run_frozen_step(self) -> FollowResult:
+        """Per-frame advance while ``_frozen`` is set.
+
+        Two modes depending on lock-in:
+
+        1. **Pre-lock-in (legacy)**: position is fixed at ``_frozen_pos``
+           with confidence=0. Same behaviour the silence gate has had
+           since pymatchmaker days — prevents startup noise from
+           establishing a spurious anchor.
+        2. **Post-lock-in (inertia)**: position advances by
+           ``_compute_inertia_rate()`` per live frame, capped at
+           ``max_inertia_seconds``. Confidence still reported as 0 so
+           triggers (which check ``confidence >= _TRIGGER_CONFIDENCE_FLOOR``)
+           stay suppressed during inertia — the position is a guess,
+           not a confirmed match.
+
+        ``_live_frame_idx`` is still incremented so resumes don't
+        re-trigger the initial-frame branch in ``process_frame``.
+        """
+        self._live_frame_idx += 1
+
+        if self._inertia_active:
+            self._advance_inertia()
+            pos = int(self._inertia_ref_pos)
+        else:
+            pos = (
+                self._frozen_pos
+                if self._frozen_pos is not None
+                else self._current_ref_pos
+            )
+
+        return FollowResult(
+            ref_frame=pos,
+            ref_time_sec=pos / self._cfg.effective_frame_rate(),
+            confidence=0.0,
+            raw_local_cost=float("nan"),
+            band_lo=pos,
+            band_hi=pos + 1,
+        )
+
+    def _advance_inertia(self) -> None:
+        """Advance ``_inertia_ref_pos`` by one inertia step.
+
+        Does NOT touch ``_current_ref_pos`` — that field is owned by
+        the DP, which keeps tracking underneath inertia so that
+        ``_maybe_resync_from_dp`` can detect recovery. The effective
+        output position (what the GUI / score-mapper sees) is read
+        through the ``current_ref_frame`` property and ``FollowResult.ref_frame``,
+        both of which prefer ``_inertia_ref_pos`` when inertia is active.
+
+        After ``_max_inertia_frames`` have elapsed, ``_inertia_ref_pos``
+        is held constant (cap). Accumulated rate-estimate error can't
+        be trusted past that horizon, so we fall back to "park here
+        and wait for the operator to manually resync".
+        """
+        if self._inertia_frames_elapsed < self._max_inertia_frames:
+            rate = self._compute_inertia_rate()
+            self._inertia_ref_pos = min(
+                float(self._N - 1),
+                self._inertia_ref_pos + rate,
+            )
+        self._inertia_frames_elapsed += 1
+
+    # ------------------------------------------------------------ lock-in
+    def _update_lock_in(self) -> None:
+        """Latch ``_locked_in`` once the piece has been confidently caught.
+
+        Conditions (all must hold):
+          1. Not already locked in (latch is monotonic — once True,
+             never reverts within this follower's lifetime).
+          2. Initialisation phase is over (``_live_frame_idx`` has
+             advanced past ``init_search_width``). Before this the DP
+             is still establishing its band and confidence can spike
+             on coincidental matches.
+          3. ``_high_conf_streak`` reached ``_lock_in_frames``.
+
+        Setting ``_lock_in_frames=0`` would lock in on the very first
+        high-confidence frame after init — the no-streak-required mode.
+        """
+        if self._locked_in:
+            return
+        if self._live_frame_idx <= self._init_search_width:
+            return
+        if self._high_conf_streak >= self._lock_in_frames:
+            self._locked_in = True
+            logger.info(
+                "OLTW locked in at live_frame=%d ref_pos=%d "
+                "(high_conf_streak=%d, threshold=%d)",
+                self._live_frame_idx, self._current_ref_pos,
+                self._high_conf_streak, self._lock_in_frames,
+            )
+
+    def _compute_inertia_rate(self) -> float:
+        """Estimate ref-frames-per-live-frame from recent history.
+
+        Reads ``_pos_history`` (high-confidence positions sampled in
+        ``_process_subsequent_frame``) and returns ``Δref / Δlive``
+        between the oldest and newest entries. Clamped to [0.3, 2.0] to
+        reject outliers from extreme rubato.
+
+        Falls back to ``_last_good_rate`` (cached from the previous
+        successful estimate) when history is too short. This matters
+        for fast-cycling inertia: when a resync clears history and the
+        next inertia entry happens before 5 high-conf frames have
+        accumulated, the cached rate (e.g. 0.95 from earlier) is
+        vastly better than the bootstrap 1.0 — especially for slower
+        live performances against a faster reference, where 1.0 would
+        consistently overshoot and trigger more frequent inertia cycles.
+
+        The clamp range matches the practical envelope of orchestral
+        tempo deviation against a reference recording: at the slow end,
+        a luftpause / extreme ritardando wouldn't credibly hold above
+        0.3× live for sustained periods (faster than that and the
+        operator would manually intervene); at the fast end, an accel
+        beyond 2× would similarly be operator-triggered.
+        """
+        if len(self._pos_history) < 5:
+            return self._last_good_rate
+        live_old, ref_old = self._pos_history[0]
+        live_new, ref_new = self._pos_history[-1]
+        d_live = live_new - live_old
+        if d_live <= 0:
+            return self._last_good_rate
+        rate = (ref_new - ref_old) / float(d_live)
+        rate = max(0.3, min(2.0, rate))
+        # Cache for future fast re-entries.
+        self._last_good_rate = rate
+        return rate
+
+    def _maybe_resync_from_dp(self, dp_pos: int, dp_conf: float) -> bool:
+        """Attempt to exit inertia mode by re-anchoring on the DP estimate.
+
+        Called from the tail of ``_process_subsequent_frame`` whenever
+        inertia is active. The DP keeps running under inertia (its
+        anchor is its own ``_current_ref_pos``), so when the music
+        comes back and DP confidence rises within range of the inertia
+        position, we should accept the DP's truth and resume normal
+        tracking.
+
+        Conditions (all must hold):
+          1. Confidence has been ``>= lock_in_confidence`` for
+             ``_inertia_exit_frames`` consecutive frames.
+          2. DP estimate lies within ``_inertia_resync_max_gap_frames``
+             of the inertia position (so we're not snapping to a
+             distant self-similar match).
+
+        On accept: clear inertia state, ``seek(dp_pos, allow_catchup=True)``
+        to re-anchor DP cumulative cost and arm the post-seek catchup
+        for forward refinement on the next live frame. The
+        ``_pos_history`` is cleared because it was accumulated near the
+        old (pre-inertia) position and is no longer relevant.
+
+        Returns True if a resync was performed.
+        """
+        if not self._inertia_active:
+            return False
+        if self._high_conf_streak < self._inertia_exit_frames:
+            return False
+        gap = abs(int(dp_pos) - int(self._inertia_ref_pos))
+        if gap > self._inertia_resync_max_gap_frames:
+            return False
+
+        inertia_pos = int(self._inertia_ref_pos)
+        elapsed = (
+            self._inertia_frames_elapsed / self._cfg.effective_frame_rate()
+        )
+        logger.info(
+            "OLTW inertia → DP resync: ran %.1fs, inertia_pos=%d → "
+            "dp_pos=%d (gap=%d, conf=%.2f)",
+            elapsed, inertia_pos, dp_pos, gap, dp_conf,
+        )
+        self._inertia_active = False
+        self._inertia_frames_elapsed = 0
+        self._pos_history.clear()
+        # seek() acquires _state_lock; we're not holding it here.
+        self.seek(int(dp_pos), allow_catchup=True)
+        return True
+
+    def force_lock_in(self) -> None:
+        """Externally force the lock-in latch ON.
+
+        Called from the GUI "楽章開始" button when the operator wants
+        to manually arm inertia mode before the auto lock-in conditions
+        are met — typically right at the conductor's downbeat so the
+        first few seconds of music can use inertia recovery if needed.
+        Idempotent; subsequent calls are no-ops.
+        """
+        if self._locked_in:
+            return
+        self._locked_in = True
+        logger.info(
+            "OLTW lock-in forced (manual) at live_frame=%d ref_pos=%d",
+            self._live_frame_idx, self._current_ref_pos,
+        )
+
     # ------------------------------------------------------------ control
     def freeze(self) -> None:
-        """Stop advancing the alignment (e.g. during a silence gate).
+        """Suspend DP advance — entered by the silence gate.
 
-        Called from a different thread than process_frame, typically. The
-        next process_frame call will return the frozen position with
-        confidence=0.
+        Semantics depend on whether the piece has been locked in:
+
+        * **Pre-lock-in**: position is frozen at the current ref frame
+          and held there until ``unfreeze()`` (legacy behaviour, prevents
+          startup noise from anchoring on a spurious match).
+        * **Post-lock-in**: enters **inertia mode** — position keeps
+          advancing at the most recently observed live-to-ref rate,
+          capped at ``max_inertia_seconds``. Confidence still reported
+          as 0 so auto-triggers don't fire on a guessed position.
+          The DP state (``_D_prev``) is preserved so an ``unfreeze()``
+          can hand back to normal DP without restarting from scratch.
+
+        Setting ``max_inertia_seconds=0.0`` in config disables the
+        inertia behaviour entirely (=fully legacy: freeze always parks).
+
+        Thread-safe relative to ``process_frame`` via ``_state_lock``.
         """
         with self._state_lock:
-            if not self._frozen:
-                self._frozen = True
+            if self._frozen:
+                return
+            self._frozen = True
+            if self._locked_in and self._max_inertia_seconds > 0:
+                self._inertia_active = True
+                self._inertia_ref_pos = float(self._current_ref_pos)
+                self._inertia_frames_elapsed = 0
+                rate = self._compute_inertia_rate()
+                logger.info(
+                    "OLTW frozen → inertia at ref_frame=%d "
+                    "(rate=%.2f, cap=%.1fs)",
+                    self._current_ref_pos, rate,
+                    self._max_inertia_seconds,
+                )
+            else:
                 self._frozen_pos = self._current_ref_pos
                 logger.info(
-                    "OLTW frozen at ref_frame=%d (%.2fs)",
+                    "OLTW frozen (position fixed, pre-lock-in) at "
+                    "ref_frame=%d (%.2fs)",
                     self._frozen_pos,
                     self._frozen_pos / self._cfg.effective_frame_rate(),
                 )
 
     def unfreeze(self) -> None:
-        """Resume advancing. The DP state was preserved during freeze."""
+        """Resume DP advance. Inertia (if active) keeps running until
+        ``_maybe_resync_from_dp`` confirms DP recovery.
+
+        The DP state was preserved during freeze, but DP was not
+        running so ``_current_ref_pos`` is wherever it was before
+        the freeze. ``_inertia_ref_pos`` advanced during the freeze.
+        On the next live frames, DP runs normally and
+        ``_maybe_resync_from_dp`` watches for sustained high conf
+        within range of the inertia position — that's the "前後
+        マッチングして復帰" path the user wanted. Until resync,
+        the displayed position keeps being the inertia value (so
+        the GUI doesn't jump backward to a stale DP position).
+        """
         with self._state_lock:
-            if self._frozen:
-                self._frozen = False
-                self._frozen_pos = None
-                logger.info("OLTW unfrozen")
+            if not self._frozen:
+                return
+            self._frozen = False
+            self._frozen_pos = None
+            if self._inertia_active:
+                elapsed = (
+                    self._inertia_frames_elapsed
+                    / self._cfg.effective_frame_rate()
+                )
+                logger.info(
+                    "OLTW unfrozen, inertia continues at ref_pos=%d "
+                    "(ran %.1fs; DP will take over via _maybe_resync_from_dp)",
+                    int(self._inertia_ref_pos), elapsed,
+                )
+            else:
+                logger.info("OLTW unfrozen at ref_frame=%d", self._current_ref_pos)
 
     def seek(self, ref_frame: int, *, allow_catchup: bool = True) -> None:
         """Jump the alignment to a specific reference frame.
@@ -815,16 +1202,35 @@ class OnlineDTWFollower:
             self._stuck_dp_window_start_pos = 0
             self._backward_attempts_in_window = 0
             self._post_seek_catchup_pending = False
+            # Lock-in + inertia state — must reset on movement change
+            # so the new movement starts from scratch (no carry-over).
+            self._locked_in = False
+            self._high_conf_streak = 0
+            self._low_conf_streak = 0
+            self._pos_history.clear()
+            self._inertia_active = False
+            self._inertia_ref_pos = 0.0
+            self._inertia_frames_elapsed = 0
+            self._last_good_rate = 1.0
         logger.info("OLTW reset")
 
     # ------------------------------------------------------------ getters
     @property
     def current_ref_frame(self) -> int:
+        """Effective output position (inertia-aware).
+
+        During inertia mode the inertia position is returned; otherwise
+        the DP-tracked position. Callers (GUI, score-mapper, tests)
+        should use this rather than ``_current_ref_pos`` directly so
+        the inertia override is honored.
+        """
+        if self._inertia_active:
+            return int(self._inertia_ref_pos)
         return self._current_ref_pos
 
     @property
     def current_ref_time_sec(self) -> float:
-        return self._current_ref_pos / self._cfg.effective_frame_rate()
+        return self.current_ref_frame / self._cfg.effective_frame_rate()
 
     @property
     def n_ref_frames(self) -> int:
@@ -833,3 +1239,24 @@ class OnlineDTWFollower:
     @property
     def is_frozen(self) -> bool:
         return self._frozen
+
+    @property
+    def is_locked_in(self) -> bool:
+        """True once lock-in latch has fired (auto or manual)."""
+        return self._locked_in
+
+    @property
+    def is_in_inertia(self) -> bool:
+        """True iff inertia progression is currently advancing position."""
+        return self._inertia_active
+
+    @property
+    def inertia_elapsed_sec(self) -> float:
+        """Seconds elapsed in the current inertia run (0 if inactive)."""
+        if not self._inertia_active:
+            return 0.0
+        return self._inertia_frames_elapsed / self._cfg.effective_frame_rate()
+
+    @property
+    def max_inertia_seconds(self) -> float:
+        return self._max_inertia_seconds
