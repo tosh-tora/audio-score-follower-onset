@@ -61,6 +61,7 @@ class FollowerWorker:
         mic_device: Optional[Union[int, str]] = None,
         on_result: Optional[Callable[[FollowResult], None]] = None,
         frames_per_step: int = 4,
+        loopback: bool = False,
     ) -> None:
         """
         Args:
@@ -76,10 +77,15 @@ class FollowerWorker:
                 computation. Larger values amortise the librosa overhead
                 but increase the worst-case latency. 4 ≈ 380ms at
                 hop=2048/sr=22050.
+            loopback: if True, open a WASAPI loopback stream on the
+                *output* device identified by ``mic_device`` (or the
+                system default output when ``mic_device`` is None).
+                Windows-only; requires sounddevice with WASAPI support.
         """
         self._oltw = oltw_follower
         self._cfg = feature_config
         self._mic_device = mic_device
+        self._loopback = bool(loopback)
         self._on_result = on_result or (lambda _r: None)
         self._frames_per_step = int(frames_per_step)
 
@@ -128,25 +134,53 @@ class FollowerWorker:
         try:
             import sounddevice as sd  # type: ignore
 
-            self._stream = sd.InputStream(
-                samplerate=self._cfg.sample_rate,
-                channels=1,
-                blocksize=self._step_samples,
-                device=self._mic_device,
-                dtype="float32",
-                callback=self._audio_callback,
-            )
+            if self._loopback:
+                # WASAPI loopback: capture the output device's playback
+                # stream as an input. Requires Windows + PortAudio with
+                # WASAPI support. ``device`` must be an output device
+                # index; None resolves to the system default output.
+                if not hasattr(sd, "WasapiSettings"):
+                    raise RuntimeError(
+                        "sd.WasapiSettings が見つかりません。"
+                        "Windows + WASAPI 対応の sounddevice が必要です。"
+                    )
+                device = self._mic_device
+                if device is None:
+                    device = sd.default.device[1]  # system default output
+                self._stream = sd.InputStream(
+                    samplerate=self._cfg.sample_rate,
+                    channels=2,
+                    blocksize=self._step_samples,
+                    device=device,
+                    dtype="float32",
+                    callback=self._audio_callback,
+                    extra_settings=sd.WasapiSettings(loopback=True),
+                )
+                logger.info(
+                    "FollowerWorker loopback stream open: sr=%d, blocksize=%d, device=%s",
+                    self._cfg.sample_rate, self._step_samples, device,
+                )
+            else:
+                self._stream = sd.InputStream(
+                    samplerate=self._cfg.sample_rate,
+                    channels=1,
+                    blocksize=self._step_samples,
+                    device=self._mic_device,
+                    dtype="float32",
+                    callback=self._audio_callback,
+                )
+                logger.info(
+                    "FollowerWorker stream open: sr=%d, blocksize=%d, device=%s",
+                    self._cfg.sample_rate, self._step_samples, self._mic_device,
+                )
             self._stream.start()
-            logger.info(
-                "FollowerWorker stream open: sr=%d, blocksize=%d, device=%s",
-                self._cfg.sample_rate, self._step_samples, self._mic_device,
-            )
         except BaseException as exc:
             self._fatal_error = exc
             logger.error(
-                "Failed to open mic input stream (%s: %s). "
+                "Failed to open %s stream (%s: %s). "
                 "Check device=%r in config and that sounddevice/PortAudio "
                 "is installed.",
+                "loopback" if self._loopback else "mic input",
                 type(exc).__name__, exc, self._mic_device,
             )
         finally:
@@ -282,6 +316,7 @@ class FileWorker:
         on_result: Optional[Callable[[FollowResult], None]] = None,
         realtime: bool = True,
         start_offset_sec: float = 0.0,
+        play_audio: bool = False,
     ) -> None:
         """
         Args:
@@ -295,6 +330,9 @@ class FileWorker:
                 False for fast batch debugging.
             start_offset_sec: skip the first N seconds of the input
                 (e.g. drop a noisy intro before feeding to OLTW).
+            play_audio: if True, play the loaded audio through the
+                default output device (via sounddevice) in sync with
+                the OLTW frame loop. Only active when realtime=True.
         """
         self._oltw = oltw_follower
         self._cfg = feature_config
@@ -302,6 +340,7 @@ class FileWorker:
         self._on_result = on_result or (lambda _r: None)
         self._realtime = bool(realtime)
         self._start_offset_sec = float(start_offset_sec)
+        self._play_audio = bool(play_audio)
 
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
@@ -342,6 +381,12 @@ class FileWorker:
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop_event.set()
+        if self._play_audio:
+            try:
+                import sounddevice as sd  # type: ignore
+                sd.stop()
+            except Exception:  # noqa: BLE001
+                pass
         if self._worker_thread is not None and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=timeout)
             if self._worker_thread.is_alive():
@@ -396,6 +441,22 @@ class FileWorker:
             return
 
         self._ready_event.set()
+
+        if self._play_audio and self._realtime:
+            try:
+                import sounddevice as sd  # type: ignore
+                sd.play(audio, self._cfg.sample_rate)
+                logger.info(
+                    "FileWorker: playing audio through default output device "
+                    "(sr=%d, %.2fs)",
+                    self._cfg.sample_rate, len(audio) / self._cfg.sample_rate,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "FileWorker: sd.play failed (%s: %s); continuing without "
+                    "audio playback", type(exc).__name__, exc,
+                )
+
         t_next = time.monotonic()
         for j in range(n_frames):
             if self._stop_event.is_set():

@@ -145,6 +145,95 @@ class WarpLookup:
         beat_in_measure = score_mapper.get_beat_in_measure(continuous_beat)
         return measure, beat_in_measure, continuous_beat
 
+    # ---------------------------------------------------------- validation
+    def validate(
+        self,
+        score_mapper: "ScoreMapper",
+        *,
+        max_slope: float = 4.0,
+        max_coverage_diff_measures: int = 5,
+    ) -> None:
+        """Raise ValueError if the warp path is inconsistent with the score.
+
+        Two checks are performed:
+
+        1. **Slope**: sample the path at 1-second intervals; if any 1-second
+           window of reference time maps to more than ``max_slope`` seconds of
+           score time, the DTW has produced a physically impossible alignment
+           (e.g. the reference recording skips a structural section that the
+           score has linearly).  Default max_slope=4.0 allows a 4× tempo ratio
+           between the synth BPM and the reference performance, which is already
+           extremely generous.
+
+        2. **Coverage**: the last score_time in the path should correspond to
+           approximately the last measure of the score.  If the difference
+           exceeds ``max_coverage_diff_measures``, the reference recording
+           likely has different structure (repeats, cuts) from the score.
+
+        Args:
+            score_mapper: Loaded ScoreMapper for the same score XML.
+            max_slope: Maximum allowed score_time / ref_time ratio in any
+                1-second reference window.
+            max_coverage_diff_measures: Maximum allowed difference (in
+                measures) between the warp path's coverage and the score's
+                total measure count.
+
+        Raises:
+            ValueError: with a descriptive message on the first failed check.
+        """
+        if len(self.ref_times) < 2:
+            raise ValueError("Warp path has fewer than 2 points; rebuild with asf-build.")
+
+        # --- Check 1: slope over 1-second windows ---
+        # Sample the interpolated score_time at 1-second ref_time steps.
+        sample_ref = np.arange(
+            float(self.ref_times[0]),
+            float(self.ref_times[-1]),
+            1.0,
+        )
+        if len(sample_ref) >= 2:
+            sample_score = np.interp(sample_ref, self.ref_times, self.score_times)
+            slope_per_sec = np.diff(sample_score)  # score_seconds per 1 ref_second
+            bad = slope_per_sec > max_slope
+            if bad.any():
+                idx = int(np.argmax(bad))
+                r0, r1 = sample_ref[idx], sample_ref[idx + 1]
+                s0, s1 = sample_score[idx], sample_score[idx + 1]
+                # Convert to measures for the error message
+                b0 = s0 * self.score_bpm / 60.0
+                b1 = s1 * self.score_bpm / 60.0
+                m0 = score_mapper.beat_to_measure(b0)
+                m1 = score_mapper.beat_to_measure(b1)
+                raise ValueError(
+                    f"warp path に異常な勾配があります: "
+                    f"参照音源の {r0:.1f}s-{r1:.1f}s ({r1 - r0:.1f}s) が "
+                    f"スコアの {s1 - s0:.1f}s 分 (小節 {m0}-{m1}) に対応しています "
+                    f"(slope={slope_per_sec[idx]:.1f}x, 上限={max_slope:.1f}x)。\n"
+                    f"参照音源とスコアの繰り返し構造（リピート・カット）が一致していない可能性があります。"
+                )
+
+        # --- Check 2: measure coverage ---
+        score_total_beats = float(self.score_times[-1]) * self.score_bpm / 60.0
+        warp_last_measure = score_mapper.beat_to_measure(score_total_beats)
+        xml_total_measures = score_mapper.get_total_measures()
+        diff = abs(warp_last_measure - xml_total_measures)
+        if diff > max_coverage_diff_measures:
+            raise ValueError(
+                f"warp path の小節数が一致しません: "
+                f"warp path の末尾は小節 {warp_last_measure} ですが、"
+                f"スコアの総小節数は {xml_total_measures} です (差={diff} 小節)。\n"
+                f"参照音源がスコアと同じ繰り返し構造を持っているか確認してください。"
+            )
+
+        logger.info(
+            "Warp path validation OK: slope_max=%.2f×, "
+            "coverage=%d/%d measures",
+            float(np.max(np.diff(
+                np.interp(sample_ref, self.ref_times, self.score_times)
+            ))) if len(sample_ref) >= 2 else 0.0,
+            warp_last_measure, xml_total_measures,
+        )
+
     # ---------------------------------------------------------- diagnostics
     def reference_duration_sec(self) -> float:
         """Last reference time covered by the warp."""

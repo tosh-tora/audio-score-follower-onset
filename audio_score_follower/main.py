@@ -91,6 +91,10 @@ logger = logging.getLogger(__name__)
 _TRIGGER_POLL_HZ = 20
 # How often we poll the silence gate from the Tk main loop.
 _GATE_POLL_MS = 50
+# Maximum measure jump allowed between consecutive OLTW frames without a
+# preceding user seek. At 200 BPM 4/4 with 4× warp slope (the build-time
+# limit) the measure advances <1 per 0.093s frame — so jumps >3 are anomalous.
+_MAX_FRAME_MEASURE_JUMP = 3
 # Minimum smoothed OLTW confidence before triggers are allowed to fire.
 # Acts as the "lock-in" condition that InertiaEngine provided in
 # live-score-sync; below this, alignment hasn't stabilised yet and
@@ -107,15 +111,27 @@ class AudioScoreFollowerApp:
         slide_url: str | None,
         *,
         input_wav: Path | None = None,
+        play_audio: bool = False,
+        loopback: bool = False,
+        loopback_device=None,
     ) -> None:
         logger.info(
-            "Initialising AudioScoreFollowerApp (config=%s, input_wav=%s)",
-            config_path, input_wav,
+            "Initialising AudioScoreFollowerApp (config=%s, input_wav=%s, "
+            "play_audio=%s, loopback=%s)",
+            config_path, input_wav, play_audio, loopback,
         )
 
         self.config = ConfigLoader(config_path)
         self.slide_url = slide_url
         self.input_wav = input_wav
+        self.play_audio = play_audio
+        self.loopback = loopback
+        # loopback_device: CLI wins; fall back to config; None = OS default output
+        self.loopback_device = (
+            loopback_device
+            if loopback_device is not None
+            else self.config.get_loopback_device()
+        )
 
         self.state = AppState()
         self.cooldown = CooldownTimer(self.config.get_cooldown_seconds())
@@ -134,6 +150,15 @@ class AudioScoreFollowerApp:
         self.worker: FollowerWorker | FileWorker | None = None
 
         self._fired_trigger_measures: set[int] = set()
+
+        # Runtime jump detection: track previous measure and the wall-clock
+        # time of the most recent user-initiated seek. Jumps right after a
+        # seek are expected; outside the grace period they indicate a warp
+        # path anomaly.
+        self._prev_oltw_measure: int = 0
+        self._last_seek_time: float = 0.0
+        _SEEK_GRACE_SEC = 2.0  # suppress jump alert for this long after a seek
+        self._SEEK_GRACE_SEC = _SEEK_GRACE_SEC
 
         if slide_url:
             self.slide_controller = SlideController(slide_url=slide_url)
@@ -166,7 +191,7 @@ class AudioScoreFollowerApp:
 
     # ---------------------------------------------------- lifecycle
     def run(self) -> None:
-        if self.input_wav is None:
+        if self.input_wav is None and not self.loopback:
             logger.info("Launching AudioLevelMonitor …")
             try:
                 self.audio_monitor.start()
@@ -176,6 +201,11 @@ class AudioScoreFollowerApp:
                     "without silence gate",
                     type(exc).__name__, exc,
                 )
+        elif self.loopback:
+            logger.info(
+                "--loopback mode: skipping AudioLevelMonitor "
+                "(loopback stream has clean silence; gate not needed)"
+            )
         else:
             logger.info(
                 "--input-wav mode: skipping AudioLevelMonitor "
@@ -199,13 +229,11 @@ class AudioScoreFollowerApp:
         )
         self._trigger_thread.start()
 
-        if self.input_wav is None:
+        if self.input_wav is None and not self.loopback:
             self.root.after(_GATE_POLL_MS, self._check_silence_gate)
         else:
-            # File-input mode: no mic is open, so silence-gate polling
-            # would just report "no audio" every tick. Skip it, and mark
-            # the monitor as unavailable so the GUI dBFS readout says
-            # "n/a" rather than a misleading -120 dBFS.
+            # File-input / loopback mode: no separate mic monitor stream.
+            # Mark as unavailable so the GUI dBFS readout shows "n/a".
             self.state.set_mic_level(-120.0, gate_active=False, monitor_available=False)
 
         logger.info(
@@ -234,7 +262,7 @@ class AudioScoreFollowerApp:
         if self.worker is not None:
             self.worker.stop()
             self.worker = None
-        if self.input_wav is None:
+        if self.input_wav is None and not self.loopback:
             self.audio_monitor.stop()
         self.slide_controller.stop()
         logger.info("Shutdown complete")
@@ -303,6 +331,20 @@ class AudioScoreFollowerApp:
             reference_cens.shape[0], reference_cens.shape[1],
         )
 
+        # Validate warp path consistency before starting OLTW.
+        try:
+            self.warp_lookup.validate(self.score_mapper)
+        except ValueError as exc:
+            logger.error("Warp path validation failed: %s", exc)
+            self.state.set_load_error(
+                f"warp path 検証エラー:\n{exc}\nasf-build をやり直してください。"
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Warp path validation error: %s", exc)
+            self.state.set_load_error(f"warp path 検証中にエラー: {exc}")
+            return
+
         try:
             self.oltw = OnlineDTWFollower(
                 reference_cens=reference_cens,
@@ -337,6 +379,15 @@ class AudioScoreFollowerApp:
                 input_wav=self.input_wav,
                 on_result=self._on_oltw_result,
                 realtime=True,
+                play_audio=self.play_audio,
+            )
+        elif self.loopback:
+            self.worker = FollowerWorker(
+                oltw_follower=self.oltw,
+                feature_config=self.warp_lookup.feature_config,
+                mic_device=self.loopback_device,
+                on_result=self._on_oltw_result,
+                loopback=True,
             )
         else:
             self.worker = FollowerWorker(
@@ -385,6 +436,22 @@ class AudioScoreFollowerApp:
                 inertia_elapsed_sec=self.oltw.inertia_elapsed_sec,
                 inertia_cap_sec=self.oltw.max_inertia_seconds,
             )
+
+        # Runtime jump detection: large measure jumps between consecutive
+        # frames (outside the seek grace period) indicate a warp path
+        # anomaly that should have been caught by asf-build --validate.
+        jump = abs(measure - self._prev_oltw_measure)
+        if (
+            jump > _MAX_FRAME_MEASURE_JUMP
+            and self._prev_oltw_measure != 0  # skip first frame (initialisation)
+            and (time.monotonic() - self._last_seek_time) > self._SEEK_GRACE_SEC
+        ):
+            logger.error(
+                "異常な小節ジャンプを検出: %d → %d (+%d 小節) at ref_t=%.2fs。"
+                "warp path の勾配が異常です。asf-build をやり直してください。",
+                self._prev_oltw_measure, measure, jump, result.ref_time_sec,
+            )
+        self._prev_oltw_measure = measure
 
         # Throttled diagnostic log: emit once per wall-clock second so
         # `--verbose` doesn't drown in per-frame entries. Lets the
@@ -557,6 +624,7 @@ class AudioScoreFollowerApp:
         fr = self.warp_lookup.feature_config.effective_frame_rate()
         target_frame = int(round(ref_time_sec * fr))
         self.oltw.seek(target_frame, allow_catchup=allow_catchup)
+        self._last_seek_time = time.monotonic()
 
     def _manual_advance_to_next_trigger(self) -> None:
         """User pressed →: send slide right, then re-sync OLTW.
@@ -696,6 +764,23 @@ def main() -> int:
         help="マイクの代わりに指定の音源ファイル (WAV/MP3/...) を OLTW に流す。"
              "切り分けデバッグ用。silence gate は自動的に無効化される。",
     )
+    parser.add_argument(
+        "--play-audio", action="store_true",
+        help="--input-wav と組み合わせて使用。OLTW に流しながら同時に"
+             "デフォルト出力デバイスからも再生する（テスト時に耳で確認する用）。",
+    )
+    parser.add_argument(
+        "--loopback", action="store_true",
+        help="PC の出力音声 (WASAPI ループバック) を OLTW に流す。"
+             "Windows のみ。--loopback-device 未指定時は OS デフォルト出力を使用。"
+             "silence gate は自動的に無効化される。",
+    )
+    parser.add_argument(
+        "--loopback-device", default=None,
+        help="ループバック取得元の出力デバイス番号または名前。"
+             "省略すると OS デフォルト出力デバイスを使用。"
+             "利用可能なデバイス一覧は python -c \"import sounddevice; print(sounddevice.query_devices())\" で確認。",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -715,11 +800,30 @@ def main() -> int:
         logger.error("--input-wav not found: %s", args.input_wav)
         return 1
 
+    if args.input_wav is not None and args.loopback:
+        logger.error("--input-wav と --loopback は同時に指定できません")
+        return 1
+
+    if args.play_audio and args.input_wav is None:
+        logger.error("--play-audio は --input-wav と組み合わせて使用してください")
+        return 1
+
+    # --loopback-device: try to coerce to int (device index) if numeric
+    loopback_device = args.loopback_device
+    if loopback_device is not None:
+        try:
+            loopback_device = int(loopback_device)
+        except (ValueError, TypeError):
+            pass  # keep as string (device name)
+
     try:
         app = AudioScoreFollowerApp(
             str(config_path),
             slide_url=args.slide_url,
             input_wav=args.input_wav,
+            play_audio=args.play_audio,
+            loopback=args.loopback,
+            loopback_device=loopback_device,
         )
         app.run()
         return 0

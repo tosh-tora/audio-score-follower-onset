@@ -8,6 +8,45 @@
 使っていたが、オーケストラの密音響で破綻する弱点があった。本プロジェクトは audio-to-audio で
 全てを行うことでその問題を回避する。
 
+## 特徴
+
+### 1. Note-based ではなく Audio-to-Audio（CENS マッチング）
+
+オーケストラの密音響、ホール残響、和音の混ざり合いの中で、単音レベルのピッチをマイクから正確に
+抽出するのは至難の業。本プロジェクトは演奏音を丸ごと **CENS (Chroma Energy Normalized
+Statistics)** に変換し、オーケストラ全体の「響きのエネルギー分布」として捉える。これにより
+楽器ごとの休みの影響を無効化できる ─ 弦楽器が長大に休んでいても、木管・金管の響きが
+リファレンスと合致していれば迷子にならない。
+
+### 2. 二段階マッピング（オフライン MrMsDTW + オンライン OLTW）
+
+楽譜とマイクをリアルタイムで直接結びつけるのではなく、
+
+- **オフライン**: 楽譜 (XML) ↔ リファレンス WAV を MrMsDTW（マルチスケール DTW）で
+  高精度に対応付け → `warping_path.npz`
+- **オンライン**: リファレンス WAV ↔ 本番マイクを Online DTW で追随
+
+事前計算した warp path を介すことで、本番中の PC は「既知の音声ファイルとの Online DTW」だけに
+集中すればよく、レイテンシが劇的に抑えられる。warp 逆引きで reference_time → score_time → 小節 に
+変換する。
+
+### 3. エッジケースへの対処
+
+実際の音楽追従で直面する事態に構造的な対策を持つ:
+
+- **テンポの自動推定** (`asf-build`): 録音の duration とスコアの総ビート数から合成 BPM を逆算
+  (`total_beats * 60 / ref_duration`)。楽譜のテンポ指示は目安にすぎず、実演奏では数十%ずれる
+  ことが普通なため、固定 120 BPM だと warp path にスキップが大量発生して破綻する。`asf-build`
+  は `--score-bpm` 未指定なら自動推定する
+- **ビルド時の warp path 検証**: 勾配上限 4.0x・カバレッジ差 5 小節以内でチェック。スコアと
+  録音の繰り返し構造が不整合な場合に即検出
+- **lock-in 二段構え**: 冒頭ノイズでの誤位置固定を防ぎつつ、曲を捉えた後の silence gate は
+  慣性進行に切り替え（詳細は「OLTW 設計メモ」）
+- **5 つの DP 失敗モードへの個別対処**: 冒頭誤ロック・自己類似テーマでの後退・vert chain ジャンプ・
+  後退アトラクタ stuck・手動 seek 後の追いつき（同上）
+- **ホール本番運用**: PA LINE OUT 経路・暗騒音閾値の実測・ゲネプロ録音を当日リファレンスに使う
+  フロー（詳細は「本番ホール運用ガイド」）
+
 ## アーキテクチャ
 
 ```
@@ -86,9 +125,24 @@ asf-build `
     --score data/scores/beethoven5.xml `
     --reference data/reference_audio/karajan_1977.mp3 `
     --output data/built/beethoven5_karajan/ `
+    [--score-bpm 152] `
     [--start-offset 0.5] `
     [--plot]
 ```
+
+**合成 BPM の自動推定**: `--score-bpm` を省略すると、参照録音の duration と楽譜の総ビート数
+から `total_beats * 60 / ref_duration` で四分音符 BPM を自動算出する。例えばベルリン・フィルの
+Berlioz 幻想4 (281s 録音, 712 ビート) なら推定 BPM=152 となり、ログに次が出る:
+
+```
+Estimated synth tempo: 712.0 beats / 281.05s ref → BPM=152.00 (quarter-note).
+Override with --score-bpm if undesirable.
+```
+
+楽譜の指示テンポ (たいてい 120 等) で固定合成すると、実演奏との 20-30% のテンポ差で warp path に
+スキップが大量発生し、ビルド時バリデーション (`max_slope=4.0x`) で失敗することがある。自動推定で
+これを回避する。`--score-wav` を渡す場合は合成テンポを録音から逆算できないため、`--score-bpm`
+の明示指定が必須。
 
 ### 5. ライブ追随
 

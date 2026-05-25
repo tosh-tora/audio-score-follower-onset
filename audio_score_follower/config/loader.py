@@ -181,6 +181,15 @@ class ConfigLoader:
             return "pulse"
         return None
 
+    def get_loopback_device(self):
+        """Output device to capture in loopback mode.
+
+        Returns the value of ``settings.loopback_device`` when present.
+        None means "use the system default output device", which is
+        resolved at stream-open time by FollowerWorker.
+        """
+        return self.settings.get("loopback_device", None)
+
     def get_oltw_kwargs(self) -> dict:
         """Return kwargs forwarded to OnlineDTWFollower.
 

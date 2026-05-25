@@ -592,6 +592,76 @@ def test_stuck_dp_reset_fires_on_backward_lockin(caplog):
     )
 
 
+def test_rapid_dp_reset_fires_before_full_window(caplog):
+    """Rapid reset triggers within 10 consecutive backward frames, well
+    before the full stuck_dp_reset_seconds window elapses.
+
+    回帰防止: 後退アトラクタが 10 フレーム連続で続いた時点でフルウィンドウ
+    （~54 フレーム）より早く "rapid DP reset" が発火すること。
+
+    実際の障害パターン再現: ref の中間地点で chroma が A→B に急変し、
+    直後に A クロマを投入すると「1 つ前の位置 (A) が今の位置 (B) より
+    低コスト」という後退アトラクタが発生する。
+    これは m=117 の raw_cost 0.06→0.20 急騰と同じ構造。
+    """
+    import logging
+    cfg = FeatureConfig()
+
+    # Build reference: positions 0-19 = pitch class 0 (chroma A),
+    # positions 20-59 = pitch class 6 (chroma B, maximally different).
+    n = 60
+    ref = np.zeros((12, n), dtype=np.float32)
+    ref[0, :20] = 1.0   # A
+    ref[6, 20:] = 1.0   # B
+    norms = np.linalg.norm(ref, axis=0, keepdims=True)
+    norms[norms == 0] = 1.0
+    ref = (ref / norms).astype(np.float32)
+
+    follower = OnlineDTWFollower(
+        ref, cfg,
+        search_width=40, back_inhibit_frames=20, init_search_width=10,
+        step_penalty=0.06,
+        stuck_dp_reset_seconds=5.0,   # full window ≈ 54 frames at 10.77 Hz
+        stuck_rematch_seconds=0.0,
+    )
+    # Track through the A region (perfect match, low local costs).
+    for j in range(20):
+        follower.process_frame(ref[:, j])
+    # Feed one B frame — DP advances into position 20 (ref[:,20]=B, low cost).
+    follower.process_frame(ref[:, 20])
+    pos_before = follower._current_ref_pos  # should be ≥ 20
+
+    # Now feed chroma A repeatedly. Local cost at pos 20 (=B) is ~1.0
+    # (high), while local cost at pos 19 (=A) is ~0. D_prev[19] is fresh
+    # (set just two frames ago), so the unclamped argmin prefers 19 →
+    # backward attempt every frame → _consecutive_backward_frames grows.
+    chroma_A = ref[:, 0].copy()
+    rapid_reset_frame: int | None = None
+    with caplog.at_level(logging.INFO, logger="audio_score_follower.core.oltw_follower"):
+        for k in range(15):
+            follower.process_frame(chroma_A)
+            if any("rapid DP reset" in rec.message for rec in caplog.records):
+                rapid_reset_frame = k + 1
+                break
+
+    assert rapid_reset_frame is not None, (
+        "Rapid DP reset never fired despite every-frame backward lock-in. "
+        f"log: {[r.message for r in caplog.records[-10:]]}"
+    )
+    # Must fire well before the full 54-frame window.
+    assert rapid_reset_frame <= 12, (
+        f"Rapid reset took {rapid_reset_frame} backward frames "
+        f"(expected ≤ 12, i.e. _RAPID_RESET_FRAMES=10 plus margin)"
+    )
+    # After rapid reset, D_prev[<current] = inf, so DP can only advance
+    # forward. Feeding a B frame should not retreat below pos_before.
+    result_after = follower.process_frame(ref[:, min(pos_before + 1, n - 1)])
+    assert result_after.ref_frame >= pos_before, (
+        f"Position retreated after rapid reset: "
+        f"before={pos_before}, after={result_after.ref_frame}"
+    )
+
+
 def test_max_advance_per_frame_caps_dp_race_ahead():
     """band-DP の vert chain による前方暴走を物理的に防ぐ。
 

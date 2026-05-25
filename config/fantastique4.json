@@ -7,14 +7,14 @@
   "movements": [
     {
       "id": 1,
-      "xml_file": "../data/scores/幻想4_huan-xiang-jiao-xiang-qu-h-48-ekutoruberuriozu-huan-xiang-jiao-xiang-qu-iv-duan-tou-taiheno-xing-jin.mxl",
+      "xml_file": "../data/scores/幻想4_リピート削除.mxl",
       "built_dir": "../data/built/fantastique4_berlin",
       "triggers": [
         {"measure": 1,   "action": "right", "note": "開始 - 行進曲"},
         {"measure": 10,  "action": "right", "note": "test"},
-        {"measure": 17,  "action": "right", "note": "TODO: 実際の小節番号に変更してください"},
-        {"measure": 33,  "action": "right", "note": "TODO: 実際の小節番号に変更してください"},
-        {"measure": 65,  "action": "right", "note": "TODO: 実際の小節番号に変更してください"},
+        {"measure": 17,  "action": "right", "note": "チェロが入る"},
+        {"measure": 33,  "action": "right", "note": "1st Violin"},
+        {"measure": 62,  "action": "right", "note": "盛り上がるとこ"},
         {"measure": 97,  "action": "right", "note": "TODO: 実際の小節番号に変更してください"},
         {"measure": 129, "action": "right", "note": "TODO: 実際の小節番号に変更してください"},
         {"measure": 161, "action": "right", "note": "TODO: 実際の小節番号に変更してください"}

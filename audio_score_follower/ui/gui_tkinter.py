@@ -61,12 +61,8 @@ _MODE_COLOR_INERTIA = ("#e87b00", "white")    # orange bg
 _MODE_COLOR_CAPPED = ("#c00", "white")        # red bg
 _MODE_COLOR_FLASH = ("#2255ff", "white")      # blue bg for force-lock-in flash
 
-# Window + confidence bar geometry, also scaled ~2x to match the new fonts.
-# Height bumped to 1000 so the mic-level / inertia / cooldown / hint rows
-# below the confidence bar are not clipped by the bottom of the window.
+# Window geometry scaled ~2x to match the large pit-readable fonts.
 _WINDOW_GEOMETRY = "1400x1000"
-_BAR_WIDTH = 400
-_BAR_HEIGHT = 36
 
 
 def _pick_font_family(root: tk.Tk) -> str:
@@ -165,18 +161,21 @@ class FollowerGUI:
         )
         self.label_file.pack(pady=(0, 4))
 
-        # 現在小節（大きな数字）＋ n / m 小節目 表示
+        # 現在小節（大きな数字）＋ /全小節数 を横並びで表示
+        measure_frame = tk.Frame(self.root, bg="#f0f0f0")
+        measure_frame.pack(pady=(10, 4))
+
         measure_font = font.Font(family=family, size=_MEASURE_FONT_SIZE, weight="bold")
         self.label_measure = tk.Label(
-            self.root, text="--", font=measure_font, bg="#f0f0f0", fg="blue"
+            measure_frame, text="--", font=measure_font, bg="#f0f0f0", fg="blue"
         )
-        self.label_measure.pack(pady=(10, 0))
+        self.label_measure.pack(side=tk.LEFT)
 
-        measure_sub_font = font.Font(family=family, size=_BEAT_FONT_SIZE)
-        self.label_measure_sub = tk.Label(
-            self.root, text="-- / -- 小節目", font=measure_sub_font, bg="#f0f0f0", fg="#246"
+        measure_total_font = font.Font(family=family, size=_BEAT_FONT_SIZE)
+        self.label_measure_total = tk.Label(
+            measure_frame, text="/ --", font=measure_total_font, bg="#f0f0f0", fg="#246"
         )
-        self.label_measure_sub.pack(pady=(0, 4))
+        self.label_measure_total.pack(side=tk.LEFT, padx=(6, 0), anchor="s")
 
         # 拍位置
         beat_font = font.Font(family=family, size=_BEAT_FONT_SIZE)
@@ -185,7 +184,7 @@ class FollowerGUI:
         )
         self.label_beat.pack(pady=(0, 10))
 
-        # 確信度バー
+        # 確信度
         conf_frame = tk.Frame(self.root, bg="#f0f0f0")
         conf_frame.pack(pady=8)
 
@@ -194,14 +193,9 @@ class FollowerGUI:
         ).pack(side=tk.LEFT, padx=10)
 
         self.label_confidence = tk.Label(
-            conf_frame, text="-- (--)", font=(family, _CONFIDENCE_FONT_SIZE), bg="#f0f0f0", fg="gray"
+            conf_frame, text="--%", font=(family, _CONFIDENCE_FONT_SIZE), bg="#f0f0f0", fg="gray"
         )
         self.label_confidence.pack(side=tk.LEFT, padx=10)
-
-        self.canvas_confidence = tk.Canvas(
-            conf_frame, width=_BAR_WIDTH, height=_BAR_HEIGHT, bg="white", highlightthickness=1
-        )
-        self.canvas_confidence.pack(side=tk.LEFT, padx=10)
 
         # マイクレベル — 確信度バーの直下に置く。確信度はマイク入力に直結する
         # ので並べて確認できると運用しやすい。下にある要素（クールダウン等）が
@@ -321,7 +315,6 @@ class FollowerGUI:
         in_inertia = state.get('is_in_inertia', False)
         elapsed = float(state.get('inertia_elapsed_sec', 0.0))
         cap = float(state.get('inertia_cap_sec', 10.0))
-        conf = float(state.get('confidence', 0.0))
 
         if not is_locked:
             bg, fg = _MODE_COLOR_WAITING
@@ -341,7 +334,7 @@ class FollowerGUI:
             )
         else:
             bg, fg = _MODE_COLOR_TRACKING
-            text = f"🎵 追随中　conf: {conf:.2f}"
+            text = "🎵 追随中"
 
         self.label_mode.config(text=text, bg=bg, fg=fg)
 
@@ -376,20 +369,15 @@ class FollowerGUI:
                     filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
                 self.label_file.config(text=filename, fg="#888")
 
-            # 小節番号（大きな数字）
+            # 小節番号（大きな数字）＋ /全小節数
             measure = state['measure']
             self.label_measure.config(text=str(measure))
-
-            # n / m 小節目
             total = state.get('total_measures', 0)
-            if total > 0:
-                self.label_measure_sub.config(text=f"{measure} / {total} 小節目")
-            else:
-                self.label_measure_sub.config(text=f"{measure} 小節目")
+            self.label_measure_total.config(text=f"/ {total}" if total > 0 else "/ --")
 
             # 拍位置
             beat_in_measure = state.get('beat_in_measure', 1.0)
-            self.label_beat.config(text=f"♩ {beat_in_measure:.2f}")
+            self.label_beat.config(text=f"♩ {int(beat_in_measure)}")
 
             # 確信度（色分け）
             conf = state['confidence']
@@ -399,14 +387,7 @@ class FollowerGUI:
                 color = "orange"
             else:
                 color = "red"
-            self.label_confidence.config(text=f"{conf:.2f} ({int(conf*100)}%)", fg=color)
-
-            # 確信度バー
-            self.canvas_confidence.delete("all")
-            bar_width = _BAR_WIDTH * conf
-            self.canvas_confidence.create_rectangle(
-                0, 0, bar_width, _BAR_HEIGHT, fill=color, outline="black"
-            )
+            self.label_confidence.config(text=f"{int(conf*100)}%", fg=color)
 
             # 次のトリガー
             next_trig = state['next_trigger_measure']
