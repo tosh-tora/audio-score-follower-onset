@@ -167,7 +167,7 @@ def render_with_mscore(
     mscore: Path,
     xml_path: Path,
     out_wav: Path,
-    timeout_sec: float = 300.0,
+    timeout_sec: float = 1200.0,
 ) -> None:
     """MuseScore CLI で XML を WAV にエクスポート。"""
     cmd = [str(mscore), str(xml_path), "-o", str(out_wav)]
@@ -262,6 +262,10 @@ def main() -> int:
         help="DEBUG レベルログ",
     )
     parser.add_argument(
+        "--mscore-timeout", type=float, default=1200.0,
+        help="MuseScore CLI のタイムアウト秒数。大編成スコアは大きくする。default 1200 (20分)",
+    )
+    parser.add_argument(
         "--keep-tempo", action="store_true",
         help="XML のテンポを保持し、定テンポ正規化を行わない (デバッグ用)",
     )
@@ -303,7 +307,7 @@ def main() -> int:
         os.close(tmp_fd)
         temp_wav = Path(tmp_wav_path)
 
-        render_with_mscore(mscore, xml_to_render, temp_wav)
+        render_with_mscore(mscore, xml_to_render, temp_wav, timeout_sec=args.mscore_timeout)
 
         head_trim, out_dur = postprocess_audio(
             temp_wav, args.output, args.samplerate, args.trim_top_db
@@ -318,7 +322,7 @@ def main() -> int:
             print(f"  定テンポ: {args.bpm} BPM")
 
     except subprocess.TimeoutExpired:
-        logger.error("MuseScore がタイムアウト (5分超過)")
+        logger.error("MuseScore がタイムアウト (%.0f秒超過) — --mscore-timeout でタイムアウトを延ばせます", args.mscore_timeout)
         return 1
     except Exception as exc:
         logger.exception("合成失敗: %s", exc)

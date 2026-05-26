@@ -81,7 +81,9 @@ def _resolve_data_path(given: Path, default_dir: Path) -> Path:
     return default_dir / given
 
 
-def _synth_score_wav(score_xml: Path, bpm: float, sample_rate: int) -> Path:
+def _synth_score_wav(
+    score_xml: Path, bpm: float, sample_rate: int, mscore_timeout: float = 1200.0
+) -> Path:
     """Invoke tasks/generate_score_wav.py to produce a temporary synth WAV.
 
     The script lives in this project root; we call it via the same
@@ -105,6 +107,7 @@ def _synth_score_wav(score_xml: Path, bpm: float, sample_rate: int) -> Path:
         "-o", str(tmp_path),
         "--bpm", str(bpm),
         "--samplerate", str(sample_rate),
+        "--mscore-timeout", str(mscore_timeout),
     ]
     logger.info("Synthesising score: %s", " ".join(cmd))
     completed = subprocess.run(
@@ -211,6 +214,10 @@ def main() -> int:
         help="Write warp_path.png into --output (requires matplotlib).",
     )
     parser.add_argument(
+        "--mscore-timeout", type=float, default=1200.0,
+        help="MuseScore CLI timeout in seconds. Increase for large scores. Default 1200 (20min).",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="DEBUG-level logging",
     )
@@ -308,7 +315,7 @@ def main() -> int:
             resolved_bpm = float(args.score_bpm)
 
         try:
-            score_wav = _synth_score_wav(args.score, resolved_bpm, args.sample_rate)
+            score_wav = _synth_score_wav(args.score, resolved_bpm, args.sample_rate, args.mscore_timeout)
             cleanup_tmp = True
         except Exception as exc:
             logger.error("Failed to synthesise score WAV: %s", exc)
