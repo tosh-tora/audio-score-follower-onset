@@ -8,15 +8,25 @@ against a real performance recording. Output is a directory containing
 ``warping_path.npz``, ``reference_cens.npy``, and a JSON metadata
 sidecar. Runs entirely on Windows native — no WSL2 needed.
 
-Usage:
+Usage (filename-only shorthand — paths are resolved automatically):
 
     asf-build \\
-        --score data/scores/beethoven5.xml \\
-        --reference data/reference_audio/karajan_1977.wav \\
-        --output data/built/beethoven5_karajan \\
+        --score beethoven5.xml \\
+        --reference karajan_1977.wav \\
+        --output beethoven5_karajan \\
         [--score-bpm 120] \\
         [--start-offset 0.5] \\
         [--plot]
+
+When a plain filename (no directory component) is given, each argument
+resolves to a fixed location relative to the current working directory:
+
+    --score     →  <cwd>/data/scores/<filename>
+    --reference →  <cwd>/data/reference_audio/<filename>
+    --output    →  <cwd>/data/built/<name>
+
+If a path with a directory component or an absolute path is given it is
+used as-is, so existing invocations are unchanged.
 
 If ``--score-wav`` is given, it is used directly instead of synthesising
 from the XML. Useful for re-runs with different DTW parameters when the
@@ -46,6 +56,29 @@ from audio_score_follower.core.score_mapper import ScoreMapper
 from audio_score_follower.core.warp_lookup import WarpLookup
 
 logger = logging.getLogger(__name__)
+
+# Default data directories, resolved relative to the current working directory.
+# When a plain filename (no directory component) is passed to --score,
+# --reference, or --output, the corresponding default dir is prepended so
+# users can just type the filename. Paths that already have a directory
+# component (e.g. "my_dir/score.mxl" or an absolute path) are not modified.
+_DEFAULT_SCORE_DIR = Path("data") / "scores"
+_DEFAULT_REFERENCE_DIR = Path("data") / "reference_audio"
+_DEFAULT_OUTPUT_DIR = Path("data") / "built"
+
+
+def _resolve_data_path(given: Path, default_dir: Path) -> Path:
+    """Return the resolved path for a CLI argument.
+
+    If ``given`` is absolute or contains a directory component (i.e. its
+    ``.parent`` is not the current directory sentinel ``Path(".")``), return
+    it unchanged.  Otherwise, prepend ``default_dir`` so the caller can pass
+    a bare filename such as ``"score.mxl"`` instead of the full
+    ``"data/scores/score.mxl"``.
+    """
+    if given.is_absolute() or given.parent != Path("."):
+        return given
+    return default_dir / given
 
 
 def _synth_score_wav(score_xml: Path, bpm: float, sample_rate: int) -> Path:
@@ -130,12 +163,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--score", required=True, type=Path,
-                        help="MusicXML / MXL file")
-    parser.add_argument("--reference", required=True, type=Path,
-                        help="Reference recording (WAV / FLAC / OGG / MP3 / M4A)")
-    parser.add_argument("--output", required=True, type=Path,
-                        help="Output directory")
+    parser.add_argument(
+        "--score", required=True, type=Path,
+        help="MusicXML / MXL file. Plain filename (no directory) is resolved "
+             "under data/scores/ in the current working directory.",
+    )
+    parser.add_argument(
+        "--reference", required=True, type=Path,
+        help="Reference recording (WAV / FLAC / OGG / MP3 / M4A). "
+             "Plain filename is resolved under data/reference_audio/.",
+    )
+    parser.add_argument(
+        "--output", required=True, type=Path,
+        help="Output directory. Plain name (no directory) is resolved under "
+             "data/built/.",
+    )
     parser.add_argument(
         "--score-wav", type=Path, default=None,
         help="Pre-synthesised score WAV. If omitted, generate_score_wav.py "
@@ -174,6 +216,12 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    # Resolve plain filenames to their default data directories so the user
+    # can type just the filename instead of the full path.
+    args.score = _resolve_data_path(args.score, _DEFAULT_SCORE_DIR)
+    args.reference = _resolve_data_path(args.reference, _DEFAULT_REFERENCE_DIR)
+    args.output = _resolve_data_path(args.output, _DEFAULT_OUTPUT_DIR)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
