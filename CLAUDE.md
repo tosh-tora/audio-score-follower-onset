@@ -81,23 +81,20 @@ lock-in 判定:
 3. **絶対 cap**: `max_inertia_seconds` (=10.0) を越えたら位置固定に戻す
 4. **慣性中は `_try_global_rematch` を抑制**: スコア全体探索による遠方ジャンプを禁止（自己類似テーマへの誤テレポート防止）
 
-### stuck_dp_reset / rapid_dp_reset / rapid_reset_catchup
+### stuck_dp_reset と rapid_dp_reset
 
-後退アトラクタ（`D_prev[pos-1] < D_prev[pos] + penalty`）が形成されると DP は monotonicity clamp で固定されたまま前進できなくなる。3 段構えの逃げルートがある:
+後退アトラクタ（`D_prev[pos-1] < D_prev[pos] + penalty`）が形成されると DP は monotonicity clamp で固定されたまま前進できなくなる。2 つの逃げルートがある:
 
-| 機構 | 発火条件 | 発火タイミング | 効果 |
-|---|---|---|---|
-| `stuck_dp_reset` | 直近ウィンドウで前進 < 3 フレーム **かつ** 後退試行 ≥ ウィンドウ/4 | `stuck_dp_reset_seconds`（既定 12s）後 | backward cumulative cost を消す（位置は変えない） |
-| `rapid_dp_reset` | 10 フレーム**連続**で argmin が後退を指す | ~0.93s 後（即時） | 同上、ただし即時 |
-| `rapid_reset_catchup` | rapid reset 発火**直後の次フレーム**（`_pending_rapid_reset_lag > 0`） | rapid reset の 1 フレーム後 | stall 中に経過した live frame 分だけ前方ローカル探索でジャンプ |
+| 機構 | 発火条件 | 発火タイミング |
+|---|---|---|
+| `stuck_dp_reset` | 直近ウィンドウで前進 < 3 フレーム **かつ** 後退試行 ≥ ウィンドウ/4 | `stuck_dp_reset_seconds`（既定 12s）後 |
+| `rapid_dp_reset` | 10 フレーム**連続**で argmin が後退を指す（= 毎フレーム後退試行） | ~0.93s 後（即時） |
 
 `rapid_dp_reset` は「純後退アトラクタ」の確定シグナル（毎フレーム後退）にのみ発火する。slow-forward（DP がゆっくり前進しながら偶発的に後退を試みる）では `_consecutive_backward_frames` カウンタが非後退フレームでリセットされるため発火しない。
 
-`rapid_reset_catchup` は rapid reset 単独では解消されない「**stall ごとに ~10 frame の永続遅延が積み上がる**」問題への対処。stall 中ライブ音声は経過しているので、次フレームで `[current+1, current + 1.5×lag]` の範囲を前方ローカル探索し、`cost margin (=0.08)` を超える明確な改善があればジャンプする。音楽が止まっていれば（指揮者キープなど）current 位置と同等のコストになるので catchup はスキップされ、DP は通常追従に戻る。
+**触ってはいけない**: rapid reset の発火後は `D_prev[:current_ref_pos]=inf, D_prev[current_ref_pos]=0` にリシードされる。このリシードを省くと後退アトラクタが残り、次フレームでまた即 rapid reset が発火してしまう。
 
-**触ってはいけない**:
-- rapid reset の発火後は `D_prev[:current_ref_pos]=inf, D_prev[current_ref_pos]=0` にリシードされる。このリシードを省くと後退アトラクタが残り、次フレームでまた即 rapid reset が発火してしまう。
-- `rapid_reset_catchup` の探索範囲を `search_width` いっぱい（240 frame ≈ 22s）に広げると overshoot で自己類似テーマへの誤テレポートが起きる。`1.5×lag` の tight bound は overshoot 上限を ~2s に抑えるための構造的安全弁。discriminability ratio ガード（`_try_post_seek_catchup` が使う）はこの tight bound のおかげで不要になっている — 探索範囲を広げるなら必ず discriminability ガードも復活させること。
+**過去に試して捨てた**: rapid reset 後に「stall 中経過した live frame 数だけ前方ローカル探索してジャンプ」する catchup を実装したが、`raw_cost ~ 0.20` の曖昧 chroma 区間で 15 frame 程度の探索ではノイズと真のマッチを区別できず、誤ジャンプ → 監視 → 再 rapid reset → 誤ジャンプ … のサイクルで遅延を悪化させた（実測: 終端 m=176 → m=172 への regression）。代替案として discriminability ratio ガードを加えたり cost margin を厳しくする方向も考えられるが、まだ実装していない。stall ごとの ~10 frame の永続遅延は当面受け入れる。
 
 ### unfreeze 後の DP 復帰経路
 
