@@ -337,11 +337,6 @@ class OnlineDTWFollower:
         # attractor that the full stuck_dp_reset_seconds window would
         # otherwise leave unaddressed for 12+ seconds.
         self._consecutive_backward_frames: int = 0
-        # One-shot field: number of consecutive backward frames at the
-        # moment a rapid DP reset fired. Consumed on the next live frame
-        # by _try_rapid_reset_catchup to close the live-vs-ref lag that
-        # accumulated during the stall.  0 = no catchup pending.
-        self._pending_rapid_reset_lag: int = 0
         self._stuck_rematch_seconds = float(stuck_rematch_seconds)
         self._stuck_rematch_min_advance = int(stuck_rematch_min_advance)
         self._stuck_rematch_cost_margin = float(stuck_rematch_cost_margin)
@@ -650,14 +645,6 @@ class OnlineDTWFollower:
             self._post_seek_catchup_pending = False
             self._try_post_seek_catchup(live)
 
-        # If a rapid DP reset fired on the previous frame, close the
-        # live-vs-ref lag accumulated during the stall before normal DP
-        # runs from a (now stale) stall position. One-shot.
-        if self._pending_rapid_reset_lag > 0:
-            lag = self._pending_rapid_reset_lag
-            self._pending_rapid_reset_lag = 0
-            self._try_rapid_reset_catchup(live, lag)
-
         back = min(self._search_width, self._back_inhibit_frames)
         lo = max(0, self._current_ref_pos - back)
         hi = min(self._N, self._current_ref_pos + self._search_width + 1)
@@ -779,7 +766,6 @@ class OnlineDTWFollower:
             self._stuck_dp_reset_frames > 0
             and self._consecutive_backward_frames >= _RAPID_RESET_FRAMES
         ):
-            captured_lag = self._consecutive_backward_frames
             logger.info(
                 "OLTW rapid DP reset: %d consecutive backward attempts at "
                 "ref_frame=%d; wiping backward cumulative cost",
@@ -793,12 +779,6 @@ class OnlineDTWFollower:
             self._stuck_dp_counter = 0
             self._stuck_dp_window_start_pos = self._current_ref_pos
             self._backward_attempts_in_window = 0
-            # Arm the catchup for the NEXT live frame: during the stall,
-            # the audio kept playing while the DP held position, so the
-            # actual music position is most likely ~captured_lag frames
-            # ahead. _try_rapid_reset_catchup will probe that forward
-            # window and jump if a clearly better local match exists.
-            self._pending_rapid_reset_lag = captured_lag
 
         # ---- stuck detection: DP reset (in-place unstick) ------------
         # If the position has barely advanced over the configured
@@ -1278,7 +1258,6 @@ class OnlineDTWFollower:
             self._stuck_dp_window_start_pos = ref_frame
             self._backward_attempts_in_window = 0
             self._consecutive_backward_frames = 0
-            self._pending_rapid_reset_lag = 0
             self._post_seek_catchup_pending = bool(allow_catchup)
         logger.info(
             "OLTW seek: ref_frame=%d (%.2fs)%s",
@@ -1441,7 +1420,6 @@ class OnlineDTWFollower:
             self._stuck_dp_window_start_pos = 0
             self._backward_attempts_in_window = 0
             self._consecutive_backward_frames = 0
-            self._pending_rapid_reset_lag = 0
             self._post_seek_catchup_pending = False
             # Lock-in + inertia state — must reset on movement change
             # so the new movement starts from scratch (no carry-over).
