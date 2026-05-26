@@ -8,7 +8,7 @@
     {
       "id": 1,
       "xml_file": "../data/scores/幻想4_リピート削除.mxl",
-      "built_dir": "../data/built/fantastique4_berlin",
+      "built_dir": "../data/built/幻想4",
       "triggers": [
         {"measure": 1,   "action": "right", "note": "開始 - 行進曲"},
         {"measure": 10,  "action": "right", "note": "test"},

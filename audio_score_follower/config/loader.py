@@ -190,6 +190,47 @@ class ConfigLoader:
         """
         return self.settings.get("loopback_device", None)
 
+    def get_feature_fusion(self) -> tuple:
+        """Return (chroma_weight, onset_weight) for distance fusion.
+
+        Config key ``feature_fusion`` with sub-keys ``chroma_weight``
+        and ``onset_weight``. Defaults: 0.7 / 0.3.
+
+        Both weights must be >= 0 and their sum must be > 0. Invalid
+        values fall back to the defaults with a WARNING.
+
+        The weights are passed as-is to ``OnlineDTWFollower`` — the
+        sum is not enforced to equal 1 so users can experiment with
+        absolute scaling. When onset is unavailable (no
+        reference_onset.npy) the OLTW ignores onset_weight internally.
+        """
+        raw = self.settings.get("feature_fusion", {})
+        if not isinstance(raw, dict):
+            logger.warning(
+                "settings.feature_fusion must be a dict; got %r — using defaults",
+                raw,
+            )
+            raw = {}
+        _DEFAULT_CHROMA = 0.7
+        _DEFAULT_ONSET = 0.3
+        try:
+            cw = float(raw.get("chroma_weight", _DEFAULT_CHROMA))
+            ow = float(raw.get("onset_weight", _DEFAULT_ONSET))
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Invalid feature_fusion weights (%s); using defaults %.1f/%.1f",
+                exc, _DEFAULT_CHROMA, _DEFAULT_ONSET,
+            )
+            return _DEFAULT_CHROMA, _DEFAULT_ONSET
+        if cw < 0 or ow < 0 or (cw + ow) <= 0:
+            logger.warning(
+                "feature_fusion weights must be >= 0 with sum > 0 "
+                "(got chroma=%.3f onset=%.3f); using defaults",
+                cw, ow,
+            )
+            return _DEFAULT_CHROMA, _DEFAULT_ONSET
+        return cw, ow
+
     def get_oltw_kwargs(self) -> dict:
         """Return kwargs forwarded to OnlineDTWFollower.
 

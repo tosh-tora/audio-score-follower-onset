@@ -40,7 +40,9 @@ import numpy as np
 
 from audio_score_follower.core.feature_extractor import (
     FeatureConfig,
+    OnsetNormalizer,
     compute_cens,
+    compute_onset,
 )
 from audio_score_follower.core.oltw_follower import (
     FollowResult,
@@ -62,6 +64,7 @@ class FollowerWorker:
         on_result: Optional[Callable[[FollowResult], None]] = None,
         frames_per_step: int = 4,
         loopback: bool = False,
+        onset_enabled: bool = False,
     ) -> None:
         """
         Args:
@@ -81,6 +84,10 @@ class FollowerWorker:
                 *output* device identified by ``mic_device`` (or the
                 system default output when ``mic_device`` is None).
                 Windows-only; requires sounddevice with WASAPI support.
+            onset_enabled: if True, also compute onset_strength per step
+                and pass it to ``process_frame`` for fusion with CENS.
+                Requires the OLTW to have been built with a matching
+                reference_onset array.
         """
         self._oltw = oltw_follower
         self._cfg = feature_config
@@ -88,6 +95,12 @@ class FollowerWorker:
         self._loopback = bool(loopback)
         self._on_result = on_result or (lambda _r: None)
         self._frames_per_step = int(frames_per_step)
+        self._onset_enabled = bool(onset_enabled)
+        if self._onset_enabled:
+            window = max(1, int(5.0 * self._cfg.effective_frame_rate()))
+            self._onset_normalizer: Optional[OnsetNormalizer] = OnsetNormalizer(window)
+        else:
+            self._onset_normalizer = None
 
         # Audio buffer math: we need enough trailing audio for the CENS
         # smoothing window (cens_win frames) + librosa's internal STFT
@@ -267,13 +280,38 @@ class FollowerWorker:
                 logger.exception("CENS compute failed: %s", exc)
                 continue
 
+            onset_frames: Optional[np.ndarray] = None
+            if self._onset_enabled and self._onset_normalizer is not None:
+                try:
+                    onset_raw = compute_onset(ctx, self._cfg)
+                    n = min(cens.shape[1], onset_raw.shape[0])
+                    if n < cens.shape[1]:
+                        logger.warning(
+                            "Live onset frames (%d) < CENS frames (%d); trimming",
+                            onset_raw.shape[0], cens.shape[1],
+                        )
+                        cens = cens[:, :n]
+                    onset_frames = onset_raw[:n]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Live onset compute failed (%s); using CENS-only", exc)
+
             if cens.shape[1] < self._frames_per_step:
                 continue
-            new_frames = cens[:, -self._frames_per_step:]
+            new_cens = cens[:, -self._frames_per_step:]
+            new_onset = (
+                onset_frames[-self._frames_per_step:]
+                if onset_frames is not None
+                else None
+            )
 
-            for j in range(new_frames.shape[1]):
+            for j in range(new_cens.shape[1]):
+                live_onset = (
+                    self._onset_normalizer.normalize(float(new_onset[j]))
+                    if new_onset is not None and self._onset_normalizer is not None
+                    else None
+                )
                 try:
-                    result = self._oltw.process_frame(new_frames[:, j])
+                    result = self._oltw.process_frame(new_cens[:, j], live_onset)
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("OLTW process_frame failed: %s", exc)
                     continue
@@ -317,6 +355,7 @@ class FileWorker:
         realtime: bool = True,
         start_offset_sec: float = 0.0,
         play_audio: bool = False,
+        onset_enabled: bool = False,
     ) -> None:
         """
         Args:
@@ -333,12 +372,20 @@ class FileWorker:
             play_audio: if True, play the loaded audio through the
                 default output device (via sounddevice) in sync with
                 the OLTW frame loop. Only active when realtime=True.
+            onset_enabled: if True, compute onset_strength from the file
+                and pass it to ``process_frame`` for fusion with CENS.
         """
         self._oltw = oltw_follower
         self._cfg = feature_config
         self._input_wav = Path(input_wav)
         self._on_result = on_result or (lambda _r: None)
         self._realtime = bool(realtime)
+        self._onset_enabled = bool(onset_enabled)
+        if self._onset_enabled:
+            window = max(1, int(5.0 * self._cfg.effective_frame_rate()))
+            self._onset_normalizer: Optional[OnsetNormalizer] = OnsetNormalizer(window)
+        else:
+            self._onset_normalizer = None
         self._start_offset_sec = float(start_offset_sec)
         self._play_audio = bool(play_audio)
 
@@ -425,6 +472,23 @@ class FileWorker:
 
             logger.info("Computing CENS for full file …")
             cens = compute_cens(audio, self._cfg)
+
+            onset_all: Optional[np.ndarray] = None
+            if self._onset_enabled:
+                try:
+                    onset_raw = compute_onset(audio, self._cfg)
+                    n_common = min(cens.shape[1], onset_raw.shape[0])
+                    if n_common < cens.shape[1]:
+                        logger.warning(
+                            "FileWorker: onset frames (%d) < CENS frames (%d); trimming",
+                            onset_raw.shape[0], cens.shape[1],
+                        )
+                        cens = cens[:, :n_common]
+                    onset_all = onset_raw[:n_common]
+                    logger.info("Computed onset for full file: shape=%s", onset_all.shape)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("FileWorker: onset compute failed (%s); CENS-only", exc)
+
             n_frames = cens.shape[1]
             interval = 1.0 / self._cfg.effective_frame_rate()
             logger.info(
@@ -461,8 +525,11 @@ class FileWorker:
         for j in range(n_frames):
             if self._stop_event.is_set():
                 break
+            live_onset: Optional[float] = None
+            if onset_all is not None and self._onset_normalizer is not None:
+                live_onset = self._onset_normalizer.normalize(float(onset_all[j]))
             try:
-                result = self._oltw.process_frame(cens[:, j])
+                result = self._oltw.process_frame(cens[:, j], live_onset)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("OLTW process_frame failed at j=%d: %s", j, exc)
                 continue

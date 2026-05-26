@@ -42,6 +42,8 @@ import numpy as np
 from audio_score_follower.core.feature_extractor import (
     FeatureConfig,
     compute_cens,
+    compute_onset,
+    normalize_onset_global,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,7 @@ class BuildResult:
     score_cens: np.ndarray      # (12, N_score) float32 — kept for plotting
     score_bpm: float
     feature_config: FeatureConfig
+    reference_onset: Optional[np.ndarray] = None  # (N_ref,) float32 global-max normalised
 
 
 def _load_audio_mono(path: Path, target_sr: int) -> np.ndarray:
@@ -250,6 +253,24 @@ def build_reference(
         score_cens.shape, ref_cens.shape, cfg.effective_frame_rate(),
     )
 
+    logger.info("Computing onset for reference …")
+    ref_onset_raw = compute_onset(ref_audio, cfg)
+    # Trim to the same frame count as ref_cens (typically equal; may
+    # differ by 1 due to STFT edge handling in different librosa builds).
+    n_ref_frames = ref_cens.shape[1]
+    if ref_onset_raw.shape[0] != n_ref_frames:
+        logger.warning(
+            "Reference onset frames (%d) differ from CENS frames (%d); "
+            "truncating to %d",
+            ref_onset_raw.shape[0], n_ref_frames,
+            min(ref_onset_raw.shape[0], n_ref_frames),
+        )
+        n_common = min(ref_onset_raw.shape[0], n_ref_frames)
+        ref_onset_raw = ref_onset_raw[:n_common]
+        ref_cens = ref_cens[:, :n_common]
+    ref_onset = normalize_onset_global(ref_onset_raw)
+    logger.info("Onset shape: %s (normalised to [0, 1])", ref_onset.shape)
+
     wp = _run_mrmsdtw(score_cens, ref_cens, cfg.effective_frame_rate())
     # wp is (2, K); convert frame indices → seconds on each axis.
     frame_to_sec = 1.0 / cfg.effective_frame_rate()
@@ -289,6 +310,11 @@ def build_reference(
     logger.info("Saved reference CENS → %s (%.1f MB)",
                 cens_path, cens_path.stat().st_size / 1024 / 1024)
 
+    onset_path = output_dir / "reference_onset.npy"
+    np.save(onset_path, ref_onset)
+    logger.info("Saved reference onset → %s (%.0f KB)",
+                onset_path, onset_path.stat().st_size / 1024)
+
     # Also save a small JSON sidecar with feature config — easier to
     # diff / debug than reading the npz.
     import json
@@ -298,6 +324,7 @@ def build_reference(
         "feature_config": cfg.to_dict(),
         "reference_duration_sec": float(len(ref_audio) / cfg.sample_rate),
         "warp_path_length": int(wp.shape[1]),
+        "has_onset": True,
     }
     meta_path = output_dir / "build_meta.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
@@ -313,6 +340,7 @@ def build_reference(
         score_cens=score_cens,
         score_bpm=score_bpm,
         feature_config=cfg,
+        reference_onset=ref_onset,
     )
 
 

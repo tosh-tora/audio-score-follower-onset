@@ -82,7 +82,11 @@ class _NullSlideController:
     def last_error(self) -> None:
         return None
 from audio_score_follower.core.state_manager import AppState
-from audio_score_follower.core.warp_lookup import WarpLookup, load_reference_cens
+from audio_score_follower.core.warp_lookup import (
+    WarpLookup,
+    load_reference_cens,
+    load_reference_onset,
+)
 from audio_score_follower.ui.gui_tkinter import FollowerGUI
 
 logger = logging.getLogger(__name__)
@@ -320,6 +324,7 @@ class AudioScoreFollowerApp:
             self.score_mapper = ScoreMapper(str(xml_file))
             self.warp_lookup = WarpLookup.load(built_dir)
             reference_cens = load_reference_cens(built_dir)
+            reference_onset = load_reference_onset(built_dir)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to load movement artifacts: %s", exc)
             self.state.set_load_error(f"読込失敗: {exc}")
@@ -329,6 +334,16 @@ class AudioScoreFollowerApp:
             "Loaded: %s, %s, reference_cens=(%d,%d)",
             self.score_mapper, self.warp_lookup,
             reference_cens.shape[0], reference_cens.shape[1],
+        )
+
+        chroma_weight, onset_weight = self.config.get_feature_fusion()
+        onset_enabled = reference_onset is not None and onset_weight > 0.0
+        logger.info(
+            "Feature fusion: %s (chroma=%.2f onset=%.2f)%s",
+            "enabled" if onset_enabled else "disabled",
+            chroma_weight, onset_weight,
+            "" if onset_enabled else
+            " — rebuild with asf-build to generate reference_onset.npy",
         )
 
         # Validate warp path consistency before starting OLTW.
@@ -349,6 +364,9 @@ class AudioScoreFollowerApp:
             self.oltw = OnlineDTWFollower(
                 reference_cens=reference_cens,
                 feature_config=self.warp_lookup.feature_config,
+                reference_onset=reference_onset,
+                chroma_weight=chroma_weight,
+                onset_weight=onset_weight,
                 **self.config.get_oltw_kwargs(),
             )
         except Exception as exc:  # noqa: BLE001
@@ -380,6 +398,7 @@ class AudioScoreFollowerApp:
                 on_result=self._on_oltw_result,
                 realtime=True,
                 play_audio=self.play_audio,
+                onset_enabled=onset_enabled,
             )
         elif self.loopback:
             self.worker = FollowerWorker(
@@ -388,6 +407,7 @@ class AudioScoreFollowerApp:
                 mic_device=self.loopback_device,
                 on_result=self._on_oltw_result,
                 loopback=True,
+                onset_enabled=onset_enabled,
             )
         else:
             self.worker = FollowerWorker(
@@ -395,6 +415,7 @@ class AudioScoreFollowerApp:
                 feature_config=self.warp_lookup.feature_config,
                 mic_device=self.config.get_mic_device(),
                 on_result=self._on_oltw_result,
+                onset_enabled=onset_enabled,
             )
         self.worker.start()
 

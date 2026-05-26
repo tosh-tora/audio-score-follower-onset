@@ -1043,3 +1043,129 @@ def test_offset_input_tracks_with_lag():
     assert result.ref_frame >= 80, (
         f"expected near 89, got {result.ref_frame}"
     )
+
+
+# ============================================================= fusion tests
+
+def test_fusion_backward_compat_no_onset_kwarg():
+    """OnlineDTWFollower created without onset args behaves identically to original.
+
+    All 31+ existing tests omit reference_onset / chroma_weight / onset_weight.
+    This test verifies the backward-compat path explicitly: fusion must be
+    disabled and FollowResult must have the legacy fields populated.
+    """
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20)
+
+    assert not follower._fusion_enabled, "fusion should be off by default"
+
+    positions = []
+    for j in range(60):
+        result = follower.process_frame(ref[:, j])
+        positions.append(result.ref_frame)
+        # Legacy scalar fields present and finite.
+        assert np.isfinite(result.confidence)
+        assert np.isfinite(result.raw_local_cost)
+        # New fields default to 0.0 when fusion is off.
+        assert result.dist_onset == 0.0
+
+    diffs = np.diff(positions)
+    assert (diffs >= 0).all(), "positions must be monotonic"
+
+
+def test_fusion_process_frame_with_onset_self_alignment():
+    """With fusion enabled, self-alignment remains monotonic + high confidence.
+
+    This is the 'acceptance criterion A' test: the reference itself fed
+    back as live input should still track near-perfectly when onset is added.
+    """
+    rng = np.random.default_rng(99)
+    cfg = FeatureConfig()
+    n = 80
+
+    # Random unique unit chroma (high discriminability, mirrors test_self_alignment_high_confidence).
+    ref_cens = rng.standard_normal((12, n)).astype(np.float32)
+    ref_cens = np.abs(ref_cens)
+    norms = np.linalg.norm(ref_cens, axis=0, keepdims=True)
+    ref_cens = (ref_cens / (norms + 1e-8)).astype(np.float32)
+
+    # Synthetic onset: ramp from 0 to 1, normalised.
+    ref_onset = np.linspace(0.1, 0.9, n, dtype=np.float32)
+
+    follower = OnlineDTWFollower(
+        ref_cens, cfg,
+        reference_onset=ref_onset,
+        chroma_weight=0.7,
+        onset_weight=0.3,
+        search_width=20,
+    )
+    assert follower._fusion_enabled
+
+    positions, confidences = [], []
+    for j in range(n):
+        result = follower.process_frame(ref_cens[:, j], float(ref_onset[j]))
+        positions.append(result.ref_frame)
+        confidences.append(result.confidence)
+
+    diffs = np.diff(positions)
+    assert (diffs >= 0).all(), "positions must be monotonic with fusion on"
+    assert positions[-1] >= n - 10, f"expected near end, got {positions[-1]}"
+
+    settled = confidences[20:]
+    assert min(settled) > 0.7, (
+        f"fusion dropped confidence below 0.7: min={min(settled):.3f}"
+    )
+
+
+def test_fusion_disabled_when_onset_weight_zero():
+    """onset_weight=0 means fusion is off even if reference_onset is provided."""
+    cfg = FeatureConfig()
+    ref_cens = np.eye(12, 40, dtype=np.float32)
+    norms = np.linalg.norm(ref_cens, axis=0, keepdims=True)
+    ref_cens = (ref_cens / (norms + 1e-8)).astype(np.float32)
+    ref_onset = np.zeros(40, dtype=np.float32)
+
+    follower = OnlineDTWFollower(
+        ref_cens, cfg,
+        reference_onset=ref_onset,
+        chroma_weight=1.0,
+        onset_weight=0.0,
+        search_width=20,
+    )
+    assert not follower._fusion_enabled, (
+        "onset_weight=0 must disable fusion even when reference_onset is present"
+    )
+
+
+def test_follow_result_dist_fields_populated_with_fusion():
+    """When fusion is active, dist_chroma and dist_onset must be non-trivially populated."""
+    rng = np.random.default_rng(55)
+    cfg = FeatureConfig()
+    n = 30
+
+    ref_cens = rng.standard_normal((12, n)).astype(np.float32)
+    ref_cens = np.abs(ref_cens)
+    norms = np.linalg.norm(ref_cens, axis=0, keepdims=True)
+    ref_cens = (ref_cens / (norms + 1e-8)).astype(np.float32)
+    ref_onset = rng.uniform(0.0, 1.0, n).astype(np.float32)
+
+    follower = OnlineDTWFollower(
+        ref_cens, cfg,
+        reference_onset=ref_onset,
+        chroma_weight=0.7,
+        onset_weight=0.3,
+        search_width=15,
+    )
+
+    results = [
+        follower.process_frame(ref_cens[:, j], float(ref_onset[j]))
+        for j in range(n)
+    ]
+    # Skip the very first frame (first-frame FollowResult always gets diagnostics,
+    # but onset distance is only non-zero if there's a real diff).
+    for r in results[1:]:
+        assert np.isfinite(r.dist_chroma), "dist_chroma must be finite"
+        assert np.isfinite(r.dist_onset), "dist_onset must be finite"
+        assert -1e-5 <= r.dist_chroma <= 2.0 + 1e-5, f"dist_chroma out of [0,2]: {r.dist_chroma}"
+        assert -1e-5 <= r.dist_onset <= 1.0 + 1e-5, f"dist_onset out of [0,1]: {r.dist_onset}"
