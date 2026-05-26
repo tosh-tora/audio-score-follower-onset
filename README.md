@@ -10,13 +10,20 @@
 
 ## 特徴
 
-### 1. Note-based ではなく Audio-to-Audio（CENS マッチング）
+### 1. Note-based ではなく Audio-to-Audio（CENS + onset 融合マッチング）
 
 オーケストラの密音響、ホール残響、和音の混ざり合いの中で、単音レベルのピッチをマイクから正確に
 抽出するのは至難の業。本プロジェクトは演奏音を丸ごと **CENS (Chroma Energy Normalized
 Statistics)** に変換し、オーケストラ全体の「響きのエネルギー分布」として捉える。これにより
 楽器ごとの休みの影響を無効化できる ─ 弦楽器が長大に休んでいても、木管・金管の響きが
 リファレンスと合致していれば迷子にならない。
+
+さらに **Spectral Flux オンセット強度** を CENS に融合させた 2 特徴量距離を使う
+(`chroma_weight * cosine距離 + onset_weight * |onset差|`、デフォルト 0.7/0.3)。
+同一音域の繰り返しテーマ・平行調・ホール残響で CENS 距離が平坦になる区間でも、
+オンセットパターン（フレーズの立ち上がり位置）の違いが識別力を補う。
+融合係数は `config.json` の `settings.feature_fusion` で調整可能。
+`reference_onset.npy` がない旧来ビルドに対しては自動で CENS 単独にフォールバックする。
 
 ### 2. 二段階マッピング（オフライン MrMsDTW + オンライン OLTW）
 
@@ -59,14 +66,15 @@ Statistics)** に変換し、オーケストラ全体の「響きのエネルギ
                             │
                             ▼
                    data/built/<name>/
-                     ├─ warping_path.npz   (score_time ↔ reference_time)
-                     └─ reference_cens.npy (本番 OLTW 用 CENS)
+                     ├─ warping_path.npz    (score_time ↔ reference_time)
+                     ├─ reference_cens.npy  (本番 OLTW 用 CENS)
+                     └─ reference_onset.npy (本番 OLTW 用オンセット強度)
 
 オンライン (asf-follow):
-  マイク or WAV ─▶ CENS ─▶ Online DTW ─▶ reference_time
-                                              │
-                                              ▼ warp 逆引き
-                                         score_time → 小節 → Slides
+  マイク or WAV ─▶ CENS + onset ─▶ Online DTW (fused distance) ─▶ reference_time
+                                                                        │
+                                                                        ▼ warp 逆引き
+                                                                  score_time → 小節 → Slides
 ```
 
 ## セットアップ
@@ -121,14 +129,33 @@ data/
 ### 4. オフラインビルド
 
 ```powershell
+# ファイル名のみ指定（推奨）
+# data/scores/<score>、data/reference_audio/<ref>、data/built/<output> に自動解決される
 asf-build `
-    --score data/scores/beethoven5.xml `
-    --reference data/reference_audio/karajan_1977.mp3 `
-    --output data/built/beethoven5_karajan/ `
+    --score beethoven5.xml `
+    --reference karajan_1977.mp3 `
+    --output beethoven5_karajan `
     [--score-bpm 152] `
     [--start-offset 0.5] `
     [--plot]
+
+# フルパスも引き続き使用可（後方互換）
+asf-build `
+    --score data/scores/beethoven5.xml `
+    --reference data/reference_audio/karajan_1977.mp3 `
+    --output data/built/beethoven5_karajan
 ```
+
+**ファイル名ショートハンド**: `--score`・`--reference`・`--output` にディレクトリを含まない名前を渡すと、
+プロジェクトルートからの以下のデフォルトパスへ自動解決される：
+
+| 引数 | ファイル名のみの場合の解決先 |
+|---|---|
+| `--score` | `data/scores/<filename>` |
+| `--reference` | `data/reference_audio/<filename>` |
+| `--output` | `data/built/<name>` |
+
+ディレクトリを含むパスや絶対パスはそのまま使われる。
 
 **合成 BPM の自動推定**: `--score-bpm` を省略すると、参照録音の duration と楽譜の総ビート数
 から `total_beats * 60 / ref_duration` で四分音符 BPM を自動算出する。例えばベルリン・フィルの
@@ -144,6 +171,15 @@ Override with --score-bpm if undesirable.
 これを回避する。`--score-wav` を渡す場合は合成テンポを録音から逆算できないため、`--score-bpm`
 の明示指定が必須。
 
+**ビルド成果物**: `data/built/<output>/` に以下が生成される：
+
+| ファイル | 内容 |
+|---|---|
+| `warping_path.npz` | score_time ↔ reference_time の対応表 |
+| `reference_cens.npy` | 本番 OLTW 用 CENS 特徴量行列 `(12, N)` |
+| `reference_onset.npy` | 本番 OLTW 用オンセット強度列 `(N,)`（CENS+onset 融合に使用） |
+| `build_meta.json` | ビルド設定メタデータ（`score_bpm`・`has_onset` 等） |
+
 ### 5. ライブ追随
 
 ```powershell
@@ -155,14 +191,22 @@ python -m audio_score_follower.main config/beethoven5.json `
 # ドライラン (マイクあり、Slides なし。動作確認用)
 python -m audio_score_follower.main config/beethoven5.json --verbose
 
-# 診断モード (マイク経由を完全に外して、ファイル音源で動作確認)
+# 診断モード (ファイル名のみ指定、data/reference_audio/ に自動解決)
+python -m audio_score_follower.main config/beethoven5.json `
+    --input-wav karajan_1977.mp3 `
+    --verbose
+
+# フルパスも引き続き使用可
 python -m audio_score_follower.main config/beethoven5.json `
     --input-wav data/reference_audio/karajan_1977.mp3 `
     --verbose
 ```
 
+`--input-wav` でファイル名のみを渡した場合は `data/reference_audio/<filename>` に自動解決される。
+ディレクトリを含むパスや絶対パスはそのまま使われる。
+
 `--input-wav` モードでは silence gate が自動で無効化され、ファイルを実時間で
-CENS → OLTW に流す。アルゴリズムの検証、リファレンス音源との自己整合確認、
+CENS+onset → OLTW に流す。アルゴリズムの検証、リファレンス音源との自己整合確認、
 別演奏 (alt recording) でのカバレッジ測定に使う。
 
 ## config.json スキーマ
@@ -175,6 +219,10 @@ CENS → OLTW に流す。アルゴリズムの検証、リファレンス音源
     "cooldown_seconds": 3.0,
     "silence_threshold_db": -55.0,
     "mic_device": null,
+    "feature_fusion": {
+      "chroma_weight": 0.7,
+      "onset_weight": 0.3
+    },
     "oltw_kwargs": {
       "search_width": 240,
       "back_inhibit_frames": 30,
@@ -206,7 +254,18 @@ CENS → OLTW に流す。アルゴリズムの検証、リファレンス音源
 | `cooldown_seconds` | `3.0` | トリガ発火後、次のトリガが有効になるまでの最短間隔（秒）。 |
 | `silence_threshold_db` | `-55.0` | この dBFS 以下が続いたら OLTW を一時停止（フェルマータ・休符対策）。`--input-wav` モードでは自動無効。ホール本番は観客の咳・空調で暗騒音が **-50 〜 -45 dBFS** 程度まで上がるため、デフォルトのままだと無音区間でも gate が解除されず追従が進む。本番では事前にステージ無人時のレベルを実測し、その値 +3 dBFS 程度を指定する。 |
 | `mic_device` | `null` | マイク入力デバイス名または番号。`null` = OS デフォルト。 |
+| `feature_fusion` | (下記) | CENS + onset 融合係数。通常はデフォルトのまま。`reference_onset.npy` がない旧来ビルドでは無視される。 |
 | `oltw_kwargs` | (下記) | OLTW のチューニングパラメータ。通常はデフォルトのまま。 |
+
+### settings.feature_fusion: 特徴量融合係数
+
+| フィールド | デフォルト | 説明 |
+|---|---|---|
+| `chroma_weight` | `0.7` | CENS コサイン距離に掛ける重み。 |
+| `onset_weight` | `0.3` | オンセット絶対差分に掛ける重み。`0.0` にすると CENS 単独と同等（オンセット無効化）。両方 `0` はエラー。 |
+
+融合距離 = `chroma_weight × (1 - cosine(ref, live)) + onset_weight × |ref_onset - live_onset|`。
+和が 1 になるよう正規化される必要はない（実験的にスケーリングを変えたい場合はそのまま指定可）。`reference_onset.npy` が存在しない場合は `onset_weight` は無視され CENS 単独で動作する。
 
 ### settings.oltw_kwargs: OLTW チューニング
 
@@ -424,7 +483,7 @@ audio_score_follower/
 │   ├── state_manager.py      # GUI 状態管理 (lock-in / inertia / mic level 等を atomic に保持)
 │   ├── audio_level.py        # silence gate (マイク dBFS 監視)
 │   ├── cooldown_timer.py     # クールダウン + 手動 unmark
-│   ├── feature_extractor.py  # CENS 特徴抽出 (librosa)。オフライン/オンラインで唯一の経路
+│   ├── feature_extractor.py  # CENS + onset 特徴抽出 (librosa)。オフライン/オンラインで唯一の経路。fused_local_cost() で融合距離を計算
 │   ├── reference_builder.py  # オフライン MrMsDTW
 │   ├── oltw_follower.py      # Online DTW 本体 + lock-in latch + inertia + seek() / post-seek catchup
 │   ├── warp_lookup.py        # ref_time ↔ score_time ↔ measure (双方向)
@@ -437,7 +496,7 @@ audio_score_follower/
 └── main.py                   # GUI エントリ + キーバインディング + silence-gate poll
 tasks/
 └── generate_score_wav.py     # XML → 合成 WAV (MuseScore 4 CLI, Windows ネイティブ)
-tests/                        # pytest (現在 47 テスト。test_oltw_follower.py が lock-in/inertia を 31 ケースでカバー)
+tests/                        # pytest (現在 64 テスト。test_oltw_follower.py が lock-in/inertia/fusion を 35 ケースでカバー)
 data/                         # gitignore
 ```
 

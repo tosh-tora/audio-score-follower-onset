@@ -783,7 +783,8 @@ def main() -> int:
     parser.add_argument(
         "--input-wav", type=Path, default=None,
         help="マイクの代わりに指定の音源ファイル (WAV/MP3/...) を OLTW に流す。"
-             "切り分けデバッグ用。silence gate は自動的に無効化される。",
+             "切り分けデバッグ用。silence gate は自動的に無効化される。"
+             "ファイル名のみ指定した場合は data/reference_audio/<filename> に解決される。",
     )
     parser.add_argument(
         "--play-audio", action="store_true",
@@ -816,6 +817,10 @@ def main() -> int:
     if not config_path.exists():
         logger.error("Config not found: %s", config_path)
         return 1
+
+    # Resolve plain filename (no directory component) to data/reference_audio/.
+    if args.input_wav is not None and args.input_wav.parent == Path("."):
+        args.input_wav = Path("data") / "reference_audio" / args.input_wav
 
     if args.input_wav is not None and not args.input_wav.exists():
         logger.error("--input-wav not found: %s", args.input_wav)
