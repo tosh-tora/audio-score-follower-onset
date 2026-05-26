@@ -33,7 +33,10 @@ from typing import Optional
 
 import numpy as np
 
-from audio_score_follower.core.feature_extractor import FeatureConfig
+from audio_score_follower.core.feature_extractor import (
+    FeatureConfig,
+    fused_local_cost,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +48,17 @@ class FollowResult:
     ref_frame: int          # best-aligned reference frame
     ref_time_sec: float     # ref_frame / feature_rate
     confidence: float       # smoothed, in [0, 1]
-    raw_local_cost: float   # cosine distance at the current frame (diagnostic)
+    raw_local_cost: float   # fused local cost at the current frame (diagnostic)
     band_lo: int            # left edge of search band (diagnostic)
     band_hi: int            # right edge (exclusive)
+    # Fusion diagnostics — present in every result but only meaningful
+    # when fusion is active. ``dist_chroma`` is the unweighted cosine
+    # distance at ``ref_frame``; ``dist_onset`` is the unweighted
+    # absolute onset difference. When fusion is disabled both fall
+    # back to legacy semantics: dist_chroma = raw cosine cost,
+    # dist_onset = 0.0.
+    dist_chroma: float = 0.0
+    dist_onset: float = 0.0
 
 
 class OnlineDTWFollower:
@@ -63,6 +74,9 @@ class OnlineDTWFollower:
         reference_cens: np.ndarray,
         feature_config: FeatureConfig,
         *,
+        reference_onset: Optional[np.ndarray] = None,
+        chroma_weight: float = 1.0,
+        onset_weight: float = 0.0,
         search_width: int = 100,
         step_size: int = 1,
         step_penalty: float = 0.02,
@@ -251,6 +265,31 @@ class OnlineDTWFollower:
         self._ref = np.ascontiguousarray(reference_cens, dtype=np.float32)
         self._N = reference_cens.shape[1]
         self._cfg = feature_config
+
+        # Feature fusion (CENS + onset). Reference onset is L2-comparable
+        # to live onset because both are normalised: reference by global
+        # max (offline), live by rolling max in the worker. When
+        # reference_onset is None or onset_weight <= 0 the follower
+        # behaves exactly as before — this is the backward-compat path.
+        if chroma_weight < 0:
+            raise ValueError("chroma_weight must be >= 0")
+        if onset_weight < 0:
+            raise ValueError("onset_weight must be >= 0")
+        if reference_onset is not None:
+            ref_onset_arr = np.ascontiguousarray(reference_onset, dtype=np.float32)
+            if ref_onset_arr.ndim != 1 or ref_onset_arr.shape[0] != self._N:
+                raise ValueError(
+                    f"reference_onset must be shape ({self._N},); "
+                    f"got {ref_onset_arr.shape}"
+                )
+            self._ref_onset: Optional[np.ndarray] = ref_onset_arr
+        else:
+            self._ref_onset = None
+        self._chroma_w = float(chroma_weight)
+        self._onset_w = float(onset_weight)
+        self._fusion_enabled = (
+            self._ref_onset is not None and self._onset_w > 0.0
+        )
         self._search_width = int(search_width)
         self._step_size = int(step_size)
         self._step_penalty = float(step_penalty)
@@ -396,24 +435,38 @@ class OnlineDTWFollower:
         self._last_good_rate: float = 1.0
 
         self._state_lock = threading.Lock()
+        # Per-frame scratch field set at the top of process_frame and
+        # consumed by _local_cost_block / _local_cost_scalar. Initialised
+        # to None so helpers are safe if called outside process_frame.
+        self._live_onset_frame: Optional[float] = None
 
         logger.info(
             "OnlineDTWFollower initialised: N_ref=%d, search_width=%d, "
             "back_inhibit=%d, step_penalty=%.3f, feature_rate=%.2f Hz, "
-            "lock_in=%d frames @ conf>=%.2f, max_inertia=%.1fs",
+            "lock_in=%d frames @ conf>=%.2f, max_inertia=%.1fs, "
+            "fusion=%s (chroma=%.2f, onset=%.2f)",
             self._N, self._search_width, self._back_inhibit_frames,
             self._step_penalty, self._cfg.effective_frame_rate(),
             self._lock_in_frames, self._lock_in_confidence,
             self._max_inertia_seconds,
+            "on" if self._fusion_enabled else "off",
+            self._chroma_w, self._onset_w,
         )
 
     # ------------------------------------------------------------ runtime
-    def process_frame(self, live_cens_frame: np.ndarray) -> FollowResult:
+    def process_frame(
+        self,
+        live_cens_frame: np.ndarray,
+        live_onset_frame: Optional[float] = None,
+    ) -> FollowResult:
         """Advance one live frame and return the new alignment estimate.
 
         Args:
             live_cens_frame: (12,) float32, L2-normalised. Pass a single
                 column from ``compute_cens_streaming`` output.
+            live_onset_frame: scalar normalised onset for this frame, or
+                None. When fusion is enabled and this is None, the frame
+                silently falls back to CENS-only cost for this step.
 
         Returns:
             FollowResult with the new reference position and confidence.
@@ -427,9 +480,42 @@ class OnlineDTWFollower:
                 f"live_cens_frame must be (12,); got {live_cens_frame.shape}"
             )
 
+        # Store the onset for this frame so internal helpers can access
+        # it without threading it through every private method signature.
+        # Safe because process_frame is documented as non-reentrant.
+        if self._fusion_enabled and live_onset_frame is None:
+            logger.debug("fusion enabled but live_onset not provided; CENS-only for this frame")
+        self._live_onset_frame: Optional[float] = (
+            float(live_onset_frame) if live_onset_frame is not None else None
+        )
+
         if self._live_frame_idx == 0:
             return self._process_first_frame(live)
         return self._process_subsequent_frame(live)
+
+    def _local_cost_block(self, lo: int, hi: int, live_cens: np.ndarray) -> np.ndarray:
+        """Fused local cost over reference slice [lo, hi)."""
+        onset_block = self._ref_onset[lo:hi] if self._ref_onset is not None else None
+        return fused_local_cost(
+            self._ref[:, lo:hi],
+            live_cens,
+            onset_block,
+            self._live_onset_frame,
+            self._chroma_w,
+            self._onset_w,
+        )
+
+    def _local_cost_scalar(self, pos: int, live_cens: np.ndarray) -> float:
+        """Fused local cost at a single reference position."""
+        cens_cost = 1.0 - float(self._ref[:, pos] @ live_cens)
+        if (
+            self._fusion_enabled
+            and self._live_onset_frame is not None
+            and self._ref_onset is not None
+        ):
+            onset_cost = abs(float(self._ref_onset[pos]) - self._live_onset_frame)
+            return self._chroma_w * cens_cost + self._onset_w * onset_cost
+        return cens_cost
 
     def _process_first_frame(self, live: np.ndarray) -> FollowResult:
         """Initial alignment: search the first ``init_search_width`` reference frames.
@@ -440,7 +526,7 @@ class OnlineDTWFollower:
         land arbitrarily far into the score.
         """
         hi = min(self._N, self._init_search_width)
-        local_costs = 1.0 - self._ref[:, :hi].T @ live  # (hi,)
+        local_costs = self._local_cost_block(0, hi, live)  # (hi,)
 
         D_curr = np.full(self._N, np.inf, dtype=np.float32)
         D_curr[:hi] = local_costs
@@ -457,6 +543,13 @@ class OnlineDTWFollower:
         with self._state_lock:
             self._cost_history.append(local_cost)
 
+        dist_chroma = float(1.0 - self._ref[:, best] @ live)
+        dist_onset = (
+            abs(float(self._ref_onset[best]) - self._live_onset_frame)
+            if self._fusion_enabled and self._live_onset_frame is not None
+            and self._ref_onset is not None
+            else 0.0
+        )
         return FollowResult(
             ref_frame=best,
             ref_time_sec=best / self._cfg.effective_frame_rate(),
@@ -464,6 +557,8 @@ class OnlineDTWFollower:
             raw_local_cost=local_cost,
             band_lo=0,
             band_hi=hi,
+            dist_chroma=dist_chroma,
+            dist_onset=dist_onset,
         )
 
     def _try_global_rematch(self, live: np.ndarray, current_local_cost: float) -> bool:
@@ -493,8 +588,7 @@ class OnlineDTWFollower:
         )
         if max_jump_pos <= min_jump_pos:
             return False
-        forward_block = self._ref[:, min_jump_pos:max_jump_pos]
-        global_costs = 1.0 - forward_block.T @ live  # (block_size,)
+        global_costs = self._local_cost_block(min_jump_pos, max_jump_pos, live)
         best_offset = int(np.argmin(global_costs))
         best_cost = float(global_costs[best_offset])
 
@@ -569,7 +663,7 @@ class OnlineDTWFollower:
         hi = min(self._N, self._current_ref_pos + self._search_width + 1)
 
         # Vectorised local cost — single matmul over the band.
-        local_costs = 1.0 - self._ref[:, lo:hi].T @ live  # (band_width,)
+        local_costs = self._local_cost_block(lo, hi, live)  # (band_width,)
 
         # DP recurrence: D[i, j] = local_cost[i] + min(D[i-1, j-1],
         #                                              D[i, j-1],
@@ -768,9 +862,7 @@ class OnlineDTWFollower:
                 jumped = self._try_global_rematch(live, local_cost_at_best)
                 if jumped:
                     new_pos = self._current_ref_pos
-                    local_cost_at_best = float(
-                        1.0 - self._ref[:, new_pos] @ live
-                    )
+                    local_cost_at_best = self._local_cost_scalar(new_pos, live)
                     # After a jump the band is reset around the new pos;
                     # surface band info to caller so logs are honest.
                     lo = max(0, new_pos - min(self._search_width, self._back_inhibit_frames))
@@ -845,6 +937,17 @@ class OnlineDTWFollower:
                 out_pos = int(self._inertia_ref_pos)
                 out_conf = 0.0  # mute so triggers don't fire on a guess
 
+        dist_chroma = float(1.0 - self._ref[:, new_pos] @ live)
+        dist_onset = (
+            abs(float(self._ref_onset[new_pos]) - self._live_onset_frame)
+            if self._fusion_enabled and self._live_onset_frame is not None
+            and self._ref_onset is not None
+            else 0.0
+        )
+        logger.debug(
+            "dist_chroma=%.4f dist_onset=%.4f dist_total=%.4f at ref=%d",
+            dist_chroma, dist_onset, local_cost_at_best, new_pos,
+        )
         return FollowResult(
             ref_frame=out_pos,
             ref_time_sec=out_pos / self._cfg.effective_frame_rate(),
@@ -852,6 +955,8 @@ class OnlineDTWFollower:
             raw_local_cost=local_cost_at_best,
             band_lo=lo,
             band_hi=hi,
+            dist_chroma=dist_chroma,
+            dist_onset=dist_onset,
         )
 
     # ------------------------------------------------------------ frozen path
@@ -1208,11 +1313,10 @@ class OnlineDTWFollower:
         max_jump_pos = min(self._N, self._current_ref_pos + self._search_width + 1)
         if max_jump_pos <= min_jump_pos:
             return False
-        forward_block = self._ref[:, min_jump_pos:max_jump_pos]
-        global_costs = 1.0 - forward_block.T @ live
+        global_costs = self._local_cost_block(min_jump_pos, max_jump_pos, live)
         best_offset = int(np.argmin(global_costs))
         best_cost = float(global_costs[best_offset])
-        current_cost = float(1.0 - self._ref[:, self._current_ref_pos] @ live)
+        current_cost = self._local_cost_scalar(self._current_ref_pos, live)
 
         # Guard 1: must beat the current position.
         if current_cost - best_cost < self._stuck_rematch_cost_margin:
@@ -1288,11 +1392,10 @@ class OnlineDTWFollower:
         if max_jump_pos <= min_jump_pos:
             return False
 
-        forward_block = self._ref[:, min_jump_pos:max_jump_pos]
-        local_costs = 1.0 - forward_block.T @ live
+        local_costs = self._local_cost_block(min_jump_pos, max_jump_pos, live)
         best_offset = int(np.argmin(local_costs))
         best_cost = float(local_costs[best_offset])
-        current_cost = float(1.0 - self._ref[:, self._current_ref_pos] @ live)
+        current_cost = self._local_cost_scalar(self._current_ref_pos, live)
 
         # Only jump if the forward match is meaningfully better than the
         # stall position. If the music actually paused during the stall,

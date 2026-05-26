@@ -264,3 +264,25 @@ def load_reference_cens(built_dir: Path) -> np.ndarray:
             f"reference_cens.npy not found in {built_dir}"
         )
     return np.load(cens_path).astype(np.float32, copy=False)
+
+
+def load_reference_onset(built_dir: Path) -> Optional[np.ndarray]:
+    """Load reference_onset.npy if present; return None for legacy builds.
+
+    Legacy build artifacts (created before the CENS + onset fusion
+    feature was added) will not have this file. Returning None signals
+    to the caller that fusion should be disabled, falling back to
+    CENS-only behaviour. Users can rebuild with ``asf-build`` to
+    generate the onset artifact and enable fusion.
+    """
+    onset_path = built_dir / "reference_onset.npy"
+    if not onset_path.exists():
+        logger.info(
+            "reference_onset.npy not found in %s — fusion disabled "
+            "(rebuild with asf-build to enable CENS + onset fusion)",
+            built_dir,
+        )
+        return None
+    arr = np.load(onset_path).astype(np.float32, copy=False)
+    logger.info("Loaded reference onset: shape=%s from %s", arr.shape, onset_path)
+    return arr

@@ -259,6 +259,13 @@ class ScoreMapper:
 
         Returns:
             Beat within measure (0-indexed, e.g., 0.0, 1.5, 2.0, ...)
+
+        Clamps at ``beats_per_measure`` for the final measure: without
+        this, the reference recording's tail (reverb / silence after
+        the last note) and MuseScore's render tail map to score-time
+        beyond the last bar line, so ``beat_count - last_threshold``
+        grows unbounded and the GUI displays beat 5, 6, 7+ during
+        inertia at end-of-piece.
         """
         if not self.beat_thresholds:
             return beat_count
@@ -269,7 +276,19 @@ class ScoreMapper:
             return 0.0
 
         beat_threshold = self.beat_thresholds[idx]
-        return beat_count - beat_threshold
+        beat_in_measure = beat_count - beat_threshold
+
+        # Last-measure overflow guard: bisect_right can only place us at
+        # idx = len-1 (no further threshold to cross), so without this
+        # clamp the result grows arbitrarily past beats_per_measure.
+        if idx == len(self.beat_thresholds) - 1:
+            _, beats_per_measure = self.measure_info[beat_threshold]
+            if beats_per_measure > 0 and beat_in_measure >= beats_per_measure:
+                # Sit just below the next measure's downbeat so the
+                # 1-indexed display reads e.g. 4.99 rather than 5.0.
+                return max(0.0, beats_per_measure - 1e-6)
+
+        return beat_in_measure
 
     def get_total_measures(self) -> int:
         """Return the last measure number in the score (as written in the MusicXML).

@@ -55,8 +55,21 @@ def test_build_reference_smoke(tmp_path):
     # Artifacts exist
     assert (out_dir / "warping_path.npz").exists()
     assert (out_dir / "reference_cens.npy").exists()
+    assert (out_dir / "reference_onset.npy").exists()
     assert (out_dir / "build_meta.json").exists()
 
     # Warp path covers (roughly) the full reference duration.
     assert result.ref_times[-1] >= 4.0
     assert result.score_times[-1] >= 3.0
+
+    # Onset artifact: correct shape, values in [0, 1].
+    assert result.reference_onset is not None
+    assert result.reference_onset.ndim == 1
+    assert result.reference_onset.shape[0] == result.reference_cens.shape[1]
+    assert float(result.reference_onset.max()) <= 1.0 + 1e-5
+    assert float(result.reference_onset.min()) >= 0.0
+
+    # build_meta.json has onset flag.
+    import json
+    meta = json.loads((out_dir / "build_meta.json").read_text(encoding="utf-8"))
+    assert meta.get("has_onset") is True
