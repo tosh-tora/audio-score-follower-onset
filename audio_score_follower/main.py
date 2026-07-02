@@ -20,6 +20,9 @@ Usage::
     python -m audio_score_follower.main config.json \\
         --slide-url "https://docs.google.com/presentation/d/<ID>/present"
 
+    # config を省略するとランチャー GUI が開く (ui/launcher.py):
+    python -m audio_score_follower.main
+
 Keys (on the operator GUI window):
     N            : load next movement
     R            : reload current movement
@@ -48,6 +51,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+from audio_score_follower import launch_options
 from audio_score_follower.config.loader import ConfigError, ConfigLoader
 from audio_score_follower.core.audio_level import AudioLevelMonitor
 from audio_score_follower.core.cooldown_timer import CooldownTimer
@@ -775,7 +779,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="audio-score-follower — orchestral audio-to-audio score following"
     )
-    parser.add_argument("config", help="Path to config.json")
+    parser.add_argument(
+        "config", nargs="?", default=None,
+        help="Path to config.json。省略するとランチャー画面（GUI）を表示。",
+    )
     parser.add_argument(
         "--slide-url", required=False, default=None,
         help="Google Slides /present URL。省略するとドライランモード（スライド操作なし）。",
@@ -806,50 +813,59 @@ def main() -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
+    # INFO first so launcher-phase logs are visible; the root logger level
+    # is raised to DEBUG after --verbose / the launcher checkbox resolves.
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     for noisy in ("numba", "matplotlib", "asyncio", "PIL", "fontTools", "librosa"):
         logging.getLogger(noisy).setLevel(logging.INFO)
 
-    config_path = Path(args.config)
-    if not config_path.exists():
-        logger.error("Config not found: %s", config_path)
-        return 1
+    if args.config is None:
+        # No config argument → launcher GUI. Lazy import keeps the CLI
+        # path free of launcher/sounddevice imports.
+        from audio_score_follower.ui.launcher import run_launcher
 
-    # Resolve plain filename (no directory component) to data/reference_audio/.
-    if args.input_wav is not None and args.input_wav.parent == Path("."):
-        args.input_wav = Path("data") / "reference_audio" / args.input_wav
-
-    if args.input_wav is not None and not args.input_wav.exists():
-        logger.error("--input-wav not found: %s", args.input_wav)
-        return 1
-
-    if args.input_wav is not None and args.loopback:
-        logger.error("--input-wav と --loopback は同時に指定できません")
-        return 1
-
-    if args.play_audio and args.input_wav is None:
-        logger.error("--play-audio は --input-wav と組み合わせて使用してください")
-        return 1
-
-    # --loopback-device: try to coerce to int (device index) if numeric
-    loopback_device = args.loopback_device
-    if loopback_device is not None:
         try:
-            loopback_device = int(loopback_device)
-        except (ValueError, TypeError):
-            pass  # keep as string (device name)
+            opts = run_launcher()
+        except tk.TclError as exc:
+            logger.error(
+                "ランチャーを表示できません (%s)。config を引数で指定してください。", exc
+            )
+            return 1
+        if opts is None:
+            logger.info("ランチャーがキャンセルされました")
+            return 0
+    else:
+        # CLI mode: behaviour unchanged; the persisted settings.launcher
+        # block is intentionally ignored here.
+        if not Path(args.config).exists():
+            logger.error("Config not found: %s", args.config)
+            return 1
+        # wav × loopback exclusion must be checked before the enum mapping
+        # collapses both flags into input_source.
+        if args.input_wav is not None and args.loopback:
+            logger.error("--input-wav と --loopback は同時に指定できません")
+            return 1
+        opts = launch_options.from_cli_args(args)
+        errors = launch_options.validate(opts)
+        if errors:
+            for err in errors:
+                logger.error("%s", err)
+            return 1
+
+    if opts.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     try:
         app = AudioScoreFollowerApp(
-            str(config_path),
-            slide_url=args.slide_url,
-            input_wav=args.input_wav,
-            play_audio=args.play_audio,
-            loopback=args.loopback,
-            loopback_device=loopback_device,
+            str(opts.config_path),
+            slide_url=opts.slide_url,
+            input_wav=opts.input_wav,
+            play_audio=opts.play_audio,
+            loopback=(opts.input_source == launch_options.INPUT_SOURCE_LOOPBACK),
+            loopback_device=opts.loopback_device,
         )
         app.run()
         return 0

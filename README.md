@@ -210,6 +210,51 @@ python -m audio_score_follower.main config/beethoven5.json `
 CENS+onset → OLTW に流す。アルゴリズムの検証、リファレンス音源との自己整合確認、
 別演奏 (alt recording) でのカバレッジ測定に使う。
 
+### 6. ランチャー GUI（引数なし起動）
+
+config 引数を省略すると、CLI オプション相当の項目を GUI で選んで起動できる
+ランチャー画面が開く：
+
+```powershell
+python -m audio_score_follower.main
+# または
+asf-follow
+```
+
+| 項目 | 対応する CLI |
+|---|---|
+| 設定ファイル | 第1引数の config.json（`config/*.json` を列挙、前回使用したものをプリセレクト） |
+| 入力ソース: マイク / ループバック / 音源ファイル | （デフォルト）/ `--loopback` / `--input-wav` |
+| マイク・ループバックのデバイス選択 | `settings.mic_device` / `--loopback-device` |
+| 同時に再生する | `--play-audio` |
+| スライド URL | `--slide-url`（空欄 = ドライラン） |
+| 無音判定閾値 / トリガ間隔 | `settings.silence_threshold_db` / `settings.cooldown_seconds` |
+| 無音測定ボタン | （下記） |
+| 詳細ログ | `-v` |
+
+**無音測定ボタン**: ステージが無音（暗騒音のみ）の状態で「無音測定」を押すと
+マイクの dBFS 測定を開始し、「測定終了」でその間のサンプルから
+`中央値 + (中央値 − 10パーセンタイル) + 3dB` を無音判定閾値に自動設定する。
+突発音（咳・椅子の軋みなど）は分布の上側にしか現れないため、下側の分布幅を
+上側に鏡映するこの式は偶発音に頑健で、会場の暗騒音の揺らぎ幅にも自動適応する。
+測定は本番の silence gate と同じ RMS 経路（`AudioLevelMonitor`）で行うため
+キャリブレーションのずれがない。入力ソースの選択にかかわらず常に使用可能で、
+測定は常にマイク欄で選択中のデバイスから行う（閾値は config に保存され、
+次回マイク運用時に効くため）。最低 2 秒以上測定すること。
+
+**永続化**: 「開始」を押すと選択内容が **選択した config.json に保存**され
+（ランチャー専用の状態は `settings.launcher` ブロック、デバイスと閾値は既存の
+フラットキー）、次回起動時に復元される。保存時に JSON の整形は `indent=2` に
+正規化される（movements 等の内容は保持される）。
+
+**CLI モードとの関係**: config 引数を渡した従来の CLI 起動は挙動不変で、
+`settings.launcher` ブロックを**無視**する（`mic_device` / `loopback_device` 等の
+既存キーは従来どおり有効。CLI フラグが優先）。
+
+デバイスは保存時に名前スナップショットも記録され、次回起動時に Windows の
+デバイス番号が変わっていても名前一致で再マッチされる（見つからなければ
+「既定のデバイス」にフォールバック）。
+
 ## config.json スキーマ
 
 `config/` ディレクトリに JSON ファイルを置く。`asf-follow` の第1引数に渡す。
@@ -255,6 +300,8 @@ CENS+onset → OLTW に流す。アルゴリズムの検証、リファレンス
 | `cooldown_seconds` | `3.0` | トリガ発火後、次のトリガが有効になるまでの最短間隔（秒）。 |
 | `silence_threshold_db` | `-55.0` | この dBFS 以下が続いたら OLTW を一時停止（フェルマータ・休符対策）。`--input-wav` モードでは自動無効。ホール本番は観客の咳・空調で暗騒音が **-50 〜 -45 dBFS** 程度まで上がるため、デフォルトのままだと無音区間でも gate が解除されず追従が進む。本番では事前にステージ無人時のレベルを実測し、その値 +3 dBFS 程度を指定する。 |
 | `mic_device` | `null` | マイク入力デバイス名または番号。`null` = OS デフォルト。 |
+| `loopback_device` | `null` | `--loopback` モードで取得する出力デバイス番号または名前。`null` = OS デフォルト出力。CLI の `--loopback-device` が優先。 |
+| `launcher` | (なし) | ランチャー GUI が保存する起動オプション（入力ソース・スライド URL・デバイス名スナップショット等）。**CLI 起動時は無視される**。手で編集する必要はない。 |
 | `feature_fusion` | (下記) | CENS + onset 融合係数。通常はデフォルトのまま。`reference_onset.npy` がない旧来ビルドでは無視される。 |
 | `oltw_kwargs` | (下記) | OLTW のチューニングパラメータ。通常はデフォルトのまま。 |
 
