@@ -334,6 +334,25 @@ class ConfigLoader:
             # position for _maybe_resync_from_dp to accept the DP and
             # exit inertia. None → use search_width (≈22s).
             "inertia_resync_max_gap_frames": None,
+            # Display slew: rate-limit on how fast the DISPLAYED position
+            # may chase the DP anchor during normal tracking (frames per
+            # live frame = max(display_min_advance, rate * factor)).
+            # Turns post-stall DP catch-ups (up to max_advance_per_frame
+            # = 4.6s in one 93ms frame) into a short steady fast-forward
+            # instead of a teleport. Intentional jumps (seek / reset /
+            # rematch / inertia resync) still snap instantly. Set
+            # display_slew_factor to 0 to disable (raw DP output).
+            "display_slew_factor": 3.0,
+            "display_min_advance": 2.0,
+            # Adaptive low-confidence advance cap: after
+            # low_conf_advance_frames consecutive low-conf frames, tighten
+            # max_advance_per_frame to
+            # max(low_conf_advance_min, ceil(rate * low_conf_advance_factor)).
+            # SHIPS DISABLED (0): enable only after eval shows a win on
+            # all alternate recordings with no same-recording regression.
+            "low_conf_advance_frames": 0,
+            "low_conf_advance_factor": 4.0,
+            "low_conf_advance_min": 4,
         }
         user_kwargs = self.settings.get("oltw_kwargs", {})
         if not isinstance(user_kwargs, dict):
@@ -342,6 +361,18 @@ class ConfigLoader:
             )
             user_kwargs = {}
         return {**defaults, **user_kwargs}
+
+    @classmethod
+    def default_oltw_kwargs(cls) -> dict:
+        """OLTW defaults without loading a config file.
+
+        Used by headless eval tooling (tasks/eval_tracking.py) so
+        parameter sweeps start from the exact same defaults production
+        uses, without requiring a config.json.
+        """
+        dummy = cls.__new__(cls)
+        dummy.settings = {}
+        return dummy.get_oltw_kwargs()
 
     def get_movement_triggers(self, movement_id: Optional[int] = None) -> List[Dict]:
         if movement_id is None:

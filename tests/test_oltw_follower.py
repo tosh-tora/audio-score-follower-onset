@@ -811,8 +811,12 @@ def test_back_inhibit_prevents_self_similar_capture():
 
     # Wide search_width so symmetric band could reach back to frame 0,
     # but tight back_inhibit keeps it forward.
+    # display_slew_factor=0: this test asserts the DP's raw capture
+    # behaviour; the display-slew overlay would otherwise glide through
+    # the early-theme region while catching up to the DP's init position.
     follower = OnlineDTWFollower(
-        ref, cfg, search_width=120, back_inhibit_frames=10
+        ref, cfg, search_width=120, back_inhibit_frames=10,
+        display_slew_factor=0.0,
     )
 
     positions = []
@@ -1053,3 +1057,178 @@ def test_follow_result_dist_fields_populated_with_fusion():
         assert np.isfinite(r.dist_onset), "dist_onset must be finite"
         assert -1e-5 <= r.dist_chroma <= 2.0 + 1e-5, f"dist_chroma out of [0,2]: {r.dist_chroma}"
         assert -1e-5 <= r.dist_onset <= 1.0 + 1e-5, f"dist_onset out of [0,1]: {r.dist_onset}"
+
+
+# ====================================================== display-slew tests
+
+def _random_unit_chroma(n: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    ref = np.abs(rng.standard_normal((12, n))).astype(np.float32)
+    return (ref / np.linalg.norm(ref, axis=0, keepdims=True)).astype(np.float32)
+
+
+def test_display_slew_limits_forward_jump():
+    """DP が一気に前方へ進んでも、表示位置 (ref_frame) の
+    フレーム間デルタは slew 上限以下に制限される。
+
+    平坦な chroma (全 ref 位置が同一 pitch class) では DP のコスト場が
+    フラットになり、rightmost tie-break + vert chain が毎フレーム
+    max_advance_per_frame いっぱいまで前進する — 実機の「stall 後
+    キャッチアップ」と同じ大ジャンプ構造。dp_ref_frame は暴走するが、
+    ref_frame は max(display_min_advance, rate*display_slew_factor)
+    ずつしか進まないことを確認する。
+    """
+    cfg = FeatureConfig()
+    n = 400
+    # Pure plateau: every column identical (a held tutti chord). All
+    # local costs are exactly 0, every band cell ties, and the
+    # rightmost tie-break advances the DP by max_advance_per_frame
+    # every single frame — the maximal jump generator.
+    ref = np.zeros((12, n), dtype=np.float32)
+    ref[0, :] = 1.0
+
+    follower = OnlineDTWFollower(
+        ref, cfg,
+        search_width=120, back_inhibit_frames=10, init_search_width=10,
+        step_penalty=0.0,  # no penalty → plateau race at full cap
+        max_advance_per_frame=40,
+        stuck_dp_reset_seconds=0.0, stuck_rematch_seconds=0.0,
+        display_slew_factor=3.0, display_min_advance=2.0,
+    )
+    live = ref[:, 0]
+
+    # rate estimator has no history → _last_good_rate=1.0, but bound by
+    # the clamp maximum to be safe: max(2.0, 2.0*3.0) = 6.
+    max_step = max(2.0, 2.0 * 3.0)
+    r = follower.process_frame(live)
+    prev = r.ref_frame
+    dp_jumped = False
+    for _ in range(8):
+        r = follower.process_frame(live)
+        delta = r.ref_frame - prev
+        assert delta <= max_step + 1, (
+            f"display jumped by {delta} frames (> slew bound {max_step})"
+        )
+        if r.dp_ref_frame - r.ref_frame > 10:
+            dp_jumped = True
+        prev = r.ref_frame
+    assert dp_jumped, (
+        "test premise broken: DP never ran ahead of the display "
+        "(no jump was induced)"
+    )
+
+
+def test_display_snaps_on_seek_and_reset():
+    """seek() / reset() は意図的テレポートなので表示も即スナップする。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(80)
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=20, init_search_width=10,
+        display_slew_factor=3.0,
+    )
+    for j in range(10):
+        follower.process_frame(ref[:, j])
+
+    follower.seek(50)
+    assert follower.current_ref_frame == 50, "seek must snap the display"
+
+    follower.reset()
+    assert follower.current_ref_frame == 0, "reset must snap the display to 0"
+
+
+def test_display_snaps_after_inertia_resync():
+    """慣性からの DP resync (seek 経由) 後、表示は resync 先に即スナップ。"""
+    cfg = FeatureConfig()
+    ref = _random_unit_chroma(200, seed=41)
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=30, init_search_width=10,
+        inertia_exit_frames=3, display_slew_factor=3.0,
+    )
+    for j in range(80):
+        follower.process_frame(ref[:, j])
+    assert follower.is_locked_in
+
+    follower.freeze()
+    assert follower.is_in_inertia
+    for _ in range(15):
+        follower.process_frame(np.zeros(12, dtype=np.float32))
+    follower.unfreeze()
+    assert follower.is_in_inertia
+
+    # Feed correct chroma until resync fires.
+    dp_pos = follower._current_ref_pos
+    for j in range(dp_pos, min(dp_pos + 30, ref.shape[1])):
+        r = follower.process_frame(ref[:, j])
+        if not follower.is_in_inertia:
+            break
+    assert not follower.is_in_inertia, "resync never fired"
+    # Display equals the DP anchor right after the resync snap (the
+    # resync frame itself outputs the seek target).
+    assert abs(follower.current_ref_frame - follower.dp_ref_frame) <= 1, (
+        f"display {follower.current_ref_frame} != dp "
+        f"{follower.dp_ref_frame} after resync snap"
+    )
+
+
+def test_display_disabled_passthrough():
+    """display_slew_factor=0 で表示は生 DP 位置と完全一致 (A/B 用)。"""
+    cfg = FeatureConfig()
+    ref = _random_unit_chroma(150, seed=5)
+    follower = OnlineDTWFollower(
+        ref, cfg,
+        search_width=60, back_inhibit_frames=10, init_search_width=10,
+        step_penalty=0.06, max_advance_per_frame=40,
+        stuck_dp_reset_seconds=0.0, stuck_rematch_seconds=0.0,
+        display_slew_factor=0.0,
+    )
+    for j in range(20):
+        follower.process_frame(ref[:, j])
+    # Induce a forward jump; with slew disabled the output must equal
+    # the raw DP position on every frame.
+    pos = follower.current_ref_frame
+    for j in range(pos + 35, min(pos + 60, 150)):
+        r = follower.process_frame(ref[:, j])
+        assert r.ref_frame == r.dp_ref_frame, (
+            f"passthrough violated: ref_frame={r.ref_frame} "
+            f"dp_ref_frame={r.dp_ref_frame}"
+        )
+
+
+def test_low_conf_advance_cap():
+    """低 conf が続くと per-frame の DP 前進が適応 cap に制限され、
+    高 conf が戻ると即座にフル cap (max_advance_per_frame) に復帰する。
+    """
+    cfg = FeatureConfig()
+    ref = _random_unit_chroma(200, seed=13)
+    cap_min = 4
+    follower = OnlineDTWFollower(
+        ref, cfg,
+        search_width=60, back_inhibit_frames=10, init_search_width=10,
+        step_penalty=0.06, max_advance_per_frame=40,
+        stuck_dp_reset_seconds=0.0, stuck_rematch_seconds=0.0,
+        display_slew_factor=0.0,  # observe raw DP advance directly
+        low_conf_advance_frames=5,
+        low_conf_advance_factor=4.0,
+        low_conf_advance_min=cap_min,
+    )
+    for j in range(30):
+        follower.process_frame(ref[:, j])
+
+    # Sustained low confidence: np.zeros gives a guaranteed poor match.
+    # confidence_smoothing=5 leaves residual high confidence for the
+    # first couple of zero frames — feed enough to build the streak.
+    zeros = np.zeros(12, dtype=np.float32)
+    for _ in range(10):
+        follower.process_frame(zeros)
+    assert follower._low_conf_streak >= 5
+
+    # While the streak holds, per-frame advance must respect the
+    # adaptive cap: max(cap_min, ceil(rate * 4.0)) with rate <= 2.0 → <= 8.
+    adaptive_bound = max(cap_min, int(np.ceil(2.0 * 4.0)))
+    prev = follower.dp_ref_frame
+    for _ in range(10):
+        r = follower.process_frame(zeros)
+        assert r.dp_ref_frame - prev <= adaptive_bound, (
+            f"low-conf cap violated: advance={r.dp_ref_frame - prev}"
+        )
+        prev = r.dp_ref_frame

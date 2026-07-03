@@ -204,6 +204,12 @@ def _synth_score_wav(score_xml: Path, bpm: float, sample_rate: int) -> Path:
 
 _MIN_REF_DURATION_SEC = 5.0
 _BPM_SANITY_RANGE = (20.0, 400.0)
+# Tail-silence auto-detection: trailing audio quieter than the file's
+# peak minus this margin is considered "after the music". Only trims
+# when the detected tail exceeds the minimum, so normal release/reverb
+# tails are left alone.
+_TAIL_SILENCE_TOP_DB = 45.0
+_TAIL_SILENCE_MIN_SEC = 1.5
 
 
 def _probe_reference_duration(path: Path) -> float:
@@ -217,6 +223,28 @@ def _probe_reference_duration(path: Path) -> float:
     import librosa  # type: ignore
 
     return float(librosa.get_duration(path=str(path)))
+
+
+def _detect_tail_silence_sec(path: Path, sample_rate: int) -> float:
+    """Return the duration (sec) of trailing silence in the recording.
+
+    Rationale: YouTube rips and live recordings often carry several
+    seconds of near-silence (or hall noise) after the final chord. If
+    that tail is kept, two things go wrong: (1) the auto BPM estimate
+    divides the score's beats by an inflated duration, and (2) MrMsDTW
+    maps the score's final measures onto the silent tail, so the
+    runtime follower tops out a few measures short of the end — the
+    reference CENS there matches nothing (実測: 幻想4 で末尾 8s の無音
+    により m=173/178 で頭打ち).
+
+    Uses librosa.effects.trim's dB-below-peak criterion on the tail
+    only (the head is governed by --start-offset).
+    """
+    import librosa  # type: ignore
+
+    audio, _ = librosa.load(str(path), sr=sample_rate, mono=True)
+    _trimmed, index = librosa.effects.trim(audio, top_db=_TAIL_SILENCE_TOP_DB)
+    return max(0.0, (len(audio) - int(index[1])) / float(sample_rate))
 
 
 def _estimate_score_bpm(total_beats: float, ref_duration_sec: float) -> float:
@@ -278,6 +306,13 @@ def main() -> int:
              "conductor breath). Default 0.",
     )
     parser.add_argument(
+        "--end-trim", type=float, default=None,
+        help="Seconds to trim from the TAIL of --reference (trailing "
+             "silence / applause after the music). If omitted, trailing "
+             "silence is auto-detected and trimmed when longer than "
+             f"{_TAIL_SILENCE_MIN_SEC}s. Pass 0 to disable trimming.",
+    )
+    parser.add_argument(
         "--sample-rate", type=int, default=22050,
         help="Sample rate for feature extraction (must match runtime). "
              "Default 22050.",
@@ -335,6 +370,29 @@ def main() -> int:
         logger.exception("Failed to load score: %s", exc)
         return 1
 
+    # --- Resolve reference tail trim ---
+    # Trailing silence/applause must be excluded BEFORE BPM estimation:
+    # it both inflates the estimated duration (slower synth tempo) and
+    # makes MrMsDTW map the final measures onto silence, capping the
+    # runtime follower a few measures short of the end.
+    if args.end_trim is not None:
+        end_trim = max(0.0, float(args.end_trim))
+    else:
+        try:
+            tail = _detect_tail_silence_sec(args.reference, args.sample_rate)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Tail-silence detection failed (%s); building without "
+                "end trim. Pass --end-trim explicitly if needed.", exc
+            )
+            tail = 0.0
+        end_trim = tail if tail >= _TAIL_SILENCE_MIN_SEC else 0.0
+        if end_trim > 0:
+            logger.info(
+                "Auto-detected %.2fs of trailing silence in reference — "
+                "trimming (override with --end-trim).", end_trim,
+            )
+
     # --- Resolve synth BPM ---
     score_wav = args.score_wav
     cleanup_tmp = False
@@ -361,7 +419,7 @@ def main() -> int:
                     "Pass --score-bpm explicitly to skip estimation.", exc
                 )
                 return 1
-            effective_ref_dur = ref_dur - max(args.start_offset, 0.0)
+            effective_ref_dur = ref_dur - max(args.start_offset, 0.0) - end_trim
             total_beats = score_mapper.get_total_beats()
             try:
                 resolved_bpm = _estimate_score_bpm(total_beats, effective_ref_dur)
@@ -402,6 +460,7 @@ def main() -> int:
             score_bpm=resolved_bpm,
             feature_config=cfg,
             reference_start_offset_sec=args.start_offset,
+            reference_end_trim_sec=end_trim,
             plot=args.plot,
         )
         logger.info(
