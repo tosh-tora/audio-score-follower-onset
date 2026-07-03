@@ -59,6 +59,10 @@ class FollowResult:
     # dist_onset = 0.0.
     dist_chroma: float = 0.0
     dist_onset: float = 0.0
+    # Raw DP anchor position (pre display-slew / pre inertia overlay).
+    # Diagnostic: lets eval tooling compare the smoothed output against
+    # the DP's actual estimate.
+    dp_ref_frame: int = 0
 
 
 class OnlineDTWFollower:
@@ -98,6 +102,11 @@ class OnlineDTWFollower:
         inertia_history_frames: int = 40,
         max_inertia_seconds: float = 10.0,
         inertia_resync_max_gap_frames: int | None = None,
+        display_slew_factor: float = 3.0,
+        display_min_advance: float = 2.0,
+        low_conf_advance_frames: int = 0,
+        low_conf_advance_factor: float = 4.0,
+        low_conf_advance_min: int = 4,
     ) -> None:
         """
         Args:
@@ -246,6 +255,35 @@ class OnlineDTWFollower:
                 ``_maybe_resync_from_dp`` to accept the DP and exit
                 inertia. None (default) = use ``search_width`` (≈22s)
                 so the resync follows the DP search band.
+            display_slew_factor: rate-limit on the *displayed* position
+                during normal tracking. Per live frame the display may
+                advance toward the DP anchor by at most
+                ``max(display_min_advance, rate * display_slew_factor)``
+                frames, where ``rate`` is the inertia rate estimator's
+                current value. This turns a post-stall DP catch-up
+                (up to ``max_advance_per_frame`` in one frame) into a
+                short steady fast-forward instead of a teleport.
+                Frame-driven (one step per live frame), so the display
+                structurally cannot outrun the live input. Intentional
+                teleports (reset / seek / initial alignment / global
+                rematch / inertia resync) snap the display instantly;
+                only ordinary tracking is slewed. Set 0.0 to disable
+                (display = raw DP position, pre-slew behaviour).
+            display_min_advance: floor on the per-frame display advance
+                (frames/frame), so catch-up is guaranteed even when the
+                rate estimate sits at its lower clamp.
+            low_conf_advance_frames: when > 0, after this many
+                consecutive low-confidence frames the effective
+                ``max_advance_per_frame`` is tightened to
+                ``max(low_conf_advance_min, ceil(rate * low_conf_advance_factor))``
+                — preventing the vertical DP chain from drifting far
+                forward across a flat low-confidence cost field. The
+                full cap is restored on the first high-confidence
+                frame. Default 0 = disabled (ships off; enable only
+                after measuring no same-recording regression).
+            low_conf_advance_factor: multiplier on the estimated rate
+                for the adaptive low-confidence cap.
+            low_conf_advance_min: floor (frames) for the adaptive cap.
         """
         if reference_cens.ndim != 2 or reference_cens.shape[0] != 12:
             raise ValueError(
@@ -429,6 +467,27 @@ class OnlineDTWFollower:
         # entry, before any history has accumulated.
         self._last_good_rate: float = 1.0
 
+        # Display-slew overlay (third position layer, alongside
+        # _current_ref_pos [DP-owned] and _inertia_ref_pos [inertia-owned]).
+        # Only _apply_display_slew / the explicit snap points (reset, seek,
+        # first frame, rematch jumps, frozen step) write this field.
+        if display_slew_factor < 0:
+            raise ValueError("display_slew_factor must be >= 0")
+        if display_min_advance <= 0:
+            raise ValueError("display_min_advance must be > 0")
+        if low_conf_advance_frames < 0:
+            raise ValueError("low_conf_advance_frames must be >= 0")
+        if low_conf_advance_factor <= 0:
+            raise ValueError("low_conf_advance_factor must be > 0")
+        if low_conf_advance_min < 1:
+            raise ValueError("low_conf_advance_min must be >= 1")
+        self._display_slew_factor = float(display_slew_factor)
+        self._display_min_advance = float(display_min_advance)
+        self._display_ref_pos: float = 0.0
+        self._low_conf_advance_frames = int(low_conf_advance_frames)
+        self._low_conf_advance_factor = float(low_conf_advance_factor)
+        self._low_conf_advance_min = int(low_conf_advance_min)
+
         self._state_lock = threading.Lock()
         # Per-frame scratch field set at the top of process_frame and
         # consumed by _local_cost_block / _local_cost_scalar. Initialised
@@ -533,6 +592,7 @@ class OnlineDTWFollower:
         self._prev_band_lo = 0
         self._prev_band_hi = hi
         self._current_ref_pos = best
+        self._display_ref_pos = float(best)  # initial alignment: snap
         self._live_frame_idx = 1
 
         with self._state_lock:
@@ -554,6 +614,7 @@ class OnlineDTWFollower:
             band_hi=hi,
             dist_chroma=dist_chroma,
             dist_onset=dist_onset,
+            dp_ref_frame=best,
         )
 
     def _try_global_rematch(self, live: np.ndarray, current_local_cost: float) -> bool:
@@ -625,6 +686,7 @@ class OnlineDTWFollower:
         self._prev_band_lo = new_pos
         self._prev_band_hi = new_pos + 1
         self._current_ref_pos = new_pos
+        self._display_ref_pos = float(new_pos)  # intentional teleport: snap
         return True
 
     def _process_subsequent_frame(self, live: np.ndarray) -> FollowResult:
@@ -718,7 +780,25 @@ class OnlineDTWFollower:
         # context for tempo flexibility), but constrains the *acted-on*
         # advance to live rate.
         if self._max_advance_per_frame is not None:
-            max_band_idx = (self._current_ref_pos - lo) + self._max_advance_per_frame
+            advance_cap = self._max_advance_per_frame
+            # Adaptive low-confidence cap (disabled unless
+            # low_conf_advance_frames > 0): when confidence has been low
+            # for a sustained streak, the cost field is likely flat and
+            # the vertical chain can drift far forward on noise — tighten
+            # the acted-on advance to ~live rate. Uses the PREVIOUS
+            # frame's streak counter (confidence for this frame is only
+            # computed after the argmin) and the cached rate estimate;
+            # no D_prev / band / reset state is touched.
+            if (
+                self._low_conf_advance_frames > 0
+                and self._low_conf_streak >= self._low_conf_advance_frames
+            ):
+                adaptive = max(
+                    self._low_conf_advance_min,
+                    int(np.ceil(self._last_good_rate * self._low_conf_advance_factor)),
+                )
+                advance_cap = min(advance_cap, adaptive)
+            max_band_idx = (self._current_ref_pos - lo) + advance_cap
             max_band_idx = min(max_band_idx, band_width - 1)
         else:
             max_band_idx = band_width - 1
@@ -917,6 +997,34 @@ class OnlineDTWFollower:
                 out_pos = int(self._inertia_ref_pos)
                 out_conf = 0.0  # mute so triggers don't fire on a guess
 
+        # ---- display slew (output-stage rate limit) -------------------
+        # Third position layer: rate-limit how fast the *displayed*
+        # position may chase the DP anchor, so a post-stall DP catch-up
+        # renders as a short fast-forward instead of a teleport. Never
+        # touches _current_ref_pos (DP-owned) or _inertia_ref_pos
+        # (inertia-owned). Frame-driven: one bounded step per live
+        # frame, so it cannot outrun the live input.
+        if self._inertia_active:
+            # Inertia display is already smooth; keep the slew state in
+            # sync so a later resync (which snaps via seek()) has no
+            # stale gap to glide across.
+            self._display_ref_pos = float(out_pos)
+        elif self._display_slew_factor > 0.0:
+            rate = self._compute_inertia_rate()
+            max_step = max(
+                self._display_min_advance, rate * self._display_slew_factor
+            )
+            gap = float(out_pos) - self._display_ref_pos
+            if gap >= 0.0:
+                self._display_ref_pos += min(gap, max_step)
+            else:
+                # DP output is monotonic-clamped; a backward gap only
+                # appears after an intentional teleport — snap, don't slew.
+                self._display_ref_pos = float(out_pos)
+            out_pos = int(self._display_ref_pos)
+        else:
+            self._display_ref_pos = float(out_pos)
+
         dist_chroma = float(1.0 - self._ref[:, new_pos] @ live)
         dist_onset = (
             abs(float(self._ref_onset[new_pos]) - self._live_onset_frame)
@@ -937,6 +1045,7 @@ class OnlineDTWFollower:
             band_hi=hi,
             dist_chroma=dist_chroma,
             dist_onset=dist_onset,
+            dp_ref_frame=new_pos,
         )
 
     # ------------------------------------------------------------ frozen path
@@ -971,6 +1080,11 @@ class OnlineDTWFollower:
                 else self._current_ref_pos
             )
 
+        # Keep the display overlay in sync while frozen (position-fixed
+        # or inertia): no slew is needed here, and a stale display value
+        # would otherwise glide on the first post-unfreeze frame.
+        self._display_ref_pos = float(pos)
+
         return FollowResult(
             ref_frame=pos,
             ref_time_sec=pos / self._cfg.effective_frame_rate(),
@@ -978,6 +1092,7 @@ class OnlineDTWFollower:
             raw_local_cost=float("nan"),
             band_lo=pos,
             band_hi=pos + 1,
+            dp_ref_frame=self._current_ref_pos,
         )
 
     def _advance_inertia(self) -> None:
@@ -1162,7 +1277,15 @@ class OnlineDTWFollower:
             self._frozen = True
             if self._locked_in and self._max_inertia_seconds > 0:
                 self._inertia_active = True
-                self._inertia_ref_pos = float(self._current_ref_pos)
+                # Start inertia from the *displayed* position when the
+                # slew is active: if the display was still catching up
+                # to the DP anchor, starting from _current_ref_pos would
+                # render as a forward jump at the freeze boundary.
+                self._inertia_ref_pos = (
+                    float(self._display_ref_pos)
+                    if self._display_slew_factor > 0.0
+                    else float(self._current_ref_pos)
+                )
                 self._inertia_frames_elapsed = 0
                 rate = self._compute_inertia_rate()
                 logger.info(
@@ -1244,6 +1367,7 @@ class OnlineDTWFollower:
             self._prev_band_lo = ref_frame
             self._prev_band_hi = ref_frame + 1
             self._current_ref_pos = ref_frame
+            self._display_ref_pos = float(ref_frame)  # intentional teleport: snap
             # If we haven't processed any live frame yet, the next call
             # would otherwise go through the (init_search_width-limited)
             # first-frame path and overwrite our seek. Bumping the index
@@ -1327,6 +1451,7 @@ class OnlineDTWFollower:
         self._prev_band_lo = new_pos
         self._prev_band_hi = new_pos + 1
         self._current_ref_pos = new_pos
+        self._display_ref_pos = float(new_pos)  # intentional teleport: snap
         return True
 
     def _try_rapid_reset_catchup(
@@ -1401,6 +1526,7 @@ class OnlineDTWFollower:
         self._prev_band_lo = new_pos
         self._prev_band_hi = new_pos + 1
         self._current_ref_pos = new_pos
+        self._display_ref_pos = float(new_pos)  # intentional teleport: snap
         return True
 
     def reset(self) -> None:
@@ -1431,6 +1557,7 @@ class OnlineDTWFollower:
             self._inertia_ref_pos = 0.0
             self._inertia_frames_elapsed = 0
             self._last_good_rate = 1.0
+            self._display_ref_pos = 0.0
         logger.info("OLTW reset")
 
     # ------------------------------------------------------------ getters
@@ -1445,6 +1572,13 @@ class OnlineDTWFollower:
         """
         if self._inertia_active:
             return int(self._inertia_ref_pos)
+        if self._display_slew_factor > 0.0:
+            return int(self._display_ref_pos)
+        return self._current_ref_pos
+
+    @property
+    def dp_ref_frame(self) -> int:
+        """Raw DP anchor position (pre display-slew / pre inertia). Debug."""
         return self._current_ref_pos
 
     @property

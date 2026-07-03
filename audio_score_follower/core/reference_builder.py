@@ -189,6 +189,7 @@ def build_reference(
     score_bpm: float = 120.0,
     feature_config: Optional[FeatureConfig] = None,
     reference_start_offset_sec: float = 0.0,
+    reference_end_trim_sec: float = 0.0,
     plot: bool = False,
 ) -> BuildResult:
     """Build offline artifacts from a score-synth WAV and a reference recording.
@@ -210,6 +211,13 @@ def build_reference(
             chair noise that exist in the recording but not in the score
             — the DTW otherwise tries to align that to the score's first
             note and the whole path skews.
+        reference_end_trim_sec: Seconds to trim from the TAIL of the
+            reference recording. Use this to drop trailing silence /
+            applause after the music ends — otherwise MrMsDTW maps the
+            score's final measures onto the silent tail, and the runtime
+            follower can never reach the last measures (the reference
+            CENS there is unmatched noise). asf-build auto-detects this
+            when --end-trim is not given.
         plot: If True, also write ``warp_path.png`` into output_dir.
 
     Returns:
@@ -239,6 +247,19 @@ def build_reference(
             reference_start_offset_sec, skip,
         )
         ref_audio = ref_audio[skip:]
+    if reference_end_trim_sec > 0:
+        cut = int(reference_end_trim_sec * cfg.sample_rate)
+        if cut >= len(ref_audio):
+            raise ValueError(
+                f"reference_end_trim_sec={reference_end_trim_sec} "
+                f"exceeds remaining reference duration "
+                f"{len(ref_audio)/cfg.sample_rate:.2f}s"
+            )
+        logger.info(
+            "Trimming %.3fs (%d samples) from reference tail",
+            reference_end_trim_sec, cut,
+        )
+        ref_audio = ref_audio[:-cut]
     logger.info(
         "Reference audio: %d samples (%.2f s)",
         len(ref_audio), len(ref_audio) / cfg.sample_rate,
@@ -321,6 +342,7 @@ def build_reference(
     meta = {
         "score_bpm": float(score_bpm),
         "reference_start_offset_sec": float(reference_start_offset_sec),
+        "reference_end_trim_sec": float(reference_end_trim_sec),
         "feature_config": cfg.to_dict(),
         "reference_duration_sec": float(len(ref_audio) / cfg.sample_rate),
         "warp_path_length": int(wp.shape[1]),

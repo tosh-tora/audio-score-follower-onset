@@ -138,6 +138,7 @@ asf-build `
     --output beethoven5_karajan `
     [--score-bpm 152] `
     [--start-offset 0.5] `
+    [--end-trim 8.0] `
     [--plot]
 
 # フルパスも引き続き使用可（後方互換）
@@ -171,6 +172,13 @@ Override with --score-bpm if undesirable.
 スキップが大量発生し、ビルド時バリデーション (`max_slope=4.0x`) で失敗することがある。自動推定で
 これを回避する。`--score-wav` を渡す場合は合成テンポを録音から逆算できないため、`--score-bpm`
 の明示指定が必須。
+
+**末尾無音の自動トリム**: 参照録音の末尾にある無音・拍手（ピークから 45 dB 以上低い区間が
+1.5 秒超）は自動検出してビルド前にカットする。トリムしないと (1) BPM 推定の分母が水増しされて
+合成テンポが遅くなり、(2) MrMsDTW がスコアの最終小節群を無音尾部にマップするため、**runtime が
+最後の数小節に到達できない**（実測: 幻想4 で末尾 8.2 秒の無音により m=173/178 で頭打ち →
+トリム後は全録音で 178/178）。`--end-trim <秒>` で手動指定、`--end-trim 0` で無効化できる。
+トリム量は `build_meta.json` の `reference_end_trim_sec` に記録される。
 
 **ビルド成果物**: `data/built/<output>/` に以下が生成される：
 
@@ -209,6 +217,24 @@ python -m audio_score_follower.main config/beethoven5.json `
 `--input-wav` モードでは silence gate が自動で無効化され、ファイルを実時間で
 CENS+onset → OLTW に流す。アルゴリズムの検証、リファレンス音源との自己整合確認、
 別演奏 (alt recording) でのカバレッジ測定に使う。
+
+#### ヘッドレス計測 (tasks/eval_tracking.py)
+
+GUI を起動せず最速で追従品質を数値化するツール。パラメータ A/B 比較はこれで行う：
+
+```powershell
+python tasks/eval_tracking.py `
+    --built-dir data/built/幻想4 `
+    --score data/scores/幻想4_リピート削除.mxl `
+    --input-wav "data/reference_audio/<録音>.mp3" `
+    [--csv out.csv] `
+    [--oltw-kwargs '{\"display_slew_factor\": 0}']
+```
+
+出力: カバレッジ%、小節ジャンプ >1 / >3 の回数、最長・累計 stall、per-frame 前進量の
+stddev。`--csv` で per-frame の `live_time, ref_frame, dp_ref_frame, measure,
+confidence` をダンプできる。`--oltw-kwargs` は config を編集せずデフォルトに JSON を
+上書きマージする（例: `'{"display_slew_factor": 0}'` で表示スルー無効の旧挙動と比較）。
 
 ### 6. ランチャー GUI（引数なし起動）
 
@@ -335,6 +361,11 @@ asf-follow
 | `inertia_history_frames` | `40` | 慣性 rate 推定用の position history 窓（≈3.7 秒）。長いほど滑らか、短いほど tempo 変化に追従。 |
 | `max_inertia_seconds` | `10.0` | 慣性進行の最大持続秒数。超えたら位置固定に戻り、復帰は手動 →/L 任せ。長フェルマータが多い曲（Bruckner 等）では 20〜30 に増やす。`0.0` で慣性を無効化（legacy: freeze=位置固定）。 |
 | `inertia_resync_max_gap_frames` | `None` | 慣性位置と DP 位置の許容ギャップ（frame）。`None` なら `search_width` を使う。 |
+| `display_slew_factor` | `3.0` | **表示スルー**: 通常追従中、表示位置が DP 位置を追いかける速度の上限を `max(display_min_advance, 推定rate × factor)` frame/frame に制限する。stall 後の DP キャッチアップ（最大 `max_advance_per_frame` ≈4.6s/frame）が「瞬間テレポート」ではなく短い早送りとして表示される。seek / reset / rematch / 慣性 resync 等の**意図的ジャンプは即時スナップ**。`0` で無効（表示 = 生 DP 位置）。 |
+| `display_min_advance` | `2.0` | 表示スルーの 1 フレームあたり前進量の下限。rate 推定が下限 clamp (0.3) に張り付いていてもキャッチアップを保証する。 |
+| `low_conf_advance_frames` | `0` | **低 conf 適応キャップ**（実験的・デフォルト無効）: 低 confidence がこのフレーム数連続したら、`max_advance_per_frame` を `max(low_conf_advance_min, ceil(rate × low_conf_advance_factor))` に絞る。高 conf フレームが来たら即フルキャップに復帰。`0` で無効。 |
+| `low_conf_advance_factor` | `4.0` | 適応キャップの rate 乗数。 |
+| `low_conf_advance_min` | `4` | 適応キャップの下限（frame）。 |
 
 ### movements
 
@@ -414,6 +445,7 @@ Slide left  [manual] measure=17 note=テーマA      ← 人手で ←
 | Band-DP の vert chain で 1 フレームで 20 小節先にジャンプ | `max_advance_per_frame=50` で argmin の探索範囲をキャップ |
 | 累積コストの「後退アトラクタ」で stuck | `stuck_dp_reset_seconds=12` で過去メモリ wipe（位置は据置） |
 | 人手 → 押下後に OLTW が live 位置に追いつけない | `seek(allow_catchup=True)` で post-seek の局所 forward 再 match |
+| stall 後の DP キャッチアップが表示上「瞬間ジャンプ」に見える | `display_slew_factor=3.0` の表示スルー層で表示前進速度を rate 連動制限（DP 内部は無制限のまま） |
 
 「**スコア全体を見て位置を特定**」する設計は繰り返し曲で破綻するため避けている。
 すべての探索は **`search_width=240` (≈22 秒) 以内** または操作者明示の seek 直後のみ。

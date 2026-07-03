@@ -39,6 +39,7 @@
 | マイク (`FollowerWorker`) / ファイル (`FileWorker`) / **WASAPI ループバック** のスレッド管理 | `audio_score_follower/core/follower_worker.py` |
 | オフラインビルド (`asf-build`) + **ビルド時 warp path 検証** + **合成 BPM 自動推定** | `audio_score_follower/cli/build_reference.py` + `core/reference_builder.py` |
 | MuseScore 4 CLI 連携 (合成 WAV 生成) | `tasks/generate_score_wav.py` |
+| **追従品質のヘッドレス計測**（カバレッジ / ジャンプ / stall 統計、パラメータ A/B） | `tasks/eval_tracking.py` |
 
 ユーザーが「**ボタンの挙動を変えたい**」と言ったら `ui/gui_tkinter.py` 単発で済むことが多い。「**追随ロジックが暴走する**」なら `core/oltw_follower.py` の DP recurrence と band 計算。「**測度がずれる**」なら `core/warp_lookup.py` か `core/score_mapper.py`。「**マイクで動かない**」なら `core/audio_level.py` と `_check_silence_gate` (main.py)。「**warp path 検証が落ちる**」なら `core/warp_lookup.py` の `validate()` と、スコアの繰り返し構造を確認する。
 
@@ -66,11 +67,18 @@ lock-in 判定:
 **低 DP confidence 単独では慣性に入らない**。これは過去の regression 対応:
 > オーケストラの pp passage は DP が正しい位置を低マージンで追えている状態が多い。慣性で上書きすると別演奏のカバレッジが 100% → 34% に落ちる regression を実測。低 conf 自動 entry を完全削除した。
 
-### `_current_ref_pos` と `_inertia_ref_pos` の分離
+### `_current_ref_pos` / `_inertia_ref_pos` / `_display_ref_pos` の三層分離
 
 - **`_current_ref_pos`**（int）: DP-owned anchor。DP の更新ロジックのみが変更する
 - **`_inertia_ref_pos`**（float）: 慣性中の表示位置。`_advance_inertia()` のみが変更する
-- **公開プロパティ `current_ref_frame`**: 慣性 active なら `int(_inertia_ref_pos)`、それ以外は `_current_ref_pos`
+- **`_display_ref_pos`**（float）: **表示スルー層**。通常追従中、表示が DP 位置を追いかける速度を `max(display_min_advance=2.0, rate × display_slew_factor=3.0)` frame/frame に制限する出力段レートリミッタ。stall 後の DP キャッチアップ（最大 `max_advance_per_frame`=50 frame ≈4.6s を 1 フレームで）が表示上のテレポートにならない。フレーム駆動なので live を追い越せない（慣性の安全弁 #1 と同じ論法）。`display_slew_factor: 0` で無効化（生 DP 表示）
+- **公開プロパティ `current_ref_frame`**: 慣性 active なら `int(_inertia_ref_pos)`、slew 有効なら `int(_display_ref_pos)`、それ以外は `_current_ref_pos`。生 DP 位置は `dp_ref_frame` プロパティ / `FollowResult.dp_ref_frame` で参照
+
+**snap-vs-slew ルール**: `reset()` / `seek()` / 初期アライメント / global rematch / post-seek catchup / rapid-reset catchup / 慣性 resync（seek 経由）という**意図的テレポートでは表示も即スナップ**。スルーがかかるのは通常追従の DP 前進のみ。frozen 中・慣性中のフレームでは `_display_ref_pos` を出力値に同期させ stale gap を残さない。freeze() の慣性開始位置は（slew 有効時）`_display_ref_pos` から始める — DP anchor から始めると freeze 境界で表示が前方ジャンプするため。
+
+**低 conf 適応キャップ**（`low_conf_advance_frames`、デフォルト 0=無効）: 低 conf 連続時に `max_advance_per_frame` を `max(low_conf_advance_min, ceil(rate × low_conf_advance_factor))` に絞る DP 側オプション。前フレームの streak カウンタを使うので DP 再構成なし。幻想4 実測では有意差なしのため無効で出荷。
+
+**計測**: `python tasks/eval_tracking.py --built-dir <dir> --score <mxl> --input-wav <wav> [--oltw-kwargs '{...}']` でヘッドレスにカバレッジ / ジャンプ / stall / 前進 stddev を測る。パラメータ変更の回帰確認はこれで行う（同録音 100% / conf 0.93+、別演奏 97%+ がベースライン。幻想4 実測: slew で別演奏の前進 stddev 0.66→0.42、カバレッジ・conf 無回帰）。
 
 **触ってはいけない**: `_advance_inertia()` で `_current_ref_pos` を書き換えると DP の band がずれ、stuck_dp_reset 後の D_prev 初期化が狂って DP が壊れる。過去にこの罠にハマった。
 
@@ -180,6 +188,17 @@ estimated_bpm = total_beats * 60.0 / ref_duration_sec
 実例: 幻想4 (178 measures × 4 beats = 712 beats) / 281.04s ≈ 152 BPM。楽譜指示の 120 BPM で固定合成すると、ベルリン・フィルのような速い演奏 (281s) との 27% のテンポ差が MrMsDTW のスキップ大量発生 (21% のステップで score 側のみ進む) を招き、`WarpLookup.validate` (slope 4.0x 上限) で失敗する。
 
 実装は `audio_score_follower/cli/build_reference.py` の `_estimate_score_bpm()` / `_probe_reference_duration()`。`librosa.get_duration(path=...)` で全ロードせず duration だけ取得する。`--start-offset` 指定時はその分を差し引いた duration で推定する。
+
+### 末尾無音の自動トリム（`--end-trim` / `_detect_tail_silence_sec`）
+
+参照録音の末尾無音・拍手（ピーク−45dB 以下が 1.5s 超）は `asf-build` が自動検出してビルド前にカットする（`_detect_tail_silence_sec()`、`librosa.effects.trim` の tail 側のみ使用）。**トリムしないと 2 つの故障が同時に起きる**:
+
+1. BPM 推定の分母（ref_duration）が水増しされ合成テンポが遅くなる
+2. MrMsDTW がスコアの最終小節群を無音尾部にマップする → 無音区間の CENS はどの演奏ともマッチしないので、**runtime はどの入力でも最後の数小節に到達できない**
+
+実測: 幻想4 の Berlin 参照録音は末尾 8.23s が無音で、トリム前は全入力が m=173/178 で頭打ち（BPM 152.0）。トリム後は同録音・別演奏 2 種すべて 178/178（BPM 156.6）。トリム量は `build_meta.json` の `reference_end_trim_sec` に永続化。`--end-trim <秒>` で手動指定、`--end-trim 0` で無効化。`build_reference()` には `reference_end_trim_sec` kwarg として渡る（`--start-offset` と同型の tail 版）。
+
+**症状からの逆引き**: 「追随は最後まで正常なのに、最終小節の数小節手前で頭打ちになる」場合はまずこれを疑う。eval CSV の末尾で conf が高く 1:1 前進のまま入力が尽きていたら、参照側の warp が無音に食われている。
 
 **ルール**:
 - `--score-bpm` 明示指定: その値を使う（手動オーバライド）

@@ -73,3 +73,63 @@ def test_build_reference_smoke(tmp_path):
     import json
     meta = json.loads((out_dir / "build_meta.json").read_text(encoding="utf-8"))
     assert meta.get("has_onset") is True
+
+
+def test_build_reference_end_trim(tmp_path):
+    """reference_end_trim_sec cuts the reference tail before alignment.
+
+    末尾無音を残すと warp が最終小節を無音尾部にマップして runtime が
+    最後まで到達できない (実測: 幻想4 で m=173/178 頭打ち)。トリム後の
+    warp path は参照の実音楽区間内で終わることを確認する。
+    """
+    pytest.importorskip("librosa")
+    pytest.importorskip("synctoolbox")
+    from scipy.io import wavfile  # type: ignore
+    from audio_score_follower.core.feature_extractor import FeatureConfig
+    from audio_score_follower.core.reference_builder import build_reference
+
+    sr = 22050
+    cfg = FeatureConfig(sample_rate=sr, hop_length=2048)
+
+    score_audio = _make_synth_audio(sr, 4.0, 440.0)
+    score_path = tmp_path / "score.wav"
+    wavfile.write(str(score_path), sr, (score_audio * 32000).astype(np.int16))
+
+    # Reference: music followed by 3 seconds of trailing silence.
+    silence = np.zeros(3 * sr, dtype=np.float32)
+    ref_audio = np.concatenate([score_audio, silence])
+    ref_path = tmp_path / "ref.wav"
+    wavfile.write(str(ref_path), sr, (ref_audio * 32000).astype(np.int16))
+
+    out_dir = tmp_path / "built_trim"
+    result = build_reference(
+        score_wav=score_path,
+        reference_wav=ref_path,
+        output_dir=out_dir,
+        score_bpm=120.0,
+        feature_config=cfg,
+        reference_end_trim_sec=3.0,
+        plot=False,
+    )
+
+    # Warp path must end within the trimmed (4s) reference, not the
+    # original 7s file.
+    assert result.ref_times[-1] <= 4.5, (
+        f"warp extends into the trimmed tail: {result.ref_times[-1]:.2f}s"
+    )
+
+    import json
+    meta = json.loads((out_dir / "build_meta.json").read_text(encoding="utf-8"))
+    assert meta.get("reference_end_trim_sec") == pytest.approx(3.0)
+
+    # Trim longer than the file must raise.
+    with pytest.raises(ValueError, match="end_trim"):
+        build_reference(
+            score_wav=score_path,
+            reference_wav=ref_path,
+            output_dir=tmp_path / "built_bad",
+            score_bpm=120.0,
+            feature_config=cfg,
+            reference_end_trim_sec=100.0,
+            plot=False,
+        )
