@@ -32,6 +32,10 @@ class ConfigLoader:
             "cooldown_seconds": 3.0,
             "silence_threshold_db": -55.0,
             "mic_device": null,
+            "loopback_device": null,
+            "launcher": {"...": "ランチャー GUI (ui/launcher.py) が保存する起動
+                          オプション。ConfigLoader は読まない (launch_options.py
+                          が raw JSON として読み書きする)"},
             "oltw_search_width": 240,
             "oltw_step_size": 1
           },

@@ -28,6 +28,12 @@ Thumbs.db
 
 # Plots / scratch
 *.png
+
+# Vendored binaries (FluidSynth etc.) - install locally
+vendor/
+
+# Debug scripts
+debug_*.py
 *.pdf
 scratch/
 
