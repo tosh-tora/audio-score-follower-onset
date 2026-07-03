@@ -226,10 +226,13 @@ MusicXML の繰り返し記号 (`<barline><repeat direction="forward/backward"/>
 - パラメータを変えたらビルド済み `reference_cens.npy` も作り直す (`asf-build` を再実行)
 - `WarpLookup` は `built_dir` から `feature_config` を読んで OLTW に注入する（手で渡さない）
 
-### 合成は MuseScore 4 CLI で行う (Windows ネイティブ)
-- `tasks/generate_score_wav.py` は MuseScore 4 の CLI (`mscore --export-to`) を呼ぶ
-- music21 で XML のテンポマーキングを剥がし、冒頭に単一 MetronomeMark を入れて定テンポ合成を保証する
-- 検出: 環境変数 `MSCORE_EXE` → PATH → 既知パス (`C:\Program Files\MuseScore 4\bin\MuseScore4.exe` 等)
+### 合成は FluidSynth で行う (Windows ネイティブ)
+- `tasks/generate_score_wav.py` は **FluidSynth** を使う。MuseScore 4 は v4.6.5 で CLI バッチモードがハングするバグがあり使用不可。
+- フロー: MusicXML → music21 でテンポ正規化 → MIDI → FluidSynth → WAV。合成は 12 分の曲で約 1 分。
+- music21 で XML のテンポマーキングを剥がし、冒頭に単一 MetronomeMark を入れてから MIDI エクスポート
+- **FluidSynth 検出順**: プロジェクト内 `vendor/FluidSynth/*/bin/fluidsynth.exe` → 環境変数 `FLUIDSYNTH_EXE` → PATH → 既知パス → `LocalAppData\FluidSynth\...\fluidsynth.exe`
+- **SF ファイル検出順**: 環境変数 `SF_FILE` → `C:\Program Files\MuseScore 4\sound\MS Basic.sf3` → MuseScore 3 付属 SF3
+- **FluidSynth インストール推奨手順**: GitHub releases から `fluidsynth-vX.Y.Z-win10-x64-glib.zip` を取得してプロジェクトの `vendor/FluidSynth/` に展開する。LocalAppData に置くと Windows Defender / Controlled Folder Access に削除されるケースあり (実例: 過去に発生)。`vendor/` は `.gitignore` 済み。
 - WSL2 は **不要**。オフラインビルドも本番追随も Windows で完結する
 
 ### リハ録音冒頭の指揮ブレス

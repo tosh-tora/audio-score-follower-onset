@@ -37,10 +37,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 # Windows console defaults to cp932 / cp1252, which cannot encode the
 # em-dash and Japanese characters we use in argparse help text. Forcing
@@ -81,6 +84,72 @@ def _resolve_data_path(given: Path, default_dir: Path) -> Path:
     return default_dir / given
 
 
+def _find_fluidsynth() -> Optional[Path]:
+    """Locate fluidsynth.exe in the parent process where env vars are reliable."""
+    # Project-local vendor directory (most reliable — no sandbox/virtualization issues)
+    repo_root = Path(__file__).resolve().parents[2]
+    vendor_dir = repo_root / "vendor" / "FluidSynth"
+    if vendor_dir.exists():
+        for p in sorted(vendor_dir.glob("*/bin/fluidsynth.exe")):
+            if p.exists():
+                return p
+
+    env = os.environ.get("FLUIDSYNTH_EXE")
+    if env:
+        p = Path(env)
+        if p.exists():
+            return p
+        logger.warning("FLUIDSYNTH_EXE=%s が見つからない", env)
+
+    which = shutil.which("fluidsynth")
+    if which:
+        return Path(which)
+
+    # Search LocalAppData via multiple methods — env vars can be unreliable
+    # depending on how the process was spawned.
+    local_appdata_candidates: list[Path] = []
+    local_appdata_candidates.append(Path.home() / "AppData" / "Local")
+    userprofile = os.environ.get("USERPROFILE", "")
+    if userprofile:
+        local_appdata_candidates.append(Path(userprofile) / "AppData" / "Local")
+    # Walk up from sys.executable to find AppData\Local (e.g. user-installed Python)
+    for parent in Path(sys.executable).resolve().parents:
+        if parent.name.lower() == "local" and parent.parent.name.lower() == "appdata":
+            local_appdata_candidates.append(parent)
+            break
+
+    for local_appdata in local_appdata_candidates:
+        fluidsynth_dir = local_appdata / "FluidSynth"
+        logger.debug("FluidSynth 検索: %s (exists=%s)", fluidsynth_dir, fluidsynth_dir.exists())
+        for p in sorted(fluidsynth_dir.glob("*/bin/fluidsynth.exe")):
+            if p.exists():
+                return p
+
+    for cand in [
+        Path(r"C:\Program Files\FluidSynth\bin\fluidsynth.exe"),
+        Path(r"C:\ProgramData\chocolatey\bin\fluidsynth.exe"),
+    ]:
+        if cand.exists():
+            return cand
+
+    return None
+
+
+def _find_sf_file() -> Optional[Path]:
+    """Locate a SF2/SF3 soundfont in the parent process where env vars are reliable."""
+    env = os.environ.get("SF_FILE")
+    if env and Path(env).exists():
+        return Path(env)
+    for cand in [
+        Path(r"C:\Program Files\MuseScore 4\sound\MS Basic.sf3"),
+        Path(r"C:\Program Files\MuseScore 3\sound\MuseScore_General.sf3"),
+        Path(r"C:\Program Files\MuseScore 3\sound\MuseScore_General.sf2"),
+    ]:
+        if cand.exists():
+            return cand
+    return None
+
+
 def _synth_score_wav(score_xml: Path, bpm: float, sample_rate: int) -> Path:
     """Invoke tasks/generate_score_wav.py to produce a temporary synth WAV.
 
@@ -106,6 +175,17 @@ def _synth_score_wav(score_xml: Path, bpm: float, sample_rate: int) -> Path:
         "--bpm", str(bpm),
         "--samplerate", str(sample_rate),
     ]
+    # Detect FluidSynth and SF in the parent process (env vars are reliable here)
+    # and pass them explicitly so the subprocess doesn't need to re-detect.
+    fluidsynth = _find_fluidsynth()
+    if fluidsynth:
+        cmd += ["--fluidsynth-exe", str(fluidsynth)]
+        logger.info("FluidSynth: %s", fluidsynth)
+    sf_file = _find_sf_file()
+    if sf_file:
+        cmd += ["--sf-file", str(sf_file)]
+        logger.info("SoundFont: %s", sf_file)
+
     logger.info("Synthesising score: %s", " ".join(cmd))
     completed = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
@@ -115,8 +195,8 @@ def _synth_score_wav(score_xml: Path, bpm: float, sample_rate: int) -> Path:
             f"generate_score_wav.py failed (exit {completed.returncode}):\n"
             f"  stdout: {completed.stdout}\n"
             f"  stderr: {completed.stderr}\n"
-            f"  NOTE: requires MuseScore 4 installed. Set MSCORE_EXE env "
-            f"var or pass --mscore-exe if auto-detection fails."
+            f"  NOTE: requires FluidSynth. Set FLUIDSYNTH_EXE env var "
+            f"to the fluidsynth.exe path, and SF_FILE to a SF2/SF3 soundfont."
         )
     logger.info("Score synth complete: %s", tmp_path)
     return tmp_path

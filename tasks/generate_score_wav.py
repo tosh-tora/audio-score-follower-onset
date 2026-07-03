@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-generate_score_wav.py - MusicXML → 合成 WAV (Windows ネイティブ版)
+generate_score_wav.py - MusicXML → 合成 WAV (FluidSynth 版)
 
-MuseScore 4 CLI を呼んで MusicXML を WAV にレンダリングする。
+FluidSynth を使って MusicXML を WAV にレンダリングする。
 リファレンスビルド (asf-build) のオフライン工程で使う。
 
-オーケストラ追随用途では合成 WAV は **chroma マッチング** にしか使わないので、
-MuseScore 標準音色で十分な品質が得られる。
+合成エンジン: MuseScore 4 が CLI バッチモードでハングするバグ (v4.6.5 確認)
+のため、FluidSynth + MS Basic.sf3 に切り替えた。音質より特徴量 (CENS chroma)
+精度が重要で、SF2 で十分。
 
 定テンポ化:
     XML 内の全テンポマーキングを music21 で剥がし、冒頭に単一の
-    MetronomeMark(--bpm) を挿入してから MuseScore に渡す。これにより
-    accelerando / ritardando や複数の MetronomeMark がある楽曲でも
-    本ツールは常に定テンポの合成を出力し、後段の
-    ``score_time → beat = score_time * bpm / 60`` という単純換算が成立する。
+    MetronomeMark(--bpm) を挿入して MIDI エクスポートする。
+    FluidSynth はこの MIDI テンポイベントをそのまま使うので
+    ``score_time = 0`` が「合成 WAV の最初の音」に揃う。
 
 先頭無音トリム:
-    MuseScore は冒頭に短い無音を挟むことがあるので、--top-db 以下の振幅
-    部分を librosa.effects.trim で削る。これで ``score_time = 0`` を
-    「合成 WAV の最初の音の立ち上がり」に揃え、リファレンス録音側との
-    位置合わせを DTW が素直に取れるようにする。
+    FluidSynth は冒頭に短い無音を挟む場合があるので、
+    librosa.effects.trim で削る。
 
 Usage::
 
@@ -28,11 +26,11 @@ Usage::
         -o /tmp/score_synth.wav \\
         --bpm 120
 
-    # MuseScore 実行ファイルを環境変数 or 引数で指定したい場合
-    set MSCORE_EXE=C:\\Program Files\\MuseScore 4\\bin\\MuseScore4.exe
-    python tasks/generate_score_wav.py score.xml -o out.wav
+    # FluidSynth / SF ファイルを明示する場合
+    set FLUIDSYNTH_EXE=C:\\path\\to\\fluidsynth.exe
+    set SF_FILE=C:\\path\\to\\soundfont.sf3
 
-依存: music21 + librosa + scipy。MuseScore 4 のインストール (公式インストーラ)。
+依存: music21 + librosa + scipy。FluidSynth のインストール。
 """
 
 from __future__ import annotations
@@ -56,77 +54,128 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-_MSCORE_CANDIDATES = [
-    Path(r"C:\Program Files\MuseScore 4\bin\MuseScore4.exe"),
-    Path(r"C:\Program Files\MuseScore 4\bin\mscore.exe"),
-    Path(r"C:\Program Files (x86)\MuseScore 4\bin\MuseScore4.exe"),
-    Path(r"C:\Program Files\MuseScore 3\bin\MuseScore3.exe"),
-    Path("/usr/bin/mscore"),
-    Path("/usr/bin/musescore"),
-    Path("/usr/local/bin/mscore"),
-    Path("/Applications/MuseScore 4.app/Contents/MacOS/mscore"),
+_FLUIDSYNTH_FIXED_CANDIDATES = [
+    Path(r"C:\Program Files\FluidSynth\bin\fluidsynth.exe"),
+    Path(r"C:\ProgramData\chocolatey\bin\fluidsynth.exe"),
+    Path("/usr/bin/fluidsynth"),
+    Path("/usr/local/bin/fluidsynth"),
+    Path("/opt/homebrew/bin/fluidsynth"),
+]
+
+_SF_CANDIDATES = [
+    Path(r"C:\Program Files\MuseScore 4\sound\MS Basic.sf3"),
+    Path(r"C:\Program Files\MuseScore 3\sound\MuseScore_General.sf3"),
+    Path(r"C:\Program Files\MuseScore 3\sound\MuseScore_General.sf2"),
+    Path("/usr/share/sounds/sf2/default.sf2"),
+    Path("/usr/share/soundfonts/default.sf2"),
+    Path("/opt/homebrew/share/soundfonts/default.sf2"),
 ]
 
 
-def find_mscore(explicit: Optional[Path] = None) -> Path:
-    """MuseScore 実行ファイルを発見する。
+def find_fluidsynth(explicit: Optional[Path] = None) -> Path:
+    """FluidSynth 実行ファイルを発見する。
 
     優先順:
-        1. --mscore-exe で渡されたパス
-        2. 環境変数 MSCORE_EXE
-        3. PATH 上の MuseScore4 / mscore / MuseScore
-        4. 既知のインストール先 (Windows / Linux / macOS)
+        1. explicit 引数 (--fluidsynth-exe)
+        2. 環境変数 FLUIDSYNTH_EXE
+        3. PATH 上の fluidsynth
+        4. 既知のインストール先
     """
     if explicit is not None:
         if not explicit.exists():
-            raise FileNotFoundError(f"--mscore-exe が存在しません: {explicit}")
+            raise FileNotFoundError(f"--fluidsynth-exe が存在しません: {explicit}")
         return explicit
 
-    env = os.environ.get("MSCORE_EXE")
+    # Project-local vendor directory (most reliable — no sandbox/virtualization issues)
+    repo_root = Path(__file__).resolve().parents[1]
+    vendor_dir = repo_root / "vendor" / "FluidSynth"
+    if vendor_dir.exists():
+        for p in sorted(vendor_dir.glob("*/bin/fluidsynth.exe")):
+            if p.exists():
+                return p
+
+    env = os.environ.get("FLUIDSYNTH_EXE")
     if env:
         p = Path(env)
         if p.exists():
             return p
-        logger.warning("MSCORE_EXE=%s が見つからない — 他の候補を探す", env)
+        logger.warning("FLUIDSYNTH_EXE=%s が見つからない — 他の候補を探す", env)
 
-    for name in ("MuseScore4", "mscore", "MuseScore", "MuseScore3"):
-        which = shutil.which(name)
-        if which:
-            return Path(which)
+    which = shutil.which("fluidsynth")
+    if which:
+        return Path(which)
 
-    for cand in _MSCORE_CANDIDATES:
+    # Search LocalAppData via multiple methods — env vars can be unreliable.
+    local_appdata_candidates: list[Path] = []
+    local_appdata_candidates.append(Path.home() / "AppData" / "Local")
+    userprofile = os.environ.get("USERPROFILE", "")
+    if userprofile:
+        local_appdata_candidates.append(Path(userprofile) / "AppData" / "Local")
+    for parent in Path(sys.executable).resolve().parents:
+        if parent.name.lower() == "local" and parent.parent.name.lower() == "appdata":
+            local_appdata_candidates.append(parent)
+            break
+    for local_appdata in local_appdata_candidates:
+        for p in sorted((local_appdata / "FluidSynth").glob("*/bin/fluidsynth.exe")):
+            if p.exists():
+                return p
+
+    for cand in _FLUIDSYNTH_FIXED_CANDIDATES:
         if cand.exists():
             return cand
 
     raise FileNotFoundError(
-        "MuseScore 実行ファイルが見つかりません。\n"
-        "  1. MuseScore 4 を https://musescore.org/ja/download からインストール\n"
-        "  2. または環境変数 MSCORE_EXE に絶対パスを設定\n"
-        "  3. または --mscore-exe フラグで明示\n"
-        f"  既知の候補: {[str(c) for c in _MSCORE_CANDIDATES]}"
+        "FluidSynth 実行ファイルが見つかりません。\n"
+        "  1. https://github.com/FluidSynth/fluidsynth/releases から Windows バイナリを取得\n"
+        "  2. または環境変数 FLUIDSYNTH_EXE に絶対パスを設定\n"
+        "  3. または --fluidsynth-exe フラグで明示"
     )
 
 
-def preprocess_to_constant_tempo(xml_path: Path, bpm: float) -> Path:
-    """XML 内の全テンポマーキングを除去し、冒頭に単一の MetronomeMark を挿入。
+def find_sf_file(explicit: Optional[Path] = None) -> Path:
+    """SF2/SF3 サウンドフォントファイルを発見する。
 
-    結果は一時 .musicxml ファイルに保存され、そのパスを返す。
-    呼び出し側がアンリンクする責任を持つ。
+    優先順:
+        1. explicit 引数 (--sf-file)
+        2. 環境変数 SF_FILE
+        3. 既知のインストール先 (MuseScore 4 付属 MS Basic.sf3 等)
     """
-    import music21  # type: ignore — heavy
+    if explicit is not None:
+        if not explicit.exists():
+            raise FileNotFoundError(f"--sf-file が存在しません: {explicit}")
+        return explicit
+
+    env = os.environ.get("SF_FILE")
+    if env:
+        p = Path(env)
+        if p.exists():
+            return p
+        logger.warning("SF_FILE=%s が見つからない — 他の候補を探す", env)
+
+    for cand in _SF_CANDIDATES:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError(
+        "SF2/SF3 サウンドフォントが見つかりません。\n"
+        "  1. MuseScore 4 をインストールすると MS Basic.sf3 が付属する\n"
+        "  2. または環境変数 SF_FILE に絶対パスを設定\n"
+        "  3. または --sf-file フラグで明示"
+    )
+
+
+def preprocess_to_constant_tempo(xml_path: Path, bpm: float):  # -> music21.stream.Score
+    """XML を music21 でパースし、全テンポマーキングを除去して単一 BPM に固定した Score を返す。"""
+    import music21  # type: ignore
 
     logger.info("music21 で XML をロード中: %s", xml_path)
     score = music21.converter.parse(str(xml_path))
 
-    # MetronomeMark / MetricModulation / TempoText を全て除去。
-    # ``recurse`` 中に削除すると挙動が壊れるので、まず収集してから削除する。
     targets = []
     for el in score.recurse():
-        if isinstance(el, music21.tempo.MetronomeMark):
-            targets.append(el)
-        elif isinstance(el, music21.tempo.MetricModulation):
-            targets.append(el)
-        elif isinstance(el, music21.tempo.TempoText):
+        if isinstance(el, (music21.tempo.MetronomeMark,
+                           music21.tempo.MetricModulation,
+                           music21.tempo.TempoText)):
             targets.append(el)
     removed = 0
     for el in targets:
@@ -139,8 +188,6 @@ def preprocess_to_constant_tempo(xml_path: Path, bpm: float) -> Path:
                 logger.debug("除去できなかったテンポ要素: %r (%s)", el, exc)
     logger.info("除去したテンポ要素: %d 個", removed)
 
-    # 冒頭に単一の MetronomeMark を入れる。
-    # パートがあれば最初のパートの最初の measure に、無ければ score 直下に。
     new_mm = music21.tempo.MetronomeMark(
         number=bpm, referent=music21.duration.Duration(1.0)
     )
@@ -155,40 +202,53 @@ def preprocess_to_constant_tempo(xml_path: Path, bpm: float) -> Path:
         score.insert(0, new_mm)
     logger.info("冒頭に %.1f BPM の MetronomeMark を挿入", bpm)
 
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".musicxml")
-    os.close(tmp_fd)
-    out_path = Path(tmp_path)
-    score.write("musicxml", str(out_path))
-    logger.info("定テンポ XML 出力: %s", out_path)
-    return out_path
+    return score
 
 
-def render_with_mscore(
-    mscore: Path,
-    xml_path: Path,
+def export_midi(score, midi_path: Path) -> None:
+    """music21 Score を MIDI ファイルとして書き出す。"""
+    score.write("midi", str(midi_path))
+    logger.info("MIDI 出力: %s (%.1f KB)", midi_path, midi_path.stat().st_size / 1024)
+
+
+def render_with_fluidsynth(
+    fluidsynth: Path,
+    sf_path: Path,
+    midi_path: Path,
     out_wav: Path,
+    sample_rate: int = 44100,
 ) -> None:
-    """MuseScore CLI で XML を WAV にエクスポート。"""
-    cmd = [str(mscore), str(xml_path), "-o", str(out_wav)]
-    logger.info("MuseScore 実行: %s", " ".join(cmd))
+    """FluidSynth CLI で MIDI を WAV に変換する。
+
+    -n: no MIDI input  -i: no interactive shell  -F: render to file
+    """
+    cmd = [
+        str(fluidsynth),
+        "-ni",
+        "-F", str(out_wav),
+        "-r", str(sample_rate),
+        str(sf_path),
+        str(midi_path),
+    ]
+    logger.info("FluidSynth 実行: %s", " ".join(cmd))
     completed = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
+        timeout=120,
     )
     if completed.returncode != 0:
         raise RuntimeError(
-            f"MuseScore CLI が失敗しました (exit {completed.returncode}):\n"
+            f"FluidSynth が失敗しました (exit {completed.returncode}):\n"
             f"  stdout: {completed.stdout}\n"
             f"  stderr: {completed.stderr}"
         )
     if not out_wav.exists():
         raise RuntimeError(
-            f"MuseScore は exit=0 を返したが出力が無い: {out_wav}\n"
+            f"FluidSynth は exit=0 を返したが出力が無い: {out_wav}\n"
             f"  stdout: {completed.stdout}"
         )
-    logger.info("MuseScore 出力: %s (%.1f KB)",
-                out_wav, out_wav.stat().st_size / 1024)
+    logger.info("FluidSynth 出力: %s (%.1f KB)", out_wav, out_wav.stat().st_size / 1024)
 
 
 def postprocess_audio(
@@ -197,12 +257,12 @@ def postprocess_audio(
     target_sr: int,
     trim_top_db: float = 60.0,
 ) -> tuple[float, float]:
-    """MuseScore 生 WAV を読み、目的 sr にリサンプル、先頭/末尾の無音を削り、保存。
+    """生 WAV を目的 sr にリサンプル、先頭/末尾の無音を削り、保存。
 
     Returns:
         (trimmed_seconds_at_head, output_duration_sec)
     """
-    import librosa  # type: ignore — heavy
+    import librosa  # type: ignore
     import numpy as np
     from scipy.io import wavfile  # type: ignore
 
@@ -248,8 +308,12 @@ def main() -> int:
         help="出力サンプルレート。default 22050 (CENS デフォルト)",
     )
     parser.add_argument(
-        "--mscore-exe", type=Path, default=None,
-        help="MuseScore 実行ファイル。省略時は MSCORE_EXE / PATH / 既知パスを探索",
+        "--fluidsynth-exe", type=Path, default=None,
+        help="FluidSynth 実行ファイル。省略時は FLUIDSYNTH_EXE / PATH / 既知パスを探索",
+    )
+    parser.add_argument(
+        "--sf-file", type=Path, default=None,
+        help="SF2/SF3 サウンドフォント。省略時は SF_FILE 環境変数 / MuseScore 4 付属 MS Basic.sf3 を探索",
     )
     parser.add_argument(
         "--trim-top-db", type=float, default=60.0,
@@ -269,9 +333,6 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    # librosa/music21 が import 時に numba/matplotlib などを巻き込むと
-    # -v 時に大量のバイトコードダンプが流れて読めなくなる。ノイジーな
-    # ロガーは常時 INFO 以上に落とす。
     for noisy in ("numba", "matplotlib", "PIL", "fontTools", "music21"):
         logging.getLogger(noisy).setLevel(logging.INFO)
 
@@ -281,27 +342,40 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        mscore = find_mscore(args.mscore_exe)
-        logger.info("MuseScore: %s", mscore)
+        fluidsynth = find_fluidsynth(args.fluidsynth_exe)
+        logger.info("FluidSynth: %s", fluidsynth)
     except FileNotFoundError as exc:
         logger.error("%s", exc)
         return 1
 
-    temp_xml: Optional[Path] = None
+    try:
+        sf_file = find_sf_file(args.sf_file)
+        logger.info("SoundFont: %s", sf_file)
+    except FileNotFoundError as exc:
+        logger.error("%s", exc)
+        return 1
+
+    temp_midi: Optional[Path] = None
     temp_wav: Optional[Path] = None
     try:
-        if args.keep_tempo:
-            xml_to_render = args.score
-            logger.info("--keep-tempo: XML のテンポを維持して合成")
-        else:
-            temp_xml = preprocess_to_constant_tempo(args.score, args.bpm)
-            xml_to_render = temp_xml
+        import music21  # type: ignore
 
-        tmp_fd, tmp_wav_path = tempfile.mkstemp(suffix=".wav")
+        if args.keep_tempo:
+            logger.info("--keep-tempo: XML のテンポを維持して合成")
+            score = music21.converter.parse(str(args.score))
+        else:
+            score = preprocess_to_constant_tempo(args.score, args.bpm)
+
+        tmp_fd, tmp_midi_path = tempfile.mkstemp(suffix=".mid")
         os.close(tmp_fd)
+        temp_midi = Path(tmp_midi_path)
+        export_midi(score, temp_midi)
+
+        tmp_fd2, tmp_wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(tmp_fd2)
         temp_wav = Path(tmp_wav_path)
 
-        render_with_mscore(mscore, xml_to_render, temp_wav)
+        render_with_fluidsynth(fluidsynth, sf_file, temp_midi, temp_wav)
 
         head_trim, out_dur = postprocess_audio(
             temp_wav, args.output, args.samplerate, args.trim_top_db
@@ -319,16 +393,12 @@ def main() -> int:
         logger.exception("合成失敗: %s", exc)
         return 1
     finally:
-        if temp_xml is not None:
-            try:
-                temp_xml.unlink()
-            except OSError:
-                pass
-        if temp_wav is not None:
-            try:
-                temp_wav.unlink()
-            except OSError:
-                pass
+        for p in (temp_midi, temp_wav):
+            if p is not None:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
 
     return 0
 

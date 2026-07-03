@@ -1,0 +1,24 @@
+{
+  "settings": {
+    "cooldown_seconds": 3.0,
+    "silence_threshold_db": -55.0,
+    "mic_device": null
+  },
+  "movements": [
+    {
+      "id": 1,
+      "xml_file": "../data/scores/幻想交響曲5.mxl",
+      "built_dir": "../data/built/幻想交響曲5",
+      "triggers": [
+        {"measure": 1,   "action": "right", "note": "開始 - 行進曲"},
+        {"measure": 10,  "action": "right", "note": "test"},
+        {"measure": 17,  "action": "right", "note": "チェロが入る"},
+        {"measure": 33,  "action": "right", "note": "1st Violin"},
+        {"measure": 62,  "action": "right", "note": "盛り上がるとこ"},
+        {"measure": 97,  "action": "right", "note": "TODO: 実際の小節番号に変更してください"},
+        {"measure": 129, "action": "right", "note": "TODO: 実際の小節番号に変更してください"},
+        {"measure": 161, "action": "right", "note": "TODO: 実際の小節番号に変更してください"}
+      ]
+    }
+  ]
+}
