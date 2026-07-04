@@ -99,8 +99,6 @@ class AudioLevelMonitor:
         library-specific exceptions whose class hierarchy we do not
         control.
         """
-        import threading
-
         outcome: dict = {"done": False, "stream": None, "exc": None}
 
         def _worker() -> None:
