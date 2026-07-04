@@ -40,6 +40,16 @@ from audio_score_follower.core.feature_extractor import (
 
 logger = logging.getLogger(__name__)
 
+# ≈0.93 s at default 10.77 Hz frame rate — sustained pure-backward
+# attractor is declared after this many consecutive backward argmins.
+_RAPID_RESET_FRAMES = 10
+# Cost margin between best and second-best DP cell that counts as a
+# fully "decisive" minimum for confidence scoring. Coupled with
+# lock_in_confidence: rescaling this rescales effective confidence.
+_CONFIDENCE_FULL_MARGIN = 0.05
+# Tie-break tolerance for the in-band argmin (float32 noise floor).
+_ARGMIN_TIE_EPS = 1e-6
+
 
 @dataclass
 class FollowResult:
@@ -836,7 +846,7 @@ class OnlineDTWFollower:
         # argmin within [0, max_band_idx]
         capped_band = D_curr_band_arr[: max_band_idx + 1]
         min_cost = float(capped_band.min())
-        candidates = np.where(capped_band <= min_cost + 1e-6)[0]
+        candidates = np.where(capped_band <= min_cost + _ARGMIN_TIE_EPS)[0]
         best_in_band = int(candidates.max())
         new_pos = lo + best_in_band
         local_cost_at_best = float(local_costs[best_in_band])
@@ -872,7 +882,6 @@ class OnlineDTWFollower:
         # place). Wipe backward memory immediately rather than waiting
         # for the full stuck_dp_reset_seconds window (which can delay
         # recovery by 12–24 s in live performances).
-        _RAPID_RESET_FRAMES = 10  # ≈0.93 s at default 10.77 Hz frame rate
         if (
             self._stuck_dp_reset_frames > 0
             and self._consecutive_backward_frames >= _RAPID_RESET_FRAMES
@@ -977,8 +986,8 @@ class OnlineDTWFollower:
             sorted_costs = np.sort(D_curr_band_arr)
             margin = float(sorted_costs[1] - sorted_costs[0])
         else:
-            margin = 0.05  # degenerate band: treat as decisive
-        margin_score = min(1.0, margin / 0.05)  # 0.05 of cost diff = full score
+            margin = _CONFIDENCE_FULL_MARGIN  # degenerate band: treat as decisive
+        margin_score = min(1.0, margin / _CONFIDENCE_FULL_MARGIN)
         confidence = max(0.0, min(1.0, match_score * (0.3 + 0.7 * margin_score)))
 
         # ---- lock-in + inertia bookkeeping -----------------------------
