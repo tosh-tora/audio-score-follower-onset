@@ -196,6 +196,14 @@ def normalize_onset_global(onset: np.ndarray) -> np.ndarray:
     return (onset / (peak + 1e-8)).astype(np.float32)
 
 
+# Rolling-max window for live onset normalisation. Must be identical
+# everywhere live onset is produced (mic worker, file worker, headless
+# eval), or the onset term of the fused DP cost changes scale between
+# them — the same trap as CENS parameter drift between offline build
+# and online follower.
+LIVE_ONSET_WINDOW_SEC = 5.0
+
+
 class OnsetNormalizer:
     """Rolling-max normaliser for the live onset stream.
 
@@ -214,6 +222,11 @@ class OnsetNormalizer:
         if window_frames < 1:
             raise ValueError(f"window_frames must be >= 1, got {window_frames}")
         self._buf: deque[float] = deque(maxlen=int(window_frames))
+
+    @classmethod
+    def for_config(cls, cfg: FeatureConfig) -> "OnsetNormalizer":
+        """Construct with the shared ``LIVE_ONSET_WINDOW_SEC`` rolling window."""
+        return cls(max(1, int(LIVE_ONSET_WINDOW_SEC * cfg.effective_frame_rate())))
 
     def normalize(self, value: float) -> float:
         """Push ``value`` into the rolling buffer and return ``value / max``.

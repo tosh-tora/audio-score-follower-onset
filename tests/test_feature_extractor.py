@@ -124,6 +124,14 @@ def test_onset_normalizer_reset():
     assert result == pytest.approx(1.0 / (1.0 + 1e-8), abs=1e-5)
 
 
+def test_onset_normalizer_for_config_window():
+    from audio_score_follower.core.feature_extractor import LIVE_ONSET_WINDOW_SEC
+
+    cfg = FeatureConfig()  # 22050/2048 → 10.766 Hz
+    n = OnsetNormalizer.for_config(cfg)
+    assert n._buf.maxlen == max(1, int(LIVE_ONSET_WINDOW_SEC * cfg.effective_frame_rate()))
+
+
 # ================================================================ fused_local_cost tests
 
 def test_fused_local_cost_cens_only_no_onset():

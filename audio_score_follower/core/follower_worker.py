@@ -97,8 +97,9 @@ class FollowerWorker:
         self._frames_per_step = int(frames_per_step)
         self._onset_enabled = bool(onset_enabled)
         if self._onset_enabled:
-            window = max(1, int(5.0 * self._cfg.effective_frame_rate()))
-            self._onset_normalizer: Optional[OnsetNormalizer] = OnsetNormalizer(window)
+            self._onset_normalizer: Optional[OnsetNormalizer] = OnsetNormalizer.for_config(
+                self._cfg
+            )
         else:
             self._onset_normalizer = None
 
@@ -382,8 +383,9 @@ class FileWorker:
         self._realtime = bool(realtime)
         self._onset_enabled = bool(onset_enabled)
         if self._onset_enabled:
-            window = max(1, int(5.0 * self._cfg.effective_frame_rate()))
-            self._onset_normalizer: Optional[OnsetNormalizer] = OnsetNormalizer(window)
+            self._onset_normalizer: Optional[OnsetNormalizer] = OnsetNormalizer.for_config(
+                self._cfg
+            )
         else:
             self._onset_normalizer = None
         self._start_offset_sec = float(start_offset_sec)
