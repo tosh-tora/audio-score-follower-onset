@@ -200,7 +200,7 @@ class AudioScoreFollowerApp:
         self.gui = FollowerGUI(
             self.root,
             self.state,
-            on_force_lock_in=self.manual_start,
+            on_start=self.manual_start,
         )
 
         self._workers_stop = threading.Event()

@@ -58,7 +58,7 @@ _MODE_COLOR_WAITING = ("#888888", "white")    # gray bg, white fg
 _MODE_COLOR_TRACKING = ("#2a7", "white")      # green bg
 _MODE_COLOR_INERTIA = ("#e87b00", "white")    # orange bg
 _MODE_COLOR_CAPPED = ("#c00", "white")        # red bg
-_MODE_COLOR_FLASH = ("#2255ff", "white")      # blue bg for force-lock-in flash
+_MODE_COLOR_FLASH = ("#2255ff", "white")      # blue bg for start-button flash
 
 # Window geometry scaled ~2x to match the large pit-readable fonts.
 _WINDOW_GEOMETRY = "1400x1000"
@@ -94,7 +94,7 @@ class FollowerGUI:
         root: tk.Tk,
         state: AppState,
         *,
-        on_force_lock_in: Optional[Callable[[], None]] = None,
+        on_start: Optional[Callable[[], None]] = None,
     ):
         """
         Initialize GUI.
@@ -102,7 +102,7 @@ class FollowerGUI:
         Args:
             root: tkinter root window
             state: Shared AppState object
-            on_force_lock_in: callback fired when the operator clicks
+            on_start: callback fired when the operator clicks
                 the "▶ 演奏開始" button. Wired by ``main.py`` to
                 ``AudioScoreFollowerApp.manual_start``. Optional;
                 passes a no-op if omitted so the GUI can run standalone
@@ -110,7 +110,7 @@ class FollowerGUI:
         """
         self.root = root
         self.state = state
-        self._on_force_lock_in = on_force_lock_in or (lambda: None)
+        self._on_start = on_start or (lambda: None)
 
         self.root.title("Sequential Live Follower")
         self.root.geometry(_WINDOW_GEOMETRY)
@@ -121,9 +121,9 @@ class FollowerGUI:
         # "運命_冒頭_guide.mxl") rendered as tofu boxes.
         self._font_family = _pick_font_family(self.root)
 
-        # Force-lock-in button flash state (drives a 1s blue label
-        # immediately after the button is pressed, then reverts to
-        # the regular mode rendering).
+        # Start button flash state (drives a 1s blue label immediately
+        # after the button is pressed, then reverts to the regular
+        # mode rendering).
         self._flash_until_ms: int = 0
 
         # Create widgets
@@ -227,14 +227,14 @@ class FollowerGUI:
         )
         self.label_mode.pack(side=tk.LEFT, fill="x", expand=True)
 
-        self.button_force_lock_in = tk.Button(
+        self.button_start = tk.Button(
             self.mode_frame,
             text="▶ 演奏開始",
             font=(family, _BUTTON_FONT_SIZE, "bold"),
-            command=self._on_force_lock_in_clicked,
+            command=self._on_start_clicked,
             padx=12, pady=6,
         )
-        self.button_force_lock_in.pack(side=tk.RIGHT, padx=(10, 0))
+        self.button_start.pack(side=tk.RIGHT, padx=(10, 0))
         # Track current button visibility so we only call pack/forget when
         # the state actually changes (cheap; avoids spurious geometry work
         # on every 100ms poll tick).
@@ -267,12 +267,12 @@ class FollowerGUI:
         )
         self.label_hints.pack(side=tk.BOTTOM, pady=8)
 
-    def _on_force_lock_in_clicked(self) -> None:
+    def _on_start_clicked(self) -> None:
         """Button handler — forward to the application callback and
         trigger a brief blue flash on the mode label as visual
         confirmation that the press registered."""
         try:
-            self._on_force_lock_in()
+            self._on_start()
         except Exception as exc:  # noqa: BLE001
             logger.error("force_lock_in callback raised: %s", exc, exc_info=True)
         # Schedule a 1-second flash so the operator sees the click landed.
@@ -283,7 +283,7 @@ class FollowerGUI:
         """Render the follower-mode panel based on the AppState snapshot.
 
         Five visual states, in priority order:
-          - flash    : just clicked the force-lock-in button (1s)
+          - flash    : just clicked the start button (1s)
           - capped   : inertia ran past max_inertia_seconds → position
                        fixed, operator intervention needed (red)
           - inertia  : inertia advancing, countdown shown (orange)
@@ -341,10 +341,10 @@ class FollowerGUI:
         # somehow drops (e.g. movement reload via R clears _locked_in).
         should_show_button = not is_locked
         if should_show_button and not self._button_visible:
-            self.button_force_lock_in.pack(side=tk.RIGHT, padx=(10, 0))
+            self.button_start.pack(side=tk.RIGHT, padx=(10, 0))
             self._button_visible = True
         elif not should_show_button and self._button_visible:
-            self.button_force_lock_in.pack_forget()
+            self.button_start.pack_forget()
             self._button_visible = False
 
     def update_display(self):
