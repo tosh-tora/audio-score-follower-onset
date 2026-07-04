@@ -61,30 +61,7 @@ from audio_score_follower.core.oltw_follower import (
     OnlineDTWFollower,
 )
 from audio_score_follower.core.score_mapper import ScoreMapper
-from audio_score_follower.core.slide_controller import SlideController
-
-
-class _NullSlideController:
-    """No-op slide controller used when --slide-url is omitted (dry-run / test mode)."""
-
-    def start(self) -> None:
-        logger.info("[dry-run] SlideController: start (no browser)")
-
-    def wait_ready(self, timeout: float = 30.0) -> bool:  # noqa: ARG002
-        return True
-
-    def stop(self) -> None:
-        logger.info("[dry-run] SlideController: stop")
-
-    def press(self, action: str) -> None:
-        # No log here — the canonical "slide press" log is emitted by
-        # AudioScoreFollowerApp._execute_action so it can include the
-        # source tag (manual/auto) and the triggering measure.
-        return None
-
-    @property
-    def last_error(self) -> None:
-        return None
+from audio_score_follower.core.slide_controller import NullSlideController, SlideController
 from audio_score_follower.core.state_manager import AppState
 from audio_score_follower.core.warp_lookup import (
     WarpLookup,
@@ -192,7 +169,7 @@ class AudioScoreFollowerApp:
                 "--slide-url 未指定: ドライランモードで起動します。"
                 "スライドは操作されません。"
             )
-            self.slide_controller = _NullSlideController()  # type: ignore[assignment]
+            self.slide_controller = NullSlideController()  # type: ignore[assignment]
 
         # Tk root + GUI (built before worker so update callbacks have
         # something to push into).
