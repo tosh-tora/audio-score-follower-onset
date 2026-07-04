@@ -74,6 +74,15 @@ class AppState:
         self.mic_level_db: float = -120.0
         self.silence_gate_active: bool = False
         self.mic_monitor_available: bool = False
+        # Configured silence-gate threshold (dBFS), shown next to the
+        # live level so the operator can see at a glance why the gate
+        # is (or is not) engaging. None = not set (wav/loopback modes).
+        self.silence_threshold_db: Optional[float] = None
+
+        # Mic-mode manual start: True while the follower is parked
+        # waiting for the operator to press 「▶ 演奏開始」 (or L).
+        # Always False in wav/loopback modes (auto-start).
+        self.waiting_for_start: bool = False
 
         # UI update signaling
         self.ui_update_event = threading.Event()
@@ -104,6 +113,8 @@ class AppState:
                 'mic_level_db': self.mic_level_db,
                 'silence_gate_active': self.silence_gate_active,
                 'mic_monitor_available': self.mic_monitor_available,
+                'silence_threshold_db': self.silence_threshold_db,
+                'waiting_for_start': self.waiting_for_start,
                 'is_locked_in': self.is_locked_in,
                 'is_in_inertia': self.is_in_inertia,
                 'inertia_elapsed_sec': self.inertia_elapsed_sec,
@@ -215,6 +226,18 @@ class AppState:
             self.mic_level_db = level_db
             self.silence_gate_active = gate_active
             self.mic_monitor_available = monitor_available
+        self.ui_update_event.set()
+
+    def set_silence_threshold(self, threshold_db: Optional[float]):
+        """Record the configured silence-gate threshold for GUI display."""
+        with self._lock:
+            self.silence_threshold_db = threshold_db
+        self.ui_update_event.set()
+
+    def set_waiting_for_start(self, waiting: bool):
+        """Update the mic-mode manual-start waiting flag."""
+        with self._lock:
+            self.waiting_for_start = waiting
         self.ui_update_event.set()
 
     def set_follower_mode(

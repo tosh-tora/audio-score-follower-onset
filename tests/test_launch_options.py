@@ -54,6 +54,54 @@ def _mic_opts(config_path: Path, **kw) -> LaunchOptions:
     return LaunchOptions(config_path=config_path, input_source=INPUT_SOURCE_MIC, **kw)
 
 
+# ---------------------------------------------------------------- effective wav
+class TestEffectiveInputWav:
+    def test_mic_source_ignores_stale_wav_path(self, config_file, tmp_path):
+        # 回帰防止: ランチャーは wav 欄の前回値を保持したまま起動できる。
+        # input_source=mic なのに input_wav を app に渡すと wav モードで
+        # 起動してしまい「マイクを選んだのに監視無効・勝手に追随開始」になる。
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"\x00")
+        opts = _mic_opts(config_file, input_wav=wav)
+        assert opts.effective_input_wav is None
+
+    def test_wav_source_passes_through(self, config_file, tmp_path):
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"\x00")
+        opts = LaunchOptions(
+            config_path=config_file, input_source=INPUT_SOURCE_WAV, input_wav=wav
+        )
+        assert opts.effective_input_wav == wav
+
+    def test_loopback_source_ignores_wav(self, config_file, tmp_path):
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"\x00")
+        opts = LaunchOptions(
+            config_path=config_file,
+            input_source=INPUT_SOURCE_LOOPBACK,
+            input_wav=wav,
+        )
+        assert opts.effective_input_wav is None
+
+
+# ---------------------------------------------------------------- config loader
+class TestConfigLoaderStartSearch:
+    def test_default(self, config_file):
+        from audio_score_follower.config.loader import ConfigLoader
+        loader = ConfigLoader(str(config_file))
+        assert loader.get_start_search_seconds() == 10.0
+
+    def test_settings_override(self, config_file, tmp_path):
+        import json as _json
+        data = _json.loads(config_file.read_text(encoding="utf-8"))
+        data["settings"]["start_search_seconds"] = 6.0
+        path = tmp_path / "config_override.json"
+        path.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        from audio_score_follower.config.loader import ConfigLoader
+        loader = ConfigLoader(str(path))
+        assert loader.get_start_search_seconds() == 6.0
+
+
 # ---------------------------------------------------------------- resolve
 class TestResolveInputWav:
     def test_none(self):
@@ -278,13 +326,24 @@ class TestReadLauncherSettings:
 # ---------------------------------------------------------------- silence threshold
 class TestComputeSilenceThreshold:
     def test_formula_median_plus_lower_spread_plus_margin(self):
-        # p10≈-61.6, median=-60 → threshold = -60 + 1.6 + 3 = -55.4
-        samples = list(np.linspace(-62.0, -58.0, 100))
+        # Wide ambient fluctuation (spread > MIN_SPREAD_DB floor):
+        # p10≈-68, median=-60 → threshold = -60 + 8 + 3 = -49.0
+        samples = list(np.linspace(-70.0, -50.0, 100))
         result = compute_silence_threshold(samples)
-        assert result.threshold_db == pytest.approx(-55.4, abs=0.2)
-        assert result.median_db == pytest.approx(-60.0, abs=0.1)
-        assert result.p10_db == pytest.approx(-61.6, abs=0.1)
+        assert result.threshold_db == pytest.approx(-49.0, abs=0.3)
+        assert result.median_db == pytest.approx(-60.0, abs=0.2)
+        assert result.p10_db == pytest.approx(-68.0, abs=0.2)
         assert result.count == 100
+
+    def test_min_spread_floor_on_steady_ambient(self):
+        # Very steady noise floor (median ≈ p10): the raw lower-spread
+        # term would give threshold ≈ median + 3dB, which ambient-level
+        # fluctuation (HVAC / fan spin-up) can cross on its own —
+        # 実測: 演奏前に追随が始まる。MIN_SPREAD_DB floors the headroom.
+        samples = list(np.linspace(-60.5, -59.5, 100))  # spread ≈ 0.4dB
+        result = compute_silence_threshold(samples)
+        # threshold = median + max(0.4, 6.0) + 3 = -60 + 9 = -51
+        assert result.threshold_db == pytest.approx(-51.0, abs=0.3)
 
     def test_robust_to_incidental_spikes(self):
         # 3% loud spikes (a cough) must not move the threshold: median and
@@ -324,8 +383,9 @@ class TestComputeSilenceThreshold:
         assert high.threshold_db <= 0.0
 
     def test_custom_margin(self):
-        samples = [-60.0] * 50  # zero spread → threshold = median + margin
-        assert compute_silence_threshold(samples, margin_db=5.0).threshold_db == -55.0
+        # zero spread → floored at MIN_SPREAD_DB → median + 6 + margin
+        samples = [-60.0] * 50
+        assert compute_silence_threshold(samples, margin_db=5.0).threshold_db == -49.0
 
 
 # ---------------------------------------------------------------- rematch

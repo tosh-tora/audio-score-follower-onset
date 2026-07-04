@@ -48,6 +48,14 @@ class LaunchOptions:
     ``silence_threshold_db`` / ``cooldown_seconds`` are launcher-only
     tuning fields; None means "leave the config value untouched" (the
     CLI has no flags for them).
+
+    ``input_wav`` may be non-None even when ``input_source`` is not
+    "wav": the launcher keeps the last-used file path in its form (and
+    persists it) so switching back to wav mode doesn't lose it.
+    Consumers MUST use ``effective_input_wav`` — passing a raw
+    ``input_wav`` to the app while the source is mic silently launches
+    file mode (auto-start, no silence gate), which manifested as
+    「マイクを選んだのに監視無効・勝手に追随開始」.
     """
 
     config_path: Path
@@ -60,6 +68,13 @@ class LaunchOptions:
     verbose: bool = False
     silence_threshold_db: Optional[float] = None
     cooldown_seconds: Optional[float] = None
+
+    @property
+    def effective_input_wav(self) -> Optional[Path]:
+        """The input_wav to actually run with (None unless wav mode)."""
+        if self.input_source == INPUT_SOURCE_WAV:
+            return self.input_wav
+        return None
 
 
 def resolve_input_wav(raw: Optional[Path]) -> Optional[Path]:
@@ -231,6 +246,17 @@ def save_launcher_settings(
 # launcher's 60ms poll rate).
 MIN_SILENCE_SAMPLES = 30
 
+# Floor on the estimated upper spread of the ambient distribution (dB).
+# A very steady noise floor during measurement (median ≈ p10) says
+# nothing about SLOW fluctuations the short measurement window cannot
+# see — HVAC cycling on, PC fans spinning up, distant traffic. Without
+# a floor the threshold lands ~3 dB above the median and those
+# fluctuations reopen the gate with no music playing (実測: 幻想4 マイク
+# 運用で演奏前に追随が始まる). Music onsets are ≥20 dB above ambient,
+# so a 6 dB floor (≈9 dB total headroom over median) costs nothing in
+# detection latency.
+MIN_SPREAD_DB = 6.0
+
 
 @dataclass
 class SilenceMeasurement:
@@ -250,14 +276,16 @@ def compute_silence_threshold(
     The gate freezes OLTW when level <= threshold, so the threshold must
     sit ABOVE (nearly) the whole ambient distribution. Formula::
 
-        threshold = median + (median - p10) + margin_db
+        threshold = median + max(median - p10, MIN_SPREAD_DB) + margin_db
 
     The upper spread is estimated by mirroring the LOWER half of the
     distribution: incidental sounds during measurement (coughs, chairs,
     nearby talk) only contaminate the upper tail, so median and p10 stay
     clean while a direct high percentile would not. The (median - p10)
     term adapts the margin to how much the venue's ambient level
-    fluctuates (HVAC cycling etc.).
+    fluctuates (HVAC cycling etc.), and ``MIN_SPREAD_DB`` floors it so a
+    suspiciously steady measurement window doesn't produce a threshold
+    the ambient level can cross on its own (fan spin-up, HVAC cycle).
 
     Non-finite samples (monitor not yet delivering) are dropped. Raises
     ValueError when fewer than MIN_SILENCE_SAMPLES remain.
@@ -272,7 +300,7 @@ def compute_silence_threshold(
         )
     median = float(np.percentile(arr, 50))
     p10 = float(np.percentile(arr, 10))
-    threshold = median + (median - p10) + margin_db
+    threshold = median + max(median - p10, MIN_SPREAD_DB) + margin_db
     threshold = min(max(threshold, -120.0), 0.0)
     return SilenceMeasurement(
         threshold_db=round(threshold, 1),

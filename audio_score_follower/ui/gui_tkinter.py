@@ -104,8 +104,8 @@ class FollowerGUI:
             root: tkinter root window
             state: Shared AppState object
             on_force_lock_in: callback fired when the operator clicks
-                the "▶ 楽章開始" button. Wired by ``main.py`` to
-                ``AudioScoreFollowerApp.manual_force_lock_in``. Optional;
+                the "▶ 演奏開始" button. Wired by ``main.py`` to
+                ``AudioScoreFollowerApp.manual_start``. Optional;
                 passes a no-op if omitted so the GUI can run standalone
                 in tests.
         """
@@ -230,7 +230,7 @@ class FollowerGUI:
 
         self.button_force_lock_in = tk.Button(
             self.mode_frame,
-            text="▶ 楽章開始",
+            text="▶ 演奏開始",
             font=(family, _BUTTON_FONT_SIZE, "bold"),
             command=self._on_force_lock_in_clicked,
             padx=12, pady=6,
@@ -266,7 +266,7 @@ class FollowerGUI:
             text=(
                 "→/Space: スライドを進める   ←: スライドを戻す   "
                 "N: 次の楽章   R: 現在の楽章を再ロード   "
-                "L / ボタン: 楽章開始（強制 lock-in）"
+                "L / ボタン: 演奏開始（押しズレ±数秒は自動補正）"
             ),
             font=(family, _HINT_FONT_SIZE),
             bg="#f0f0f0",
@@ -297,28 +297,33 @@ class FollowerGUI:
           - tracking : DP tracking with confidence (green)
           - waiting  : pre-lock-in, awaiting downbeat (gray)
 
-        Also toggles the "▶ 楽章開始" button visibility: shown only
-        pre-lock-in (where it has a useful effect). After lock-in the
-        button is a no-op so we hide it to keep the panel uncluttered;
+        Also toggles the "▶ 演奏開始" button visibility: shown while
+        waiting for the operator start and pre-lock-in (first press
+        starts tracking; a second press force-arms lock-in at the
+        downbeat). After lock-in the button is a no-op so we hide it;
         the L keybind is still available if the operator ever needs
-        to re-arm lock-in after a reset.
+        to re-arm after a reset.
         """
         now_ms = int(self.root.tk.call("clock", "milliseconds"))
         if now_ms < self._flash_until_ms:
             bg, fg = _MODE_COLOR_FLASH
-            self.label_mode.config(text="🎯 lock-in 強制発動", bg=bg, fg=fg)
+            self.label_mode.config(text="🎯 開始を受け付けました", bg=bg, fg=fg)
             # Don't touch button visibility during the flash — it will be
             # re-evaluated on the next poll tick once the flash expires.
             return
 
         is_locked = state.get('is_locked_in', False)
         in_inertia = state.get('is_in_inertia', False)
+        waiting_for_start = state.get('waiting_for_start', False)
         elapsed = float(state.get('inertia_elapsed_sec', 0.0))
         cap = float(state.get('inertia_cap_sec', 10.0))
 
-        if not is_locked:
+        if waiting_for_start:
             bg, fg = _MODE_COLOR_WAITING
-            text = "⏸ 待機中（楽章開始を待っています）"
+            text = "⏸ 開始待ち（▶ 演奏開始 を押してください）"
+        elif not is_locked:
+            bg, fg = _MODE_COLOR_WAITING
+            text = "🎧 音を待っています（曲の捕捉中）"
         elif in_inertia and elapsed >= cap:
             bg, fg = _MODE_COLOR_CAPPED
             text = (
@@ -409,18 +414,22 @@ class FollowerGUI:
             else:
                 self.label_cooldown.config(text="")
 
-            # マイクレベル
+            # マイクレベル（実測 dBFS + 判定閾値を併記）
             mic_available = state.get('mic_monitor_available', False)
             mic_db = state.get('mic_level_db', -120.0)
             gate = state.get('silence_gate_active', False)
+            threshold = state.get('silence_threshold_db')
+            thr_part = (
+                f"（閾値 {threshold:.1f}）" if threshold is not None else ""
+            )
             if not mic_available:
                 mic_text = "マイク: 監視無効（silence gate 無効）— ログを確認"
                 mic_color = "#c60"
             elif gate:
-                mic_text = f"マイク: {mic_db:.1f} dBFS  ⚠ 無音（閾値未満）"
+                mic_text = f"マイク: {mic_db:.1f} dBFS{thr_part}  ⚠ 無音（閾値未満）"
                 mic_color = "red"
             else:
-                mic_text = f"マイク: {mic_db:.1f} dBFS  ✓ 入力検出"
+                mic_text = f"マイク: {mic_db:.1f} dBFS{thr_part}  ✓ 入力検出"
                 mic_color = "#2a7"
             self.label_mic_level.config(text=mic_text, fg=mic_color)
 

@@ -1232,3 +1232,138 @@ def test_low_conf_advance_cap():
             f"low-conf cap violated: advance={r.dp_ref_frame - prev}"
         )
         prev = r.dp_ref_frame
+
+
+# ================================================= pre-lock-in rewind tests
+
+def _flat_plateau_ref(n: int) -> np.ndarray:
+    """All-identical columns: every position ties, so an unfrozen DP
+    marches forward by max_advance_per_frame per frame — the maximal
+    noise-driven advance generator (same as a gate opened on noise)."""
+    ref = np.zeros((12, n), dtype=np.float32)
+    ref[0, :] = 1.0
+    return ref
+
+
+def test_prelockin_rewind_discards_noise_window_advance():
+    """lock-in 前: freeze→unfreeze→ノイズで前進→freeze で開始位置に巻き戻る。
+
+    咳・拍手で gate が開いた間の DP 前進は「仮」であり、gate が閉じたら
+    ラチェットせずスナップショットへ戻ることを確認する。
+    """
+    cfg = FeatureConfig()
+    ref = _flat_plateau_ref(400)
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=120, init_search_width=10,
+        max_advance_per_frame=40, step_penalty=0.0,
+        stuck_dp_reset_seconds=0.0, stuck_rematch_seconds=0.0,
+    )
+    follower.freeze()          # startup park (mic mode)
+    follower.process_frame(np.zeros(12, dtype=np.float32))
+    follower.unfreeze()        # gate opened on a "cough"
+    assert not follower.is_locked_in
+
+    live = ref[:, 0]
+    for _ in range(8):         # plateau race: DP marches forward
+        follower.process_frame(live)
+    assert follower.dp_ref_frame > 0, "test premise: DP must have advanced"
+
+    follower.freeze()          # gate closed again → rewind
+    assert follower.dp_ref_frame == 0, (
+        f"pre-lock-in freeze must rewind to snapshot 0, "
+        f"got {follower.dp_ref_frame}"
+    )
+    assert follower.current_ref_frame == 0, "display must snap to rewound pos"
+
+
+def test_prelockin_unfreeze_reseeds_all_inf_dp():
+    """起動直後から frozen のまま unfreeze した場合、D_prev が全 inf の
+    ままだと argmin が毎フレーム band 右端に張り付く暴走になる。
+    unfreeze の再シードで有限アンカーが保証されることを確認する。
+    """
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(120)
+    follower = OnlineDTWFollower(
+        ref, cfg, search_width=60, init_search_width=10,
+        max_advance_per_frame=50,
+    )
+    follower.freeze()          # frozen before the very first frame
+    for _ in range(5):
+        follower.process_frame(np.zeros(12, dtype=np.float32))
+    follower.unfreeze()
+    assert np.isfinite(follower._D_prev).any(), (
+        "unfreeze must leave a finite D_prev seed"
+    )
+    # Tracking the reference from the top must now behave sanely.
+    positions = []
+    for j in range(30):
+        r = follower.process_frame(ref[:, j])
+        positions.append(r.dp_ref_frame)
+    assert positions[-1] <= 40, (
+        f"runaway advance after unfreeze: positions={positions[-5:]}"
+    )
+
+
+def test_no_rewind_after_force_lock_in():
+    """force_lock_in 後の freeze は慣性経路（巻き戻しなし）。"""
+    cfg = FeatureConfig()
+    ref = _random_unit_chroma(200, seed=7)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20, init_search_width=10)
+    for j in range(40):
+        follower.process_frame(ref[:, j])
+    pos = follower.dp_ref_frame
+    assert pos > 0
+    follower.force_lock_in()
+    follower.freeze()
+    assert follower.is_in_inertia, "post-lock-in freeze must enter inertia"
+    assert follower.dp_ref_frame >= pos, "locked-in freeze must not rewind"
+
+
+def test_no_rewind_after_auto_lock_in_during_window():
+    """gate 開放中に本物の音楽で lock-in が成立したら、その後の freeze は
+    巻き戻さない（lock-in = point of no return）。"""
+    cfg = FeatureConfig()
+    ref = _random_unit_chroma(200, seed=31)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20, init_search_width=10)
+    follower.freeze()
+    follower.process_frame(np.zeros(12, dtype=np.float32))
+    follower.unfreeze()        # snapshot = 0
+    # Real music: track confidently until auto lock-in latches.
+    for j in range(80):
+        follower.process_frame(ref[:, j])
+    assert follower.is_locked_in, "auto lock-in should have latched"
+    pos = follower.dp_ref_frame
+    follower.freeze()
+    assert follower.is_in_inertia
+    assert follower.dp_ref_frame >= pos, (
+        "freeze after auto lock-in must not rewind to the snapshot"
+    )
+
+
+def test_freeze_without_prior_unfreeze_parks():
+    """unfreeze 履歴なしの freeze は従来通り park（snapshot None）。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20)
+    for j in range(10):
+        follower.process_frame(ref[:, j])
+    pos = follower.current_ref_frame
+    follower.freeze()
+    r = follower.process_frame(ref[:, 11])
+    assert r.ref_frame == pos, "freeze without snapshot must park in place"
+
+
+def test_seek_clears_prelockin_snapshot():
+    """手動 seek は snapshot をクリアし、後の gate close で黙って
+    巻き戻されない。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(120)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20, init_search_width=10)
+    follower.freeze()
+    follower.process_frame(np.zeros(12, dtype=np.float32))
+    follower.unfreeze()        # snapshot = 0
+    follower.seek(50, allow_catchup=False)  # operator override
+    follower.freeze()          # gate close must NOT rewind to 0
+    assert follower.dp_ref_frame == 50, (
+        f"seek must supersede the rewind snapshot; got {follower.dp_ref_frame}"
+    )
