@@ -146,6 +146,8 @@ class AudioScoreFollowerApp:
         self.audio_monitor = AudioLevelMonitor(
             threshold_db=self.config.get_silence_threshold_db(),
             device=self.config.get_mic_device(),
+            activation_hold_sec=self.config.get_gate_activation_sec(),
+            release_hold_sec=self.config.get_gate_release_sec(),
         )
 
         # Per-movement objects (recreated each load)
@@ -158,6 +160,12 @@ class AudioScoreFollowerApp:
         self.worker: FollowerWorker | FileWorker | None = None
 
         self._fired_trigger_measures: set[int] = set()
+
+        # Manual performance start (mic mode only): the follower stays
+        # frozen and ignores the silence gate until the operator presses
+        # 「▶ 演奏開始」 (or L). wav/loopback modes auto-start as before.
+        self._mic_mode = input_wav is None and not loopback
+        self._performance_started = not self._mic_mode
 
         # Runtime jump detection: track previous measure and the wall-clock
         # time of the most recent user-initiated seek. Jumps right after a
@@ -183,7 +191,7 @@ class AudioScoreFollowerApp:
         self.gui = FollowerGUI(
             self.root,
             self.state,
-            on_force_lock_in=self.manual_force_lock_in,
+            on_force_lock_in=self.manual_start,
         )
 
         self._workers_stop = threading.Event()
@@ -201,6 +209,12 @@ class AudioScoreFollowerApp:
     def run(self) -> None:
         if self.input_wav is None and not self.loopback:
             logger.info("Launching AudioLevelMonitor …")
+            # Surface the configured gate threshold so the GUI can show
+            # it next to the live dBFS readout — the operator can then
+            # see at a glance whether ambient noise sits above it.
+            self.state.set_silence_threshold(
+                self.config.get_silence_threshold_db()
+            )
             try:
                 self.audio_monitor.start()
             except BaseException as exc:  # noqa: BLE001
@@ -364,6 +378,18 @@ class AudioScoreFollowerApp:
             self.state.set_load_error(f"warp path 検証中にエラー: {exc}")
             return
 
+        oltw_kwargs = self.config.get_oltw_kwargs()
+        if self._mic_mode:
+            # Manual-start correction for a LATE press: widen the
+            # first-frame search window so tracking can land several
+            # seconds into the piece. (Most late-press recovery goes
+            # through the armed post-unfreeze catchup, but this covers
+            # the corner where no freeze preceded the first frame.)
+            fr = self.warp_lookup.feature_config.effective_frame_rate()
+            start_width = int(round(self.config.get_start_search_seconds() * fr))
+            oltw_kwargs["init_search_width"] = max(
+                int(oltw_kwargs.get("init_search_width") or 0), start_width
+            )
         try:
             self.oltw = OnlineDTWFollower(
                 reference_cens=reference_cens,
@@ -371,12 +397,23 @@ class AudioScoreFollowerApp:
                 reference_onset=reference_onset,
                 chroma_weight=chroma_weight,
                 onset_weight=onset_weight,
-                **self.config.get_oltw_kwargs(),
+                **oltw_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to construct OLTW: %s", exc)
             self.state.set_load_error(f"OLTW 初期化失敗: {exc}")
             return
+
+        if self._mic_mode:
+            # Park until the operator presses 「▶ 演奏開始」. The gate
+            # poll keeps the follower frozen while _performance_started
+            # is False; freeze here as well so no frame slips through
+            # between worker start and the first poll.
+            self._performance_started = False
+            self.oltw.freeze()
+            self._prev_gate_active = True
+            self.state.set_waiting_for_start(True)
+            logger.info("Waiting for operator start (▶ 演奏開始 / L key)")
 
         self.cooldown.cleanup_old()
         self._fired_trigger_measures.clear()
@@ -510,7 +547,17 @@ class AudioScoreFollowerApp:
             mic_db = self.audio_monitor.get_level_db()
             gate_active = mic_available and not self.audio_monitor.is_active()
 
-            if gate_active != self._prev_gate_active and self.oltw is not None:
+            if not self._performance_started:
+                # Waiting for the operator's start press: hold the
+                # follower frozen regardless of the gate, but keep the
+                # level display live. _prev_gate_active stays True so
+                # the first post-start poll re-evaluates the transition
+                # (unfreezes immediately if sound is already present —
+                # the late-press case).
+                if self.oltw is not None and not self.oltw.is_frozen:
+                    self.oltw.freeze()
+                self._prev_gate_active = True
+            elif gate_active != self._prev_gate_active and self.oltw is not None:
                 if gate_active:
                     self.oltw.freeze()
                 else:
@@ -725,23 +772,39 @@ class AudioScoreFollowerApp:
             measure, pre_frame, pre_frame / fr,
         )
 
-    def manual_force_lock_in(self) -> None:
-        """Operator-triggered lock-in (L key or GUI "楽章開始" button).
+    def manual_start(self) -> None:
+        """Operator start press (L key or GUI 「▶ 演奏開始」 button).
 
-        Forces the OLTW lock-in latch ON immediately so silence-gate
-        freezes become inertia progression instead of position-fixed
-        holds. Typically pressed right at the conductor's downbeat
-        before the first sound has built up enough confidence streak
-        for the auto-latch.
+        Mic mode, first press: releases the manual-start hold. Tracking
+        is then governed by the silence gate — an EARLY press costs
+        nothing (the follower stays frozen until sustained sound, and
+        pre-lock-in noise windows are rewound), a LATE press is
+        corrected by the armed post-unfreeze catchup / widened initial
+        search (``start_search_seconds``). Lock-in still latches
+        automatically once real music is confidently tracked — we do
+        NOT force it here, because an early press + forced lock-in
+        would let silence-gate freezes advance inertia over silence.
+
+        Subsequent presses (and all presses in wav/loopback auto-start
+        modes) fall through to the legacy force-lock-in, which arms
+        inertia at the conductor's downbeat.
 
         Public (no leading underscore) so the GUI can wire a button
         click directly to it.
         """
         if self.oltw is None:
-            logger.warning("force_lock_in pressed but OLTW not initialised yet")
+            logger.warning("start pressed but OLTW not initialised yet")
+            return
+        if self._mic_mode and not self._performance_started:
+            self._performance_started = True
+            self.state.set_waiting_for_start(False)
+            logger.info(
+                "Performance start pressed — silence gate now governs "
+                "tracking (early/late press auto-corrected)"
+            )
             return
         if self.oltw.is_locked_in:
-            logger.info("force_lock_in pressed but already locked in (no-op)")
+            logger.info("start pressed but already locked in (no-op)")
             return
         self.oltw.force_lock_in()
         logger.info("Manual lock-in triggered by operator")
@@ -755,7 +818,7 @@ class AudioScoreFollowerApp:
             self._load_current_movement()
 
         def _on_l(_e: tk.Event) -> None:
-            self.manual_force_lock_in()
+            self.manual_start()
 
         def _on_next(_e: tk.Event) -> None:
             self._manual_advance_to_next_trigger()
@@ -862,7 +925,7 @@ def main() -> int:
         app = AudioScoreFollowerApp(
             str(opts.config_path),
             slide_url=opts.slide_url,
-            input_wav=opts.input_wav,
+            input_wav=opts.effective_input_wav,
             play_audio=opts.play_audio,
             loopback=(opts.input_source == launch_options.INPUT_SOURCE_LOOPBACK),
             loopback_device=opts.loopback_device,

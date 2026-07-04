@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from typing import Optional, Union
 
 import numpy as np
@@ -41,14 +42,42 @@ class AudioLevelMonitor:
         sample_rate: int = 16000,
         block_size: int = 1024,
         device: Optional[Union[int, str]] = None,
+        activation_hold_sec: float = 0.7,
+        release_hold_sec: float = 0.3,
     ) -> None:
+        """
+        Args:
+            threshold_db: level above which the mic counts as "sound".
+            activation_hold_sec: the level must stay ABOVE threshold for
+                this long continuously before ``is_active()`` flips True.
+                Filters momentary noises (cough, door, dropped program)
+                that would otherwise open the gate and let the OLTW
+                advance irreversibly on noise. Music onsets sustain, so
+                the cost is only a short unfreeze delay that the DP's
+                forward search absorbs. 0 = flip instantly (legacy).
+            release_hold_sec: the level must stay AT/BELOW threshold for
+                this long continuously before ``is_active()`` flips
+                False. Prevents brief inter-note dips from toggling the
+                gate. 0 = flip instantly.
+        """
         self.threshold_db = float(threshold_db)
         self.sample_rate = int(sample_rate)
         self.block_size = int(block_size)
         self.device = device
+        if activation_hold_sec < 0 or release_hold_sec < 0:
+            raise ValueError("hold seconds must be >= 0")
+        self.activation_hold_sec = float(activation_hold_sec)
+        self.release_hold_sec = float(release_hold_sec)
 
         self._lock = threading.Lock()
         self._current_db: float = -math.inf
+        # Debounced gate state. Starts inactive (silence assumed) so
+        # startup ambient noise cannot open the gate before the first
+        # sustained sound.
+        self._active: bool = False
+        # monotonic timestamp of the first block that disagreed with
+        # ``_active``; None while the level agrees with the state.
+        self._cross_since: Optional[float] = None
         self._stream = None  # sounddevice.InputStream when running
         self._available = False  # set True after a successful start()
 
@@ -152,15 +181,18 @@ class AudioLevelMonitor:
         return self._available
 
     def is_active(self) -> bool:
-        """True iff the most recent block was above the silence threshold.
+        """Debounced activity state (see ``activation_hold_sec``).
 
-        If the monitor is unavailable (failed to open), returns True so
-        that callers fall back to trusting the matcher's confidence.
+        True only after the level has stayed above the threshold for
+        ``activation_hold_sec`` continuously; back to False only after
+        ``release_hold_sec`` of continuous silence. If the monitor is
+        unavailable (failed to open), returns True so that callers fall
+        back to trusting the matcher's confidence.
         """
         if not self._available:
             return True
         with self._lock:
-            return self._current_db > self.threshold_db
+            return self._active
 
     def get_level_db(self) -> float:
         """Return the most recently measured level in dBFS."""
@@ -182,8 +214,32 @@ class AudioLevelMonitor:
         # Map RMS → dBFS. 1e-10 floor avoids -inf when truly silent.
         db = 20.0 * math.log10(max(rms, 1e-10))
 
+        now = time.monotonic()
+        above = db > self.threshold_db
+
         with self._lock:
             self._current_db = db
+            if above == self._active:
+                # Level agrees with the debounced state — reset any
+                # pending transition.
+                self._cross_since = None
+            else:
+                if self._cross_since is None:
+                    self._cross_since = now
+                hold = (
+                    self.activation_hold_sec if above else self.release_hold_sec
+                )
+                if now - self._cross_since >= hold:
+                    self._active = above
+                    self._cross_since = None
+                    logger.info(
+                        "AudioLevelMonitor: gate %s after %.2fs sustained "
+                        "%s (level %.1f dBFS, threshold %.1f)",
+                        "ACTIVE" if above else "silent",
+                        hold,
+                        "sound" if above else "silence",
+                        db, self.threshold_db,
+                    )
 
     def __repr__(self) -> str:
         return (

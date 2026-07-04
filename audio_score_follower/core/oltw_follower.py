@@ -405,6 +405,13 @@ class OnlineDTWFollower:
         self._live_frame_idx = 0
         self._frozen = False
         self._frozen_pos: Optional[int] = None
+        # Pre-lock-in rewind snapshot: position at the moment the gate
+        # last opened (unfreeze) BEFORE lock-in. Any advance made during
+        # that gate-open window is provisional — noise (cough, applause)
+        # can open the gate and drive the monotonic DP forward — so the
+        # next pre-lock-in freeze() rewinds to this snapshot. Lock-in is
+        # the point of no return. Cleared by reset() and seek().
+        self._pre_lockin_resume_pos: Optional[int] = None
 
         self._cost_history: deque[float] = deque(maxlen=int(confidence_smoothing))
 
@@ -1295,6 +1302,27 @@ class OnlineDTWFollower:
                     self._max_inertia_seconds,
                 )
             else:
+                # Pre-lock-in: any advance made while the gate was open
+                # is provisional. If we moved forward since the last
+                # unfreeze (noise-driven — a cough/applause opened the
+                # gate and the monotonic DP marched), rewind to the
+                # snapshot so noise events can't ratchet the position.
+                resume = self._pre_lockin_resume_pos
+                if resume is not None and self._current_ref_pos > resume:
+                    logger.info(
+                        "OLTW pre-lock-in rewind: ref_frame %d → %d "
+                        "(gate-open advance discarded; not locked in)",
+                        self._current_ref_pos, resume,
+                    )
+                    self._reseed_at(resume)
+                    # Noise-driven confidence streaks must not feed the
+                    # lock-in latch after the rewind.
+                    self._high_conf_streak = 0
+                    self._low_conf_streak = 0
+                    # If music actually started during the window, the
+                    # armed catchup re-finds it forward of the anchor on
+                    # the first frame after the next unfreeze.
+                    self._post_seek_catchup_pending = True
                 self._frozen_pos = self._current_ref_pos
                 logger.info(
                     "OLTW frozen (position fixed, pre-lock-in) at "
@@ -1322,6 +1350,22 @@ class OnlineDTWFollower:
                 return
             self._frozen = False
             self._frozen_pos = None
+            # Pre-lock-in: snapshot the position at gate-open so a later
+            # pre-lock-in freeze() can rewind any noise-driven advance,
+            # and restart the DP from a clean seed at the parked anchor.
+            # The reseed is essential: when the follower was frozen
+            # before its very first frame (mic mode starts parked),
+            # D_prev is still all-inf — without a finite seed the next
+            # DP argmin sees a uniform-inf band and the rightmost
+            # tie-break races forward by max_advance_per_frame EVERY
+            # frame regardless of audio (the "counting never stops"
+            # runaway). The armed catchup additionally lets the first
+            # live frame land forward of the anchor when the music
+            # actually started before the gate opened (late press).
+            if not self._locked_in:
+                self._pre_lockin_resume_pos = self._current_ref_pos
+                self._reseed_at(self._current_ref_pos)
+                self._post_seek_catchup_pending = True
             if self._inertia_active:
                 elapsed = (
                     self._inertia_frames_elapsed
@@ -1362,32 +1406,47 @@ class OnlineDTWFollower:
         """
         ref_frame = max(0, min(int(ref_frame), self._N - 1))
         with self._state_lock:
-            self._D_prev[:] = np.inf
-            self._D_prev[ref_frame] = 0.0
-            self._prev_band_lo = ref_frame
-            self._prev_band_hi = ref_frame + 1
-            self._current_ref_pos = ref_frame
-            self._display_ref_pos = float(ref_frame)  # intentional teleport: snap
-            # If we haven't processed any live frame yet, the next call
-            # would otherwise go through the (init_search_width-limited)
-            # first-frame path and overwrite our seek. Bumping the index
-            # routes it through the subsequent-frame DP, which will use
-            # the seeded D_prev we just set.
-            if self._live_frame_idx == 0:
-                self._live_frame_idx = 1
-            self._cost_history.clear()
-            self._stuck_counter = 0
-            self._stuck_window_start_pos = ref_frame
-            self._stuck_dp_counter = 0
-            self._stuck_dp_window_start_pos = ref_frame
-            self._backward_attempts_in_window = 0
-            self._consecutive_backward_frames = 0
+            self._reseed_at(ref_frame)
             self._post_seek_catchup_pending = bool(allow_catchup)
+            # A manual seek supersedes any pre-lock-in rewind snapshot:
+            # the operator has explicitly declared the position, and a
+            # later gate close must not silently undo it.
+            self._pre_lockin_resume_pos = None
         logger.info(
             "OLTW seek: ref_frame=%d (%.2fs)%s",
             ref_frame, ref_frame / self._cfg.effective_frame_rate(),
             " [catchup armed]" if allow_catchup else "",
         )
+
+    def _reseed_at(self, ref_frame: int) -> None:
+        """Re-anchor the DP at ``ref_frame`` with a fresh cost field.
+
+        Caller MUST hold ``_state_lock`` — this helper does not acquire
+        it. ``seek()`` and the pre-lock-in rewind in ``freeze()`` both
+        need this logic, and ``freeze()`` already holds the lock, so a
+        ``seek()`` call from there would deadlock (``threading.Lock``
+        is non-reentrant). Keep any new teleport paths on this helper.
+        """
+        self._D_prev[:] = np.inf
+        self._D_prev[ref_frame] = 0.0
+        self._prev_band_lo = ref_frame
+        self._prev_band_hi = ref_frame + 1
+        self._current_ref_pos = ref_frame
+        self._display_ref_pos = float(ref_frame)  # intentional teleport: snap
+        # If we haven't processed any live frame yet, the next call
+        # would otherwise go through the (init_search_width-limited)
+        # first-frame path and overwrite our re-anchor. Bumping the
+        # index routes it through the subsequent-frame DP, which will
+        # use the seeded D_prev we just set.
+        if self._live_frame_idx == 0:
+            self._live_frame_idx = 1
+        self._cost_history.clear()
+        self._stuck_counter = 0
+        self._stuck_window_start_pos = ref_frame
+        self._stuck_dp_counter = 0
+        self._stuck_dp_window_start_pos = ref_frame
+        self._backward_attempts_in_window = 0
+        self._consecutive_backward_frames = 0
 
     def _try_post_seek_catchup(self, live: np.ndarray) -> bool:
         """Bounded forward local rematch after a manual seek().
@@ -1558,6 +1617,7 @@ class OnlineDTWFollower:
             self._inertia_frames_elapsed = 0
             self._last_good_rate = 1.0
             self._display_ref_pos = 0.0
+            self._pre_lockin_resume_pos = None
         logger.info("OLTW reset")
 
     # ------------------------------------------------------------ getters

@@ -175,6 +175,41 @@ class ConfigLoader:
     def get_silence_threshold_db(self) -> float:
         return self.settings.get("silence_threshold_db", -55.0)
 
+    def get_gate_activation_sec(self) -> float:
+        """Sustained sound required before the silence gate OPENS.
+
+        A momentary noise (cough, dropped program, door) exceeds the
+        level threshold for only a fraction of a second; without this
+        hold the gate opens instantly and the OLTW advances on the
+        noise — irreversibly, because the DP position is monotonic.
+        Music onsets sustain, so requiring ~0.7s of continuous sound
+        filters transients at the cost of a small unfreeze delay (the
+        DP catches up: the position anchor is behind the music, and
+        forward search closes sub-second gaps within a few frames).
+        """
+        return self.settings.get("gate_activation_sec", 0.7)
+
+    def get_start_search_seconds(self) -> float:
+        """Initial-search window (seconds) after the manual start button.
+
+        Mic mode starts tracking only when the operator presses
+        「▶ 演奏開始」. A human press can lag the actual music onset by
+        a few seconds, so the OLTW's first-frame search window is
+        widened to this many seconds of the reference (overriding
+        ``init_search_width`` when larger) so a late press still lands
+        on the true position. Early presses cost nothing: the silence
+        gate keeps the follower frozen until sustained sound.
+        """
+        return self.settings.get("start_search_seconds", 10.0)
+
+    def get_gate_release_sec(self) -> float:
+        """Sustained silence required before the silence gate CLOSES.
+
+        Prevents brief inter-note dips from toggling freeze/unfreeze.
+        Kept short so real silence still freezes promptly.
+        """
+        return self.settings.get("gate_release_sec", 0.3)
+
     def get_mic_device(self):
         if "mic_device" in self.settings:
             return self.settings["mic_device"]
