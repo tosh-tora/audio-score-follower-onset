@@ -166,6 +166,15 @@ class AudioScoreFollowerApp:
         # 「▶ 演奏開始」 (or L). wav/loopback modes auto-start as before.
         self._mic_mode = input_wav is None and not loopback
         self._performance_started = not self._mic_mode
+        # One-shot gate release (Issue #13): after the start press, the
+        # FIRST sustained sound confirms the performance is underway and
+        # the gate stops governing freeze/unfreeze. Quiet openings (e.g.
+        # 幻想交響曲 4th mvt) straddle the threshold, and every pre-lock-in
+        # freeze rewinds the provisional advance and clears the confidence
+        # streak — the follower can never lock in. Once the operator has
+        # pressed start, any threshold crossing means music, so the gate's
+        # job (blocking pre-performance noise) is done.
+        self._performance_confirmed = not self._mic_mode
 
         # Runtime jump detection: track previous measure and the wall-clock
         # time of the most recent user-initiated seek. Jumps right after a
@@ -410,6 +419,7 @@ class AudioScoreFollowerApp:
             # is False; freeze here as well so no frame slips through
             # between worker start and the first poll.
             self._performance_started = False
+            self._performance_confirmed = False
             self.oltw.freeze()
             self._prev_gate_active = True
             self.state.set_waiting_for_start(True)
@@ -557,11 +567,28 @@ class AudioScoreFollowerApp:
                 if self.oltw is not None and not self.oltw.is_frozen:
                     self.oltw.freeze()
                 self._prev_gate_active = True
+            elif self._performance_confirmed:
+                # Performance confirmed (Issue #13): the gate no longer
+                # freezes the follower. The level display stays live so
+                # the operator can still see quiet passages dip below
+                # the threshold, but tracking is now trusted to the DP
+                # (pp passages that straddle the threshold must not
+                # trigger pre-lock-in rewinds or inertia churn).
+                pass
             elif gate_active != self._prev_gate_active and self.oltw is not None:
                 if gate_active:
                     self.oltw.freeze()
                 else:
                     self.oltw.unfreeze()
+                    # First sustained sound after the start press: the
+                    # performance is underway. Release the gate for the
+                    # rest of the movement (one-shot).
+                    self._performance_confirmed = True
+                    logger.info(
+                        "Performance confirmed (first sustained sound "
+                        "after start press) — silence gate released; "
+                        "tracking now governed by the DP alone"
+                    )
                 self._prev_gate_active = gate_active
 
             self.state.set_mic_level(mic_db, gate_active, mic_available)
@@ -775,15 +802,19 @@ class AudioScoreFollowerApp:
     def manual_start(self) -> None:
         """Operator start press (L key or GUI 「▶ 演奏開始」 button).
 
-        Mic mode, first press: releases the manual-start hold. Tracking
-        is then governed by the silence gate — an EARLY press costs
-        nothing (the follower stays frozen until sustained sound, and
-        pre-lock-in noise windows are rewound), a LATE press is
-        corrected by the armed post-unfreeze catchup / widened initial
-        search (``start_search_seconds``). Lock-in still latches
-        automatically once real music is confidently tracked — we do
-        NOT force it here, because an early press + forced lock-in
-        would let silence-gate freezes advance inertia over silence.
+        Mic mode, first press: releases the manual-start hold. The
+        silence gate then governs tracking only until the FIRST
+        sustained sound — that crossing confirms the performance is
+        underway and releases the gate for good (Issue #13: quiet
+        openings straddle the threshold, and repeated pre-lock-in
+        freezes rewind the follower forever). An EARLY press costs
+        nothing (the follower stays frozen until sustained sound), a
+        LATE press is corrected by the armed post-unfreeze catchup /
+        widened initial search (``start_search_seconds``). Lock-in
+        still latches automatically once real music is confidently
+        tracked — we do NOT force it here, because an early press +
+        forced lock-in would let silence-gate freezes advance inertia
+        over silence.
 
         Subsequent presses (and all presses in wav/loopback auto-start
         modes) fall through to the legacy force-lock-in, which arms
@@ -799,8 +830,9 @@ class AudioScoreFollowerApp:
             self._performance_started = True
             self.state.set_waiting_for_start(False)
             logger.info(
-                "Performance start pressed — silence gate now governs "
-                "tracking (early/late press auto-corrected)"
+                "Performance start pressed — silence gate governs "
+                "tracking until the first sustained sound, then "
+                "releases (early/late press auto-corrected)"
             )
             return
         if self.oltw.is_locked_in:

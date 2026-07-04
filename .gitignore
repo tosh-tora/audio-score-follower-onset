@@ -32,6 +32,11 @@ Thumbs.db
 # Vendored binaries (FluidSynth etc.) - install locally
 vendor/
 
+# Config files hold per-machine launcher/device settings (settings.launcher,
+# mic_device, loopback_device etc.) that get persisted on save and shouldn't
+# be committed.
+config/*
+
 # Debug scripts
 debug_*.py
 *.pdf
