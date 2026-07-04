@@ -524,7 +524,7 @@ class OnlineDTWFollower:
 
         Args:
             live_cens_frame: (12,) float32, L2-normalised. Pass a single
-                column from ``compute_cens_streaming`` output.
+                column from ``compute_cens`` output.
             live_onset_frame: scalar normalised onset for this frame, or
                 None. When fusion is enabled and this is None, the frame
                 silently falls back to CENS-only cost for this step.

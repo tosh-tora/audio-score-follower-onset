@@ -129,47 +129,6 @@ def compute_cens(
     return (cens / norms).astype(np.float32)
 
 
-def compute_cens_streaming(
-    audio_block: np.ndarray,
-    cfg: FeatureConfig,
-) -> np.ndarray:
-    """Compute CENS for a single live audio block.
-
-    Identical to ``compute_cens`` for now — librosa's chroma_cens accepts
-    arbitrary length input and computes as many frames as it can. We
-    expose a separate name so the online code documents its intent
-    (and so we can swap in a true streaming implementation later
-    without changing call sites).
-
-    Note: for very short blocks (<cens_win * hop_length samples) the
-    CENS smoothing has insufficient context and the first few frames
-    are unreliable. The OLTW follower compensates with its
-    confidence/cost gate.
-    """
-    return compute_cens(audio_block, cfg)
-
-
-def cosine_cost_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Pairwise cosine distance between two CENS sequences.
-
-    Args:
-        a: (12, n) reference CENS
-        b: (12, m) live CENS
-
-    Returns:
-        (n, m) cost matrix in [0, 2], where 0 = identical direction.
-
-    Implementation note: both inputs are assumed already L2-normalised
-    (which compute_cens guarantees). So cosine distance reduces to
-    ``1 - a.T @ b`` with no division.
-    """
-    if a.shape[0] != 12 or b.shape[0] != 12:
-        raise ValueError(
-            f"Expected 12-d chroma, got {a.shape} and {b.shape}"
-        )
-    return 1.0 - a.T @ b
-
-
 # ============================================================================
 # Onset (spectral-flux) feature — complementary to CENS for fusion.
 # ============================================================================
@@ -270,46 +229,6 @@ class OnsetNormalizer:
 
     def reset(self) -> None:
         self._buf.clear()
-
-
-@dataclass
-class AudioFeatures:
-    """Container for multi-feature time series, frame-aligned.
-
-    The fusion framework: callers build one of these from an audio
-    array (offline) or a streaming buffer (online), and the OLTW
-    consumes them column-by-column. Future features (HPCP, Mel
-    embeddings, learned representations) should be added as optional
-    fields here — the OLTW's ``fused_local_cost`` is the single point
-    that mixes them into DP cost.
-    """
-
-    cens: np.ndarray
-    onset: Optional[np.ndarray] = None
-
-    @property
-    def n_frames(self) -> int:
-        return int(self.cens.shape[1])
-
-    def aligned_truncate(self) -> "AudioFeatures":
-        """Return a copy where all feature arrays share the same n_frames.
-
-        librosa occasionally returns CENS and onset with frame counts
-        that differ by 1 due to STFT edge-handling differences. Callers
-        that pass these into the OLTW want a hard guarantee that
-        ``cens[:, j]`` and ``onset[j]`` describe the same time window.
-        """
-        if self.onset is None:
-            return AudioFeatures(cens=self.cens, onset=None)
-        n = min(self.cens.shape[1], self.onset.shape[0])
-        if n == self.cens.shape[1] and n == self.onset.shape[0]:
-            return self
-        logger.warning(
-            "AudioFeatures: CENS / onset frame counts differ "
-            "(cens=%d, onset=%d); truncating to %d",
-            self.cens.shape[1], self.onset.shape[0], n,
-        )
-        return AudioFeatures(cens=self.cens[:, :n], onset=self.onset[:n])
 
 
 def fused_local_cost(
