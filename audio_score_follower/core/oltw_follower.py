@@ -680,12 +680,7 @@ class OnlineDTWFollower:
             discriminability_ratio, median_cost,
         )
         # Reseed DP: clear cumulative history, anchor at the new position.
-        self._D_prev[:] = np.inf
-        self._D_prev[new_pos] = best_cost
-        self._prev_band_lo = new_pos
-        self._prev_band_hi = new_pos + 1
-        self._current_ref_pos = new_pos
-        self._display_ref_pos = float(new_pos)  # intentional teleport: snap
+        self._anchor_dp_at(new_pos, best_cost)
         return True
 
     def _process_subsequent_frame(self, live: np.ndarray) -> FollowResult:
@@ -1410,6 +1405,23 @@ class OnlineDTWFollower:
             " [catchup armed]" if allow_catchup else "",
         )
 
+    def _anchor_dp_at(self, ref_frame: int, seed_cost: float) -> None:
+        """Wipe D_prev, re-anchor at ``ref_frame`` with ``seed_cost``, and
+        snap the display position.
+
+        lock-free helper: same calling convention as ``_reseed_at``
+        (call from within ``process_frame``, or while ``_state_lock``
+        is already held). Shared by every intentional-teleport path
+        (rematch / post-seek catchup / ``_reseed_at``) so the "reseed
+        + band collapse + snap" invariant lives in one place.
+        """
+        self._D_prev[:] = np.inf
+        self._D_prev[ref_frame] = seed_cost
+        self._prev_band_lo = ref_frame
+        self._prev_band_hi = ref_frame + 1
+        self._current_ref_pos = ref_frame
+        self._display_ref_pos = float(ref_frame)  # intentional teleport: snap
+
     def _reseed_at(self, ref_frame: int) -> None:
         """Re-anchor the DP at ``ref_frame`` with a fresh cost field.
 
@@ -1419,12 +1431,7 @@ class OnlineDTWFollower:
         ``seek()`` call from there would deadlock (``threading.Lock``
         is non-reentrant). Keep any new teleport paths on this helper.
         """
-        self._D_prev[:] = np.inf
-        self._D_prev[ref_frame] = 0.0
-        self._prev_band_lo = ref_frame
-        self._prev_band_hi = ref_frame + 1
-        self._current_ref_pos = ref_frame
-        self._display_ref_pos = float(ref_frame)  # intentional teleport: snap
+        self._anchor_dp_at(ref_frame, 0.0)
         # If we haven't processed any live frame yet, the next call
         # would otherwise go through the (init_search_width-limited)
         # first-frame path and overwrite our re-anchor. Bumping the
@@ -1497,12 +1504,7 @@ class OnlineDTWFollower:
             (new_pos - self._current_ref_pos) / self._cfg.effective_frame_rate(),
         )
         # Re-seed DP at the corrected position.
-        self._D_prev[:] = np.inf
-        self._D_prev[new_pos] = best_cost
-        self._prev_band_lo = new_pos
-        self._prev_band_hi = new_pos + 1
-        self._current_ref_pos = new_pos
-        self._display_ref_pos = float(new_pos)  # intentional teleport: snap
+        self._anchor_dp_at(new_pos, best_cost)
         return True
 
     def reset(self) -> None:
