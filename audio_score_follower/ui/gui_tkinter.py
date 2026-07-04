@@ -47,7 +47,6 @@ _MEASURE_FONT_SIZE = 140
 _BEAT_FONT_SIZE = 42
 _CONFIDENCE_FONT_SIZE = 24
 _TRIGGER_FONT_SIZE = 28
-_INERTIA_FONT_SIZE = 24
 _COOLDOWN_FONT_SIZE = 22
 _HINT_FONT_SIZE = 18
 _MODE_FONT_SIZE = 28
@@ -248,12 +247,6 @@ class FollowerGUI:
         )
         self.label_next_trigger.pack(pady=4)
 
-        # 慣性モード表示
-        self.label_inertia = tk.Label(
-            self.root, text="", font=(family, _INERTIA_FONT_SIZE, "bold"), bg="#f0f0f0", fg="red"
-        )
-        self.label_inertia.pack(pady=2)
-
         # クールダウン表示
         self.label_cooldown = tk.Label(
             self.root, text="", font=(family, _COOLDOWN_FONT_SIZE), bg="#f0f0f0", fg="orange"
@@ -400,10 +393,6 @@ class FollowerGUI:
                 self.label_next_trigger.config(text=f"次のトリガー: {next_trig} 小節目")
             else:
                 self.label_next_trigger.config(text="次のトリガー: --")
-
-            # 慣性モード (legacy field — kept for backward compat; the
-            # primary follower-mode rendering is in label_mode below).
-            self.label_inertia.config(text="")
 
             # ----- 追随モード表示の更新 -----
             self._render_follower_mode(state)

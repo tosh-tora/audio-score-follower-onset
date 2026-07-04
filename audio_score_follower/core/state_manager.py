@@ -47,14 +47,8 @@ class AppState:
         self.confidence: float = 0.0
 
         # Trigger/cooldown state
-        self.last_trigger_measure: Optional[int] = None
-        self.last_trigger_time: Optional[float] = None
         self.next_trigger_measure: Optional[int] = None
         self.cooldown_active: bool = False
-
-        # Inertia mode (fallback when confidence is low)
-        self.inertia_mode: bool = False
-        self.inertia_tempo_bpm: Optional[float] = None
 
         # OLTW lock-in / inertia state — mirrored from OnlineDTWFollower
         # by the result callback so the GUI tracking panel can render
@@ -106,10 +100,8 @@ class AppState:
                 'measure': self.current_measure,
                 'beat_in_measure': self.current_beat_in_measure,
                 'confidence': self.confidence,
-                'inertia_mode': self.inertia_mode,
                 'cooldown_active': self.cooldown_active,
                 'next_trigger_measure': self.next_trigger_measure,
-                'last_trigger_measure': self.last_trigger_measure,
                 'mic_level_db': self.mic_level_db,
                 'silence_gate_active': self.silence_gate_active,
                 'mic_monitor_available': self.mic_monitor_available,
@@ -186,24 +178,8 @@ class AppState:
             self.current_measure = 1
             self.current_beat_in_measure = 1.0
             self.confidence = 0.0
-            self.inertia_mode = False
             self.cooldown_active = False
-            self.last_trigger_measure = None
             self.next_trigger_measure = None
-        self.ui_update_event.set()
-
-    def set_inertia_mode(self, active: bool, tempo_bpm: Optional[float] = None):
-        """
-        Activate/deactivate inertia mode.
-
-        Args:
-            active: True to activate
-            tempo_bpm: Estimated tempo (for extrapolation)
-        """
-        with self._lock:
-            self.inertia_mode = active
-            if tempo_bpm is not None:
-                self.inertia_tempo_bpm = tempo_bpm
         self.ui_update_event.set()
 
     def set_mic_level(
@@ -288,7 +264,6 @@ class AppState:
         """
         with self._lock:
             self.cooldown_active = True
-            self.last_trigger_time = time.time()
 
         # Timer to auto-clear
         def clear_cooldown():
@@ -308,5 +283,5 @@ class AppState:
         state = self.get_all()
         return (
             f"AppState(measure={state['measure']}, beat={state['beat']:.1f}, "
-            f"confidence={state['confidence']:.2f}, inertia={state['inertia_mode']})"
+            f"confidence={state['confidence']:.2f})"
         )
