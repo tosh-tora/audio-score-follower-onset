@@ -616,6 +616,66 @@ class OnlineDTWFollower:
             dp_ref_frame=best,
         )
 
+    def _probe_decisive_forward_match(
+        self,
+        live: np.ndarray,
+        min_pos: int,
+        max_pos: int,
+        current_cost: float,
+        *,
+        log_tag: str,
+    ) -> Optional[tuple[int, float, float, float]]:
+        """Search ``[min_pos, max_pos)`` for a "decisively better" forward match.
+
+        Shared by ``_try_global_rematch`` and ``_try_post_seek_catchup``:
+        both need "find the best local-cost position in a forward
+        window, but only trust it if it clearly beats both the current
+        position AND the typical forward position" — two guards:
+
+        1. The candidate beats ``current_cost`` by at least
+           ``stuck_rematch_cost_margin`` (do something only if it helps).
+        2. The candidate beats the median forward cost by at least
+           ``stuck_rematch_min_discriminability_ratio`` (don't trust the
+           "best" when many candidates are essentially tied — that's
+           the signature of a non-discriminative chroma profile, e.g.
+           a different orchestration of the same theme, and the global
+           argmin is then dominated by chance / self-similarity).
+
+        Returns ``(new_pos, best_cost, ratio, median_cost)`` on success,
+        or ``None`` if either guard rejects the window.
+        """
+        if max_pos <= min_pos:
+            return None
+        costs = self._local_cost_block(min_pos, max_pos, live)
+        best_offset = int(np.argmin(costs))
+        best_cost = float(costs[best_offset])
+
+        # Guard 1: must beat the current position.
+        if current_cost - best_cost < self._stuck_rematch_cost_margin:
+            return None
+
+        # Guard 2: the best must stand out RELATIVE to typical forward
+        # positions, not just by an absolute margin. Use a ratio so the
+        # threshold is meaningful whether absolute costs are tiny (perfect
+        # match exists) or large (mic capture of a different performance).
+        # An absolute margin alone misclassifies both ends: it rejects
+        # clean perfect matches whose median is also low (lead-time
+        # scenario), and accepts ambiguous mic matches whose median is
+        # moderate (the false-jump scenario).
+        median_cost = float(np.median(costs))
+        if median_cost <= 0:
+            return None  # degenerate; nothing to compare against
+        ratio = (median_cost - best_cost) / median_cost
+        if ratio < self._stuck_rematch_min_discriminability_ratio:
+            logger.debug(
+                "OLTW %s: skipping jump, low discriminability "
+                "ratio %.2f (best %.3f, median %.3f)",
+                log_tag, ratio, best_cost, median_cost,
+            )
+            return None
+
+        return min_pos + best_offset, best_cost, ratio, median_cost
+
     def _try_global_rematch(self, live: np.ndarray, current_local_cost: float) -> bool:
         """If a forward position has a much better local match, jump there.
 
@@ -641,37 +701,14 @@ class OnlineDTWFollower:
         max_jump_pos = min(
             self._N, self._current_ref_pos + self._stuck_rematch_max_jump_frames + 1
         )
-        if max_jump_pos <= min_jump_pos:
+        probe = self._probe_decisive_forward_match(
+            live, min_jump_pos, max_jump_pos, current_local_cost,
+            log_tag="stuck-rematch",
+        )
+        if probe is None:
             return False
-        global_costs = self._local_cost_block(min_jump_pos, max_jump_pos, live)
-        best_offset = int(np.argmin(global_costs))
-        best_cost = float(global_costs[best_offset])
+        new_pos, best_cost, discriminability_ratio, median_cost = probe
 
-        # Guard 1: must beat the current position.
-        if current_local_cost - best_cost < self._stuck_rematch_cost_margin:
-            return False
-
-        # Guard 2: the best must stand out RELATIVE to typical forward
-        # positions, not just by an absolute margin. Use a ratio so the
-        # threshold is meaningful whether absolute costs are tiny (perfect
-        # match exists) or large (mic capture of a different performance).
-        # An absolute margin alone misclassifies both ends: it rejects
-        # clean perfect matches whose median is also low (lead-time
-        # scenario), and accepts ambiguous mic matches whose median is
-        # moderate (the false-jump scenario).
-        median_cost = float(np.median(global_costs))
-        if median_cost <= 0:
-            return False  # degenerate; nothing to compare against
-        discriminability_ratio = (median_cost - best_cost) / median_cost
-        if discriminability_ratio < self._stuck_rematch_min_discriminability_ratio:
-            logger.debug(
-                "OLTW stuck-rematch: skipping jump, low discriminability "
-                "ratio %.2f (best %.3f, median %.3f)",
-                discriminability_ratio, best_cost, median_cost,
-            )
-            return False
-
-        new_pos = min_jump_pos + best_offset
         logger.info(
             "OLTW stuck-rematch: jumping ref_frame %d→%d "
             "(local cost %.3f→%.3f, discrim_ratio %.2f, median %.3f)",
@@ -1472,31 +1509,15 @@ class OnlineDTWFollower:
         """
         min_jump_pos = self._current_ref_pos + 1
         max_jump_pos = min(self._N, self._current_ref_pos + self._search_width + 1)
-        if max_jump_pos <= min_jump_pos:
-            return False
-        global_costs = self._local_cost_block(min_jump_pos, max_jump_pos, live)
-        best_offset = int(np.argmin(global_costs))
-        best_cost = float(global_costs[best_offset])
         current_cost = self._local_cost_scalar(self._current_ref_pos, live)
-
-        # Guard 1: must beat the current position.
-        if current_cost - best_cost < self._stuck_rematch_cost_margin:
+        probe = self._probe_decisive_forward_match(
+            live, min_jump_pos, max_jump_pos, current_cost,
+            log_tag="post-seek catchup",
+        )
+        if probe is None:
             return False
+        new_pos, best_cost, ratio, median_cost = probe
 
-        # Guard 2: relative discriminability.
-        median_cost = float(np.median(global_costs))
-        if median_cost <= 0:
-            return False
-        ratio = (median_cost - best_cost) / median_cost
-        if ratio < self._stuck_rematch_min_discriminability_ratio:
-            logger.debug(
-                "OLTW post-seek catchup: skipping, low discriminability "
-                "ratio %.2f (best %.3f, median %.3f)",
-                ratio, best_cost, median_cost,
-            )
-            return False
-
-        new_pos = min_jump_pos + best_offset
         logger.info(
             "OLTW post-seek catchup: %d→%d (local cost %.3f→%.3f, "
             "discrim_ratio %.2f, +%.2fs forward)",
