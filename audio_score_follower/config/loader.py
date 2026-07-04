@@ -343,8 +343,6 @@ class ConfigLoader:
             # overriding with inertia would degrade alt-recording
             # coverage. Exited via _maybe_resync_from_dp when DP
             # confidence recovers within inertia_resync_max_gap_frames.
-            # inertia_enter_frames is reserved for future use.
-            "inertia_enter_frames": 5,
             "inertia_exit_frames": 3,
             # Position-history window for inertia-rate estimation.
             # 40 frames ≈ 3.7s — long enough to smooth out beat-to-beat

@@ -97,7 +97,6 @@ class OnlineDTWFollower:
         confidence_smoothing: int = 5,
         lock_in_frames: int = 30,
         lock_in_confidence: float = 0.45,
-        inertia_enter_frames: int = 5,
         inertia_exit_frames: int = 3,
         inertia_history_frames: int = 40,
         max_inertia_seconds: float = 10.0,
@@ -232,10 +231,6 @@ class OnlineDTWFollower:
                 the lifetime of this follower (monotonic).
             lock_in_confidence: confidence threshold for lock-in counter
                 and for ``_maybe_resync_from_dp`` recovery. Default 0.45.
-            inertia_enter_frames: number of consecutive low-confidence
-                frames required to enter inertia mode automatically.
-                Default 5. (silence-gate ``freeze()`` enters inertia
-                immediately, bypassing this counter.)
             inertia_exit_frames: number of consecutive high-confidence
                 DP frames required to exit inertia mode via
                 ``_maybe_resync_from_dp``. Default 3.
@@ -427,8 +422,6 @@ class OnlineDTWFollower:
             raise ValueError("lock_in_frames must be >= 0")
         if not 0.0 <= lock_in_confidence <= 1.0:
             raise ValueError("lock_in_confidence must be in [0, 1]")
-        if inertia_enter_frames < 1:
-            raise ValueError("inertia_enter_frames must be >= 1")
         if inertia_exit_frames < 1:
             raise ValueError("inertia_exit_frames must be >= 1")
         if inertia_history_frames < 2:
@@ -438,7 +431,6 @@ class OnlineDTWFollower:
 
         self._lock_in_frames = int(lock_in_frames)
         self._lock_in_confidence = float(lock_in_confidence)
-        self._inertia_enter_frames = int(inertia_enter_frames)
         self._inertia_exit_frames = int(inertia_exit_frames)
         self._inertia_history_frames = int(inertia_history_frames)
         self._max_inertia_seconds = float(max_inertia_seconds)
