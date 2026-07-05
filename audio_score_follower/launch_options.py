@@ -257,7 +257,7 @@ class SilenceMeasurement:
 
 
 def compute_silence_threshold(
-    samples_db, margin_db: float = 3.0
+    samples_db, margin_db: float = 2.0
 ) -> SilenceMeasurement:
     """Derive silence_threshold_db from ambient-noise dBFS samples.
 

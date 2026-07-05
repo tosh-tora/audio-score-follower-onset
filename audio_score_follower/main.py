@@ -31,6 +31,7 @@ Keys (on the operator GUI window):
                    become inertia progression instead of position-fix)
     → / Space    : manual slide advance
     ←            : manual slide back
+    ↑ / ↓        : nudge silence-gate threshold by ±0.2 dB (mic mode only)
 """
 
 from __future__ import annotations
@@ -83,6 +84,8 @@ _MAX_FRAME_MEASURE_JUMP = 3
 # Suppress the jump-anomaly alert for this long after a user-initiated seek
 # (jumps right after a seek are expected, not a warp path anomaly).
 _SEEK_GRACE_SEC = 2.0
+# Step size for the operator's runtime silence-threshold nudge (↑/↓ keys).
+_THRESHOLD_STEP_DB = 0.2
 # Minimum smoothed OLTW confidence before triggers are allowed to fire.
 # Acts as the "lock-in" condition that InertiaEngine provided in
 # live-score-sync; below this, alignment hasn't stabilised yet and
@@ -819,6 +822,31 @@ class AudioScoreFollowerApp:
         self.oltw.force_lock_in()
         logger.info("Manual lock-in triggered by operator")
 
+    def adjust_silence_threshold(self, delta_db: float) -> None:
+        """Nudge the silence-gate threshold at runtime (↑/↓ keys).
+
+        Mic mode only (wav/loopback have no gate — the monitor is never
+        started, so ``is_available()`` is False and this is a no-op).
+        Runtime-only: does not persist to config.json, so a re-launch
+        reverts to the measured/configured value. Works before and after
+        「▶ 演奏開始」— the operator may want to react to a rehearsal
+        room's actual noise floor as soon as the meter is live.
+        """
+        if not self.audio_monitor.is_available():
+            logger.info(
+                "Silence threshold adjust ignored (mic monitor unavailable "
+                "— wav/loopback mode has no gate)"
+            )
+            return
+        new_threshold = self.audio_monitor.threshold_db + delta_db
+        new_threshold = min(max(new_threshold, -120.0), 0.0)
+        self.audio_monitor.set_threshold_db(new_threshold)
+        self.state.set_silence_threshold(new_threshold)
+        logger.info(
+            "Silence threshold adjusted to %.1f dBFS (%+.1f)",
+            new_threshold, delta_db,
+        )
+
     # ---------------------------------------------------- key bindings
     def _bind_keys(self) -> None:
         def _on_n(_e: tk.Event) -> None:
@@ -836,6 +864,12 @@ class AudioScoreFollowerApp:
         def _on_prev(_e: tk.Event) -> None:
             self._manual_back_to_prev_trigger()
 
+        def _on_thr_up(_e: tk.Event) -> None:
+            self.adjust_silence_threshold(_THRESHOLD_STEP_DB)
+
+        def _on_thr_down(_e: tk.Event) -> None:
+            self.adjust_silence_threshold(-_THRESHOLD_STEP_DB)
+
         self.root.bind("<KeyPress-n>", _on_n)
         self.root.bind("<KeyPress-N>", _on_n)
         self.root.bind("<KeyPress-r>", _on_r)
@@ -845,7 +879,9 @@ class AudioScoreFollowerApp:
         self.root.bind("<KeyPress-Right>", _on_next)
         self.root.bind("<KeyPress-space>", _on_next)
         self.root.bind("<KeyPress-Left>", _on_prev)
-        logger.info("Keys bound: N R L → ← Space")
+        self.root.bind("<KeyPress-Up>", _on_thr_up)
+        self.root.bind("<KeyPress-Down>", _on_thr_down)
+        logger.info("Keys bound: N R L → ← Space ↑ ↓")
 
 
 def main() -> int:
