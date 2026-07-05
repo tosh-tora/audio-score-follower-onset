@@ -359,7 +359,6 @@ asf-follow
 | `stuck_rematch_seconds` | `0.0` | スコア全体探索による遠方ジャンプ機構。**デフォルト無効**（繰り返しテーマで誤テレポートするため）。 |
 | `lock_in_frames` | `30` | 「曲開始を捉えた (lock-in)」と判定するための連続高 conf フレーム数（≈3 秒）。lock-in 前の silence gate は位置固定、lock-in 後は慣性進行に切り替わる。 |
 | `lock_in_confidence` | `0.45` | lock-in カウンタ／慣性復帰 (`_maybe_resync_from_dp`) で「高 conf」とみなす confidence 閾値。 |
-| `inertia_enter_frames` | `5` | （予約フィールド。現状は silence gate `freeze()` のみが慣性入りのトリガー） |
 | `inertia_exit_frames` | `3` | `_maybe_resync_from_dp` で慣性を抜けるのに必要な連続高 conf フレーム数。 |
 | `inertia_history_frames` | `40` | 慣性 rate 推定用の position history 窓（≈3.7 秒）。長いほど滑らか、短いほど tempo 変化に追従。 |
 | `max_inertia_seconds` | `10.0` | 慣性進行の最大持続秒数。超えたら位置固定に戻り、復帰は手動 →/L 任せ。長フェルマータが多い曲（Bruckner 等）では 20〜30 に増やす。`0.0` で慣性を無効化（legacy: freeze=位置固定）。 |

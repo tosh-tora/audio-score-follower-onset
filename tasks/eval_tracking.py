@@ -145,7 +145,7 @@ def main() -> int:
         n_common = min(cens.shape[1], onset_raw.shape[0])
         cens = cens[:, :n_common]
         onset_all = onset_raw[:n_common]
-        normalizer = OnsetNormalizer(max(1, int(5.0 * frame_rate)))
+        normalizer = OnsetNormalizer.for_config(cfg)
 
     n_frames = cens.shape[1]
     logger.info("Feeding %d frames (%.1fs) at max speed …",

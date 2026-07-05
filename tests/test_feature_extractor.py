@@ -6,12 +6,10 @@ import numpy as np
 import pytest
 
 from audio_score_follower.core.feature_extractor import (
-    AudioFeatures,
     FeatureConfig,
     OnsetNormalizer,
     compute_cens,
     compute_onset,
-    cosine_cost_matrix,
     fused_local_cost,
     normalize_onset_global,
 )
@@ -54,25 +52,6 @@ def test_cens_rejects_multichannel():
     bad = np.zeros((2, 1000), dtype=np.float32)
     with pytest.raises(ValueError, match="1D mono"):
         compute_cens(bad, cfg)
-
-
-def test_cosine_cost_matrix_self_zero():
-    """A sequence aligned with itself has zero cost on the diagonal."""
-    a = np.zeros((12, 5), dtype=np.float32)
-    for j in range(5):
-        a[j, j] = 1.0  # one-hot, distinct per column
-    cost = cosine_cost_matrix(a, a)
-    assert cost.shape == (5, 5)
-    np.testing.assert_allclose(np.diag(cost), 0.0, atol=1e-6)
-    # Off-diagonal must be 1.0 (orthogonal one-hots).
-    assert cost[0, 1] == pytest.approx(1.0, abs=1e-6)
-
-
-def test_cosine_cost_matrix_dimension_check():
-    a = np.zeros((11, 3), dtype=np.float32)
-    b = np.zeros((12, 3), dtype=np.float32)
-    with pytest.raises(ValueError, match="12-d"):
-        cosine_cost_matrix(a, b)
 
 
 # ================================================================ onset tests
@@ -145,6 +124,14 @@ def test_onset_normalizer_reset():
     assert result == pytest.approx(1.0 / (1.0 + 1e-8), abs=1e-5)
 
 
+def test_onset_normalizer_for_config_window():
+    from audio_score_follower.core.feature_extractor import LIVE_ONSET_WINDOW_SEC
+
+    cfg = FeatureConfig()  # 22050/2048 → 10.766 Hz
+    n = OnsetNormalizer.for_config(cfg)
+    assert n._buf.maxlen == max(1, int(LIVE_ONSET_WINDOW_SEC * cfg.effective_frame_rate()))
+
+
 # ================================================================ fused_local_cost tests
 
 def test_fused_local_cost_cens_only_no_onset():
@@ -179,11 +166,3 @@ def test_fused_local_cost_fusion_active():
 
     got = fused_local_cost(ref_block, live, ref_onset, live_onset, 0.7, 0.3)
     np.testing.assert_allclose(got, expected, atol=1e-5)
-
-
-def test_audio_features_aligned_truncate():
-    cens = np.zeros((12, 10), dtype=np.float32)
-    onset = np.zeros(11, dtype=np.float32)  # one extra frame
-    af = AudioFeatures(cens=cens, onset=onset).aligned_truncate()
-    assert af.cens.shape[1] == 10
-    assert af.onset is not None and af.onset.shape[0] == 10

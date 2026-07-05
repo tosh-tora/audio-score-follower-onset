@@ -191,6 +191,7 @@ class WarpLookup:
             float(self.ref_times[-1]),
             1.0,
         )
+        slope_per_sec: Optional[np.ndarray] = None
         if len(sample_ref) >= 2:
             sample_score = np.interp(sample_ref, self.ref_times, self.score_times)
             slope_per_sec = np.diff(sample_score)  # score_seconds per 1 ref_second
@@ -228,9 +229,7 @@ class WarpLookup:
         logger.info(
             "Warp path validation OK: slope_max=%.2f×, "
             "coverage=%d/%d measures",
-            float(np.max(np.diff(
-                np.interp(sample_ref, self.ref_times, self.score_times)
-            ))) if len(sample_ref) >= 2 else 0.0,
+            float(np.max(slope_per_sec)) if slope_per_sec is not None else 0.0,
             warp_last_measure, xml_total_measures,
         )
 

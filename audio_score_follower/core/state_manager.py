@@ -3,7 +3,9 @@
 state_manager.py - Thread-Safe Central State Store
 
 Manages all application state with proper locking.
-Signals UI updates via event mechanism.
+The GUI reads state via a 100ms Tk-timer poll of get_all() (see
+ui/gui_tkinter.py FollowerGUI._poll_state) rather than an event/wait
+mechanism.
 """
 
 import logging
@@ -47,14 +49,8 @@ class AppState:
         self.confidence: float = 0.0
 
         # Trigger/cooldown state
-        self.last_trigger_measure: Optional[int] = None
-        self.last_trigger_time: Optional[float] = None
         self.next_trigger_measure: Optional[int] = None
         self.cooldown_active: bool = False
-
-        # Inertia mode (fallback when confidence is low)
-        self.inertia_mode: bool = False
-        self.inertia_tempo_bpm: Optional[float] = None
 
         # OLTW lock-in / inertia state — mirrored from OnlineDTWFollower
         # by the result callback so the GUI tracking panel can render
@@ -84,9 +80,6 @@ class AppState:
         # Always False in wav/loopback modes (auto-start).
         self.waiting_for_start: bool = False
 
-        # UI update signaling
-        self.ui_update_event = threading.Event()
-
     def get_all(self) -> dict:
         """
         Atomically get snapshot of all state.
@@ -106,10 +99,8 @@ class AppState:
                 'measure': self.current_measure,
                 'beat_in_measure': self.current_beat_in_measure,
                 'confidence': self.confidence,
-                'inertia_mode': self.inertia_mode,
                 'cooldown_active': self.cooldown_active,
                 'next_trigger_measure': self.next_trigger_measure,
-                'last_trigger_measure': self.last_trigger_measure,
                 'mic_level_db': self.mic_level_db,
                 'silence_gate_active': self.silence_gate_active,
                 'mic_monitor_available': self.mic_monitor_available,
@@ -137,14 +128,11 @@ class AppState:
                 (e.g. 1.0 = downbeat, 2.5 = midway through the second beat).
                 Caller is responsible for converting from the score's
                 0-indexed offset to 1-indexed for display.
-
-        Triggers UI update event.
         """
         with self._lock:
             self.current_beat = beat
             self.current_measure = measure
             self.current_beat_in_measure = beat_in_measure
-        self.ui_update_event.set()
 
     def set_confidence(self, confidence: float):
         """
@@ -155,7 +143,6 @@ class AppState:
         """
         with self._lock:
             self.confidence = max(0.0, min(1.0, confidence))
-        self.ui_update_event.set()
 
     def set_movement(
         self,
@@ -186,25 +173,8 @@ class AppState:
             self.current_measure = 1
             self.current_beat_in_measure = 1.0
             self.confidence = 0.0
-            self.inertia_mode = False
             self.cooldown_active = False
-            self.last_trigger_measure = None
             self.next_trigger_measure = None
-        self.ui_update_event.set()
-
-    def set_inertia_mode(self, active: bool, tempo_bpm: Optional[float] = None):
-        """
-        Activate/deactivate inertia mode.
-
-        Args:
-            active: True to activate
-            tempo_bpm: Estimated tempo (for extrapolation)
-        """
-        with self._lock:
-            self.inertia_mode = active
-            if tempo_bpm is not None:
-                self.inertia_tempo_bpm = tempo_bpm
-        self.ui_update_event.set()
 
     def set_mic_level(
         self,
@@ -226,19 +196,16 @@ class AppState:
             self.mic_level_db = level_db
             self.silence_gate_active = gate_active
             self.mic_monitor_available = monitor_available
-        self.ui_update_event.set()
 
     def set_silence_threshold(self, threshold_db: Optional[float]):
         """Record the configured silence-gate threshold for GUI display."""
         with self._lock:
             self.silence_threshold_db = threshold_db
-        self.ui_update_event.set()
 
     def set_waiting_for_start(self, waiting: bool):
         """Update the mic-mode manual-start waiting flag."""
         with self._lock:
             self.waiting_for_start = waiting
-        self.ui_update_event.set()
 
     def set_follower_mode(
         self,
@@ -258,13 +225,11 @@ class AppState:
             self.is_in_inertia = is_in_inertia
             self.inertia_elapsed_sec = inertia_elapsed_sec
             self.inertia_cap_sec = inertia_cap_sec
-        self.ui_update_event.set()
 
     def set_load_error(self, message: str) -> None:
         """Record a movement-load failure message for GUI display."""
         with self._lock:
             self.load_error = message
-        self.ui_update_event.set()
 
     def set_next_trigger(self, measure_num: Optional[int]):
         """
@@ -275,7 +240,6 @@ class AppState:
         """
         with self._lock:
             self.next_trigger_measure = measure_num
-        self.ui_update_event.set()
 
     def activate_cooldown(self, duration_sec: float):
         """
@@ -288,7 +252,6 @@ class AppState:
         """
         with self._lock:
             self.cooldown_active = True
-            self.last_trigger_time = time.time()
 
         # Timer to auto-clear
         def clear_cooldown():
@@ -296,17 +259,15 @@ class AppState:
             self.deactivate_cooldown()
 
         threading.Timer(duration_sec, clear_cooldown).start()
-        self.ui_update_event.set()
 
     def deactivate_cooldown(self):
         """Deactivate cooldown."""
         with self._lock:
             self.cooldown_active = False
-        self.ui_update_event.set()
 
     def __repr__(self) -> str:
         state = self.get_all()
         return (
             f"AppState(measure={state['measure']}, beat={state['beat']:.1f}, "
-            f"confidence={state['confidence']:.2f}, inertia={state['inertia_mode']})"
+            f"confidence={state['confidence']:.2f})"
         )

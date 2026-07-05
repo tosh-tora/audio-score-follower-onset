@@ -61,30 +61,7 @@ from audio_score_follower.core.oltw_follower import (
     OnlineDTWFollower,
 )
 from audio_score_follower.core.score_mapper import ScoreMapper
-from audio_score_follower.core.slide_controller import SlideController
-
-
-class _NullSlideController:
-    """No-op slide controller used when --slide-url is omitted (dry-run / test mode)."""
-
-    def start(self) -> None:
-        logger.info("[dry-run] SlideController: start (no browser)")
-
-    def wait_ready(self, timeout: float = 30.0) -> bool:  # noqa: ARG002
-        return True
-
-    def stop(self) -> None:
-        logger.info("[dry-run] SlideController: stop")
-
-    def press(self, action: str) -> None:
-        # No log here — the canonical "slide press" log is emitted by
-        # AudioScoreFollowerApp._execute_action so it can include the
-        # source tag (manual/auto) and the triggering measure.
-        return None
-
-    @property
-    def last_error(self) -> None:
-        return None
+from audio_score_follower.core.slide_controller import NullSlideController, SlideController
 from audio_score_follower.core.state_manager import AppState
 from audio_score_follower.core.warp_lookup import (
     WarpLookup,
@@ -103,6 +80,9 @@ _GATE_POLL_MS = 50
 # preceding user seek. At 200 BPM 4/4 with 4× warp slope (the build-time
 # limit) the measure advances <1 per 0.093s frame — so jumps >3 are anomalous.
 _MAX_FRAME_MEASURE_JUMP = 3
+# Suppress the jump-anomaly alert for this long after a user-initiated seek
+# (jumps right after a seek are expected, not a warp path anomaly).
+_SEEK_GRACE_SEC = 2.0
 # Minimum smoothed OLTW confidence before triggers are allowed to fire.
 # Acts as the "lock-in" condition that InertiaEngine provided in
 # live-score-sync; below this, alignment hasn't stabilised yet and
@@ -182,8 +162,6 @@ class AudioScoreFollowerApp:
         # path anomaly.
         self._prev_oltw_measure: int = 0
         self._last_seek_time: float = 0.0
-        _SEEK_GRACE_SEC = 2.0  # suppress jump alert for this long after a seek
-        self._SEEK_GRACE_SEC = _SEEK_GRACE_SEC
 
         if slide_url:
             self.slide_controller = SlideController(slide_url=slide_url)
@@ -192,7 +170,7 @@ class AudioScoreFollowerApp:
                 "--slide-url 未指定: ドライランモードで起動します。"
                 "スライドは操作されません。"
             )
-            self.slide_controller = _NullSlideController()  # type: ignore[assignment]
+            self.slide_controller = NullSlideController()  # type: ignore[assignment]
 
         # Tk root + GUI (built before worker so update callbacks have
         # something to push into).
@@ -200,7 +178,7 @@ class AudioScoreFollowerApp:
         self.gui = FollowerGUI(
             self.root,
             self.state,
-            on_force_lock_in=self.manual_start,
+            on_start=self.manual_start,
         )
 
         self._workers_stop = threading.Event()
@@ -516,7 +494,7 @@ class AudioScoreFollowerApp:
         if (
             jump > _MAX_FRAME_MEASURE_JUMP
             and self._prev_oltw_measure != 0  # skip first frame (initialisation)
-            and (time.monotonic() - self._last_seek_time) > self._SEEK_GRACE_SEC
+            and (time.monotonic() - self._last_seek_time) > _SEEK_GRACE_SEC
         ):
             logger.error(
                 "異常な小節ジャンプを検出: %d → %d (+%d 小節) at ref_t=%.2fs。"

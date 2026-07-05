@@ -162,13 +162,6 @@ class ConfigLoader:
         logger.warning("Already at last movement")
         return False
 
-    def previous_movement(self) -> bool:
-        if self.current_movement_idx > 0:
-            self.current_movement_idx -= 1
-            return True
-        logger.warning("Already at first movement")
-        return False
-
     def get_cooldown_seconds(self) -> float:
         return self.settings.get("cooldown_seconds", 3.0)
 
@@ -350,8 +343,6 @@ class ConfigLoader:
             # overriding with inertia would degrade alt-recording
             # coverage. Exited via _maybe_resync_from_dp when DP
             # confidence recovers within inertia_resync_max_gap_frames.
-            # inertia_enter_frames is reserved for future use.
-            "inertia_enter_frames": 5,
             "inertia_exit_frames": 3,
             # Position-history window for inertia-rate estimation.
             # 40 frames ≈ 3.7s — long enough to smooth out beat-to-beat
@@ -408,41 +399,6 @@ class ConfigLoader:
         dummy = cls.__new__(cls)
         dummy.settings = {}
         return dummy.get_oltw_kwargs()
-
-    def get_movement_triggers(self, movement_id: Optional[int] = None) -> List[Dict]:
-        if movement_id is None:
-            movement = self.get_current_movement()
-        else:
-            movement = next(
-                (m for m in self.movements if m.get("id") == movement_id), None
-            )
-        if movement:
-            return sorted(movement.get("triggers", []), key=lambda t: t.get("measure", 0))
-        return []
-
-    def get_xml_file_for_movement(
-        self, movement_idx: Optional[int] = None
-    ) -> Optional[str]:
-        if movement_idx is None:
-            movement = self.get_current_movement()
-        else:
-            if 0 <= movement_idx < len(self.movements):
-                movement = self.movements[movement_idx]
-            else:
-                return None
-        return movement.get("xml_file") if movement else None
-
-    def get_built_dir_for_movement(
-        self, movement_idx: Optional[int] = None
-    ) -> Optional[str]:
-        if movement_idx is None:
-            movement = self.get_current_movement()
-        else:
-            if 0 <= movement_idx < len(self.movements):
-                movement = self.movements[movement_idx]
-            else:
-                return None
-        return movement.get("built_dir") if movement else None
 
     def total_movements(self) -> int:
         return len(self.movements)

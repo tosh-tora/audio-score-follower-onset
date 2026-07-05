@@ -227,3 +227,26 @@ class SlideController:
     def __repr__(self) -> str:  # pragma: no cover — debugging aid
         alive = self._thread is not None and self._thread.is_alive()
         return f"SlideController(url={self.slide_url!r}, running={alive})"
+
+
+class NullSlideController:
+    """No-op slide controller used when --slide-url is omitted (dry-run / test mode)."""
+
+    def start(self) -> None:
+        logger.info("[dry-run] SlideController: start (no browser)")
+
+    def wait_ready(self, timeout: float = 30.0) -> bool:  # noqa: ARG002
+        return True
+
+    def stop(self) -> None:
+        logger.info("[dry-run] SlideController: stop")
+
+    def press(self, action: str) -> None:
+        # No log here — the canonical "slide press" log is emitted by
+        # AudioScoreFollowerApp._execute_action so it can include the
+        # source tag (manual/auto) and the triggering measure.
+        return None
+
+    @property
+    def last_error(self) -> None:
+        return None

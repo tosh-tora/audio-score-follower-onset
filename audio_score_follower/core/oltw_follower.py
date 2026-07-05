@@ -40,6 +40,16 @@ from audio_score_follower.core.feature_extractor import (
 
 logger = logging.getLogger(__name__)
 
+# ≈0.93 s at default 10.77 Hz frame rate — sustained pure-backward
+# attractor is declared after this many consecutive backward argmins.
+_RAPID_RESET_FRAMES = 10
+# Cost margin between best and second-best DP cell that counts as a
+# fully "decisive" minimum for confidence scoring. Coupled with
+# lock_in_confidence: rescaling this rescales effective confidence.
+_CONFIDENCE_FULL_MARGIN = 0.05
+# Tie-break tolerance for the in-band argmin (float32 noise floor).
+_ARGMIN_TIE_EPS = 1e-6
+
 
 @dataclass
 class FollowResult:
@@ -97,7 +107,6 @@ class OnlineDTWFollower:
         confidence_smoothing: int = 5,
         lock_in_frames: int = 30,
         lock_in_confidence: float = 0.45,
-        inertia_enter_frames: int = 5,
         inertia_exit_frames: int = 3,
         inertia_history_frames: int = 40,
         max_inertia_seconds: float = 10.0,
@@ -232,10 +241,6 @@ class OnlineDTWFollower:
                 the lifetime of this follower (monotonic).
             lock_in_confidence: confidence threshold for lock-in counter
                 and for ``_maybe_resync_from_dp`` recovery. Default 0.45.
-            inertia_enter_frames: number of consecutive low-confidence
-                frames required to enter inertia mode automatically.
-                Default 5. (silence-gate ``freeze()`` enters inertia
-                immediately, bypassing this counter.)
             inertia_exit_frames: number of consecutive high-confidence
                 DP frames required to exit inertia mode via
                 ``_maybe_resync_from_dp``. Default 3.
@@ -427,8 +432,6 @@ class OnlineDTWFollower:
             raise ValueError("lock_in_frames must be >= 0")
         if not 0.0 <= lock_in_confidence <= 1.0:
             raise ValueError("lock_in_confidence must be in [0, 1]")
-        if inertia_enter_frames < 1:
-            raise ValueError("inertia_enter_frames must be >= 1")
         if inertia_exit_frames < 1:
             raise ValueError("inertia_exit_frames must be >= 1")
         if inertia_history_frames < 2:
@@ -438,7 +441,6 @@ class OnlineDTWFollower:
 
         self._lock_in_frames = int(lock_in_frames)
         self._lock_in_confidence = float(lock_in_confidence)
-        self._inertia_enter_frames = int(inertia_enter_frames)
         self._inertia_exit_frames = int(inertia_exit_frames)
         self._inertia_history_frames = int(inertia_history_frames)
         self._max_inertia_seconds = float(max_inertia_seconds)
@@ -524,7 +526,7 @@ class OnlineDTWFollower:
 
         Args:
             live_cens_frame: (12,) float32, L2-normalised. Pass a single
-                column from ``compute_cens_streaming`` output.
+                column from ``compute_cens`` output.
             live_onset_frame: scalar normalised onset for this frame, or
                 None. When fusion is enabled and this is None, the frame
                 silently falls back to CENS-only cost for this step.
@@ -624,6 +626,66 @@ class OnlineDTWFollower:
             dp_ref_frame=best,
         )
 
+    def _probe_decisive_forward_match(
+        self,
+        live: np.ndarray,
+        min_pos: int,
+        max_pos: int,
+        current_cost: float,
+        *,
+        log_tag: str,
+    ) -> Optional[tuple[int, float, float, float]]:
+        """Search ``[min_pos, max_pos)`` for a "decisively better" forward match.
+
+        Shared by ``_try_global_rematch`` and ``_try_post_seek_catchup``:
+        both need "find the best local-cost position in a forward
+        window, but only trust it if it clearly beats both the current
+        position AND the typical forward position" — two guards:
+
+        1. The candidate beats ``current_cost`` by at least
+           ``stuck_rematch_cost_margin`` (do something only if it helps).
+        2. The candidate beats the median forward cost by at least
+           ``stuck_rematch_min_discriminability_ratio`` (don't trust the
+           "best" when many candidates are essentially tied — that's
+           the signature of a non-discriminative chroma profile, e.g.
+           a different orchestration of the same theme, and the global
+           argmin is then dominated by chance / self-similarity).
+
+        Returns ``(new_pos, best_cost, ratio, median_cost)`` on success,
+        or ``None`` if either guard rejects the window.
+        """
+        if max_pos <= min_pos:
+            return None
+        costs = self._local_cost_block(min_pos, max_pos, live)
+        best_offset = int(np.argmin(costs))
+        best_cost = float(costs[best_offset])
+
+        # Guard 1: must beat the current position.
+        if current_cost - best_cost < self._stuck_rematch_cost_margin:
+            return None
+
+        # Guard 2: the best must stand out RELATIVE to typical forward
+        # positions, not just by an absolute margin. Use a ratio so the
+        # threshold is meaningful whether absolute costs are tiny (perfect
+        # match exists) or large (mic capture of a different performance).
+        # An absolute margin alone misclassifies both ends: it rejects
+        # clean perfect matches whose median is also low (lead-time
+        # scenario), and accepts ambiguous mic matches whose median is
+        # moderate (the false-jump scenario).
+        median_cost = float(np.median(costs))
+        if median_cost <= 0:
+            return None  # degenerate; nothing to compare against
+        ratio = (median_cost - best_cost) / median_cost
+        if ratio < self._stuck_rematch_min_discriminability_ratio:
+            logger.debug(
+                "OLTW %s: skipping jump, low discriminability "
+                "ratio %.2f (best %.3f, median %.3f)",
+                log_tag, ratio, best_cost, median_cost,
+            )
+            return None
+
+        return min_pos + best_offset, best_cost, ratio, median_cost
+
     def _try_global_rematch(self, live: np.ndarray, current_local_cost: float) -> bool:
         """If a forward position has a much better local match, jump there.
 
@@ -649,37 +711,14 @@ class OnlineDTWFollower:
         max_jump_pos = min(
             self._N, self._current_ref_pos + self._stuck_rematch_max_jump_frames + 1
         )
-        if max_jump_pos <= min_jump_pos:
+        probe = self._probe_decisive_forward_match(
+            live, min_jump_pos, max_jump_pos, current_local_cost,
+            log_tag="stuck-rematch",
+        )
+        if probe is None:
             return False
-        global_costs = self._local_cost_block(min_jump_pos, max_jump_pos, live)
-        best_offset = int(np.argmin(global_costs))
-        best_cost = float(global_costs[best_offset])
+        new_pos, best_cost, discriminability_ratio, median_cost = probe
 
-        # Guard 1: must beat the current position.
-        if current_local_cost - best_cost < self._stuck_rematch_cost_margin:
-            return False
-
-        # Guard 2: the best must stand out RELATIVE to typical forward
-        # positions, not just by an absolute margin. Use a ratio so the
-        # threshold is meaningful whether absolute costs are tiny (perfect
-        # match exists) or large (mic capture of a different performance).
-        # An absolute margin alone misclassifies both ends: it rejects
-        # clean perfect matches whose median is also low (lead-time
-        # scenario), and accepts ambiguous mic matches whose median is
-        # moderate (the false-jump scenario).
-        median_cost = float(np.median(global_costs))
-        if median_cost <= 0:
-            return False  # degenerate; nothing to compare against
-        discriminability_ratio = (median_cost - best_cost) / median_cost
-        if discriminability_ratio < self._stuck_rematch_min_discriminability_ratio:
-            logger.debug(
-                "OLTW stuck-rematch: skipping jump, low discriminability "
-                "ratio %.2f (best %.3f, median %.3f)",
-                discriminability_ratio, best_cost, median_cost,
-            )
-            return False
-
-        new_pos = min_jump_pos + best_offset
         logger.info(
             "OLTW stuck-rematch: jumping ref_frame %d→%d "
             "(local cost %.3f→%.3f, discrim_ratio %.2f, median %.3f)",
@@ -688,12 +727,7 @@ class OnlineDTWFollower:
             discriminability_ratio, median_cost,
         )
         # Reseed DP: clear cumulative history, anchor at the new position.
-        self._D_prev[:] = np.inf
-        self._D_prev[new_pos] = best_cost
-        self._prev_band_lo = new_pos
-        self._prev_band_hi = new_pos + 1
-        self._current_ref_pos = new_pos
-        self._display_ref_pos = float(new_pos)  # intentional teleport: snap
+        self._anchor_dp_at(new_pos, best_cost)
         return True
 
     def _process_subsequent_frame(self, live: np.ndarray) -> FollowResult:
@@ -812,7 +846,7 @@ class OnlineDTWFollower:
         # argmin within [0, max_band_idx]
         capped_band = D_curr_band_arr[: max_band_idx + 1]
         min_cost = float(capped_band.min())
-        candidates = np.where(capped_band <= min_cost + 1e-6)[0]
+        candidates = np.where(capped_band <= min_cost + _ARGMIN_TIE_EPS)[0]
         best_in_band = int(candidates.max())
         new_pos = lo + best_in_band
         local_cost_at_best = float(local_costs[best_in_band])
@@ -848,7 +882,6 @@ class OnlineDTWFollower:
         # place). Wipe backward memory immediately rather than waiting
         # for the full stuck_dp_reset_seconds window (which can delay
         # recovery by 12–24 s in live performances).
-        _RAPID_RESET_FRAMES = 10  # ≈0.93 s at default 10.77 Hz frame rate
         if (
             self._stuck_dp_reset_frames > 0
             and self._consecutive_backward_frames >= _RAPID_RESET_FRAMES
@@ -953,8 +986,8 @@ class OnlineDTWFollower:
             sorted_costs = np.sort(D_curr_band_arr)
             margin = float(sorted_costs[1] - sorted_costs[0])
         else:
-            margin = 0.05  # degenerate band: treat as decisive
-        margin_score = min(1.0, margin / 0.05)  # 0.05 of cost diff = full score
+            margin = _CONFIDENCE_FULL_MARGIN  # degenerate band: treat as decisive
+        margin_score = min(1.0, margin / _CONFIDENCE_FULL_MARGIN)
         confidence = max(0.0, min(1.0, match_score * (0.3 + 0.7 * margin_score)))
 
         # ---- lock-in + inertia bookkeeping -----------------------------
@@ -1418,6 +1451,23 @@ class OnlineDTWFollower:
             " [catchup armed]" if allow_catchup else "",
         )
 
+    def _anchor_dp_at(self, ref_frame: int, seed_cost: float) -> None:
+        """Wipe D_prev, re-anchor at ``ref_frame`` with ``seed_cost``, and
+        snap the display position.
+
+        lock-free helper: same calling convention as ``_reseed_at``
+        (call from within ``process_frame``, or while ``_state_lock``
+        is already held). Shared by every intentional-teleport path
+        (rematch / post-seek catchup / ``_reseed_at``) so the "reseed
+        + band collapse + snap" invariant lives in one place.
+        """
+        self._D_prev[:] = np.inf
+        self._D_prev[ref_frame] = seed_cost
+        self._prev_band_lo = ref_frame
+        self._prev_band_hi = ref_frame + 1
+        self._current_ref_pos = ref_frame
+        self._display_ref_pos = float(ref_frame)  # intentional teleport: snap
+
     def _reseed_at(self, ref_frame: int) -> None:
         """Re-anchor the DP at ``ref_frame`` with a fresh cost field.
 
@@ -1427,12 +1477,7 @@ class OnlineDTWFollower:
         ``seek()`` call from there would deadlock (``threading.Lock``
         is non-reentrant). Keep any new teleport paths on this helper.
         """
-        self._D_prev[:] = np.inf
-        self._D_prev[ref_frame] = 0.0
-        self._prev_band_lo = ref_frame
-        self._prev_band_hi = ref_frame + 1
-        self._current_ref_pos = ref_frame
-        self._display_ref_pos = float(ref_frame)  # intentional teleport: snap
+        self._anchor_dp_at(ref_frame, 0.0)
         # If we haven't processed any live frame yet, the next call
         # would otherwise go through the (init_search_width-limited)
         # first-frame path and overwrite our re-anchor. Bumping the
@@ -1473,31 +1518,15 @@ class OnlineDTWFollower:
         """
         min_jump_pos = self._current_ref_pos + 1
         max_jump_pos = min(self._N, self._current_ref_pos + self._search_width + 1)
-        if max_jump_pos <= min_jump_pos:
-            return False
-        global_costs = self._local_cost_block(min_jump_pos, max_jump_pos, live)
-        best_offset = int(np.argmin(global_costs))
-        best_cost = float(global_costs[best_offset])
         current_cost = self._local_cost_scalar(self._current_ref_pos, live)
-
-        # Guard 1: must beat the current position.
-        if current_cost - best_cost < self._stuck_rematch_cost_margin:
+        probe = self._probe_decisive_forward_match(
+            live, min_jump_pos, max_jump_pos, current_cost,
+            log_tag="post-seek catchup",
+        )
+        if probe is None:
             return False
+        new_pos, best_cost, ratio, median_cost = probe
 
-        # Guard 2: relative discriminability.
-        median_cost = float(np.median(global_costs))
-        if median_cost <= 0:
-            return False
-        ratio = (median_cost - best_cost) / median_cost
-        if ratio < self._stuck_rematch_min_discriminability_ratio:
-            logger.debug(
-                "OLTW post-seek catchup: skipping, low discriminability "
-                "ratio %.2f (best %.3f, median %.3f)",
-                ratio, best_cost, median_cost,
-            )
-            return False
-
-        new_pos = min_jump_pos + best_offset
         logger.info(
             "OLTW post-seek catchup: %d→%d (local cost %.3f→%.3f, "
             "discrim_ratio %.2f, +%.2fs forward)",
@@ -1505,87 +1534,7 @@ class OnlineDTWFollower:
             (new_pos - self._current_ref_pos) / self._cfg.effective_frame_rate(),
         )
         # Re-seed DP at the corrected position.
-        self._D_prev[:] = np.inf
-        self._D_prev[new_pos] = best_cost
-        self._prev_band_lo = new_pos
-        self._prev_band_hi = new_pos + 1
-        self._current_ref_pos = new_pos
-        self._display_ref_pos = float(new_pos)  # intentional teleport: snap
-        return True
-
-    def _try_rapid_reset_catchup(
-        self, live: np.ndarray, lag_frames: int
-    ) -> bool:
-        """Close the live-vs-ref lag accumulated during a rapid-reset stall.
-
-        Context: when a rapid DP reset fires, the DP has held position
-        for ``lag_frames`` consecutive backward-attempt frames while the
-        live audio kept playing. The actual music position is therefore
-        most likely ~lag_frames frames ahead of the stall point. Without
-        this catchup, the DP resumes from the stall position and tracks
-        forward at 1:1 rate — *permanently* leaving the lag in place,
-        which can accumulate across multiple stalls (observed: 5.3 s
-        cumulative lag → piece ends ~2 measures short).
-
-        Approach: probe a *tightly bounded* forward window
-        ``[current+1, current + 1.5×lag_frames]`` for a clearly better
-        local match. The tight bound (≈2 s in the worst case) means
-        overshoot risk is small enough that the strict discriminability
-        ratio used by ``_try_post_seek_catchup`` (designed for the full
-        search_width window) is not needed — a simple cost-margin guard
-        suffices to reject "music actually paused, stay put" cases.
-
-        Args:
-            live: current live chroma frame.
-            lag_frames: number of consecutive backward-attempt frames at
-                the moment the rapid reset fired.
-
-        Returns:
-            True if a catchup jump was performed.
-        """
-        # 1.5× lag (with a floor of 1) covers both 1:1 rate music and
-        # modest tempo variation; capped by the search band so we never
-        # leave the DP's known good range.
-        max_lookahead = min(
-            max(1, lag_frames + lag_frames // 2),
-            self._search_width,
-        )
-        min_jump_pos = self._current_ref_pos + 1
-        max_jump_pos = min(self._N, self._current_ref_pos + max_lookahead + 1)
-        if max_jump_pos <= min_jump_pos:
-            return False
-
-        local_costs = self._local_cost_block(min_jump_pos, max_jump_pos, live)
-        best_offset = int(np.argmin(local_costs))
-        best_cost = float(local_costs[best_offset])
-        current_cost = self._local_cost_scalar(self._current_ref_pos, live)
-
-        # Only jump if the forward match is meaningfully better than the
-        # stall position. If the music actually paused during the stall,
-        # current_cost will be comparable to best_cost and we stay put.
-        if current_cost - best_cost < self._stuck_rematch_cost_margin:
-            logger.debug(
-                "OLTW rapid-reset catchup: skipping, no clear forward "
-                "improvement (current %.3f, best %.3f, lag=%d)",
-                current_cost, best_cost, lag_frames,
-            )
-            return False
-
-        new_pos = min_jump_pos + best_offset
-        logger.info(
-            "OLTW rapid-reset catchup: %d→%d (cost %.3f→%.3f, +%d frames, "
-            "lag=%d)",
-            self._current_ref_pos, new_pos,
-            current_cost, best_cost,
-            new_pos - self._current_ref_pos, lag_frames,
-        )
-        # Re-seed DP at the corrected position (mirrors post_seek_catchup).
-        self._D_prev[:] = np.inf
-        self._D_prev[new_pos] = best_cost
-        self._prev_band_lo = new_pos
-        self._prev_band_hi = new_pos + 1
-        self._current_ref_pos = new_pos
-        self._display_ref_pos = float(new_pos)  # intentional teleport: snap
+        self._anchor_dp_at(new_pos, best_cost)
         return True
 
     def reset(self) -> None:

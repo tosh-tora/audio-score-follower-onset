@@ -38,7 +38,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,115 +52,14 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# Allow running this script directly (not installed as a package) while
+# still importing the shared FluidSynth/SoundFont locator.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-_FLUIDSYNTH_FIXED_CANDIDATES = [
-    Path(r"C:\Program Files\FluidSynth\bin\fluidsynth.exe"),
-    Path(r"C:\ProgramData\chocolatey\bin\fluidsynth.exe"),
-    Path("/usr/bin/fluidsynth"),
-    Path("/usr/local/bin/fluidsynth"),
-    Path("/opt/homebrew/bin/fluidsynth"),
-]
-
-_SF_CANDIDATES = [
-    Path(r"C:\Program Files\MuseScore 4\sound\MS Basic.sf3"),
-    Path(r"C:\Program Files\MuseScore 3\sound\MuseScore_General.sf3"),
-    Path(r"C:\Program Files\MuseScore 3\sound\MuseScore_General.sf2"),
-    Path("/usr/share/sounds/sf2/default.sf2"),
-    Path("/usr/share/soundfonts/default.sf2"),
-    Path("/opt/homebrew/share/soundfonts/default.sf2"),
-]
-
-
-def find_fluidsynth(explicit: Optional[Path] = None) -> Path:
-    """FluidSynth 実行ファイルを発見する。
-
-    優先順:
-        1. explicit 引数 (--fluidsynth-exe)
-        2. 環境変数 FLUIDSYNTH_EXE
-        3. PATH 上の fluidsynth
-        4. 既知のインストール先
-    """
-    if explicit is not None:
-        if not explicit.exists():
-            raise FileNotFoundError(f"--fluidsynth-exe が存在しません: {explicit}")
-        return explicit
-
-    # Project-local vendor directory (most reliable — no sandbox/virtualization issues)
-    repo_root = Path(__file__).resolve().parents[1]
-    vendor_dir = repo_root / "vendor" / "FluidSynth"
-    if vendor_dir.exists():
-        for p in sorted(vendor_dir.glob("*/bin/fluidsynth.exe")):
-            if p.exists():
-                return p
-
-    env = os.environ.get("FLUIDSYNTH_EXE")
-    if env:
-        p = Path(env)
-        if p.exists():
-            return p
-        logger.warning("FLUIDSYNTH_EXE=%s が見つからない — 他の候補を探す", env)
-
-    which = shutil.which("fluidsynth")
-    if which:
-        return Path(which)
-
-    # Search LocalAppData via multiple methods — env vars can be unreliable.
-    local_appdata_candidates: list[Path] = []
-    local_appdata_candidates.append(Path.home() / "AppData" / "Local")
-    userprofile = os.environ.get("USERPROFILE", "")
-    if userprofile:
-        local_appdata_candidates.append(Path(userprofile) / "AppData" / "Local")
-    for parent in Path(sys.executable).resolve().parents:
-        if parent.name.lower() == "local" and parent.parent.name.lower() == "appdata":
-            local_appdata_candidates.append(parent)
-            break
-    for local_appdata in local_appdata_candidates:
-        for p in sorted((local_appdata / "FluidSynth").glob("*/bin/fluidsynth.exe")):
-            if p.exists():
-                return p
-
-    for cand in _FLUIDSYNTH_FIXED_CANDIDATES:
-        if cand.exists():
-            return cand
-
-    raise FileNotFoundError(
-        "FluidSynth 実行ファイルが見つかりません。\n"
-        "  1. https://github.com/FluidSynth/fluidsynth/releases から Windows バイナリを取得\n"
-        "  2. または環境変数 FLUIDSYNTH_EXE に絶対パスを設定\n"
-        "  3. または --fluidsynth-exe フラグで明示"
-    )
-
-
-def find_sf_file(explicit: Optional[Path] = None) -> Path:
-    """SF2/SF3 サウンドフォントファイルを発見する。
-
-    優先順:
-        1. explicit 引数 (--sf-file)
-        2. 環境変数 SF_FILE
-        3. 既知のインストール先 (MuseScore 4 付属 MS Basic.sf3 等)
-    """
-    if explicit is not None:
-        if not explicit.exists():
-            raise FileNotFoundError(f"--sf-file が存在しません: {explicit}")
-        return explicit
-
-    env = os.environ.get("SF_FILE")
-    if env:
-        p = Path(env)
-        if p.exists():
-            return p
-        logger.warning("SF_FILE=%s が見つからない — 他の候補を探す", env)
-
-    for cand in _SF_CANDIDATES:
-        if cand.exists():
-            return cand
-
-    raise FileNotFoundError(
-        "SF2/SF3 サウンドフォントが見つかりません。\n"
-        "  1. MuseScore 4 をインストールすると MS Basic.sf3 が付属する\n"
-        "  2. または環境変数 SF_FILE に絶対パスを設定\n"
-        "  3. または --sf-file フラグで明示"
-    )
+from audio_score_follower.core.synth_locator import (  # noqa: E402
+    find_fluidsynth,
+    find_soundfont,
+)
 
 
 def preprocess_to_constant_tempo(xml_path: Path, bpm: float):  # -> music21.stream.Score
@@ -341,19 +239,33 @@ def main() -> int:
         return 1
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        fluidsynth = find_fluidsynth(args.fluidsynth_exe)
-        logger.info("FluidSynth: %s", fluidsynth)
-    except FileNotFoundError as exc:
-        logger.error("%s", exc)
+    if args.fluidsynth_exe is not None and not args.fluidsynth_exe.exists():
+        logger.error("--fluidsynth-exe が存在しません: %s", args.fluidsynth_exe)
         return 1
+    fluidsynth = find_fluidsynth(args.fluidsynth_exe)
+    if fluidsynth is None:
+        logger.error(
+            "FluidSynth 実行ファイルが見つかりません。\n"
+            "  1. https://github.com/FluidSynth/fluidsynth/releases から Windows バイナリを取得\n"
+            "  2. または環境変数 FLUIDSYNTH_EXE に絶対パスを設定\n"
+            "  3. または --fluidsynth-exe フラグで明示"
+        )
+        return 1
+    logger.info("FluidSynth: %s", fluidsynth)
 
-    try:
-        sf_file = find_sf_file(args.sf_file)
-        logger.info("SoundFont: %s", sf_file)
-    except FileNotFoundError as exc:
-        logger.error("%s", exc)
+    if args.sf_file is not None and not args.sf_file.exists():
+        logger.error("--sf-file が存在しません: %s", args.sf_file)
         return 1
+    sf_file = find_soundfont(args.sf_file)
+    if sf_file is None:
+        logger.error(
+            "SF2/SF3 サウンドフォントが見つかりません。\n"
+            "  1. MuseScore 4 をインストールすると MS Basic.sf3 が付属する\n"
+            "  2. または環境変数 SF_FILE に絶対パスを設定\n"
+            "  3. または --sf-file フラグで明示"
+        )
+        return 1
+    logger.info("SoundFont: %s", sf_file)
 
     temp_midi: Optional[Path] = None
     temp_wav: Optional[Path] = None
