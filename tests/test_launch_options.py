@@ -327,10 +327,10 @@ class TestReadLauncherSettings:
 class TestComputeSilenceThreshold:
     def test_formula_median_plus_lower_spread_plus_margin(self):
         # Wide ambient fluctuation:
-        # p10≈-68, median=-60 → threshold = -60 + 8 + 3 = -49.0
+        # p10≈-68, median=-60 → threshold = -60 + 8 + 2 = -50.0
         samples = list(np.linspace(-70.0, -50.0, 100))
         result = compute_silence_threshold(samples)
-        assert result.threshold_db == pytest.approx(-49.0, abs=0.3)
+        assert result.threshold_db == pytest.approx(-50.0, abs=0.3)
         assert result.median_db == pytest.approx(-60.0, abs=0.2)
         assert result.p10_db == pytest.approx(-68.0, abs=0.2)
         assert result.count == 100
@@ -343,8 +343,8 @@ class TestComputeSilenceThreshold:
         # governance the floor's false-start protection is redundant.
         samples = list(np.linspace(-60.5, -59.5, 100))  # spread ≈ 0.4dB
         result = compute_silence_threshold(samples)
-        # threshold = median + 0.4 + 3 ≈ -56.6
-        assert result.threshold_db == pytest.approx(-56.6, abs=0.3)
+        # threshold = median + 0.4 + 2 ≈ -57.6
+        assert result.threshold_db == pytest.approx(-57.6, abs=0.3)
 
     def test_robust_to_incidental_spikes(self):
         # 3% loud spikes (a cough) must not move the threshold: median and

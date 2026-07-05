@@ -112,3 +112,16 @@ class TestGateDebounce:
         assert m.is_active()
         m._callback(QUIET, QUIET.shape[0], None, None)
         assert not m.is_active()
+
+    def test_set_threshold_db_updates_gate_decision(self, monitor):
+        # 操作者の ↑/↓ 調整 (main.adjust_silence_threshold) が次のコールバック
+        # から即座に反映されること。
+        m, clock = monitor  # threshold_db=-40.0
+        moderate = _block(10 ** (-45 / 20.0))  # ≈ -45 dBFS: below -40
+        _feed(m, clock, QUIET, 1.0)
+        _feed(m, clock, moderate, 1.0)
+        assert not m.is_active(), "-45 dBFS is below the -40 threshold"
+
+        m.set_threshold_db(-50.0)  # loosen: -45 dBFS is now above threshold
+        _feed(m, clock, moderate, 1.0)
+        assert m.is_active(), "gate must react to the newly-set threshold"

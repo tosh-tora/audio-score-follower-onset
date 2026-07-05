@@ -197,6 +197,15 @@ class AudioLevelMonitor:
         with self._lock:
             return self._current_db
 
+    def set_threshold_db(self, threshold_db: float) -> None:
+        """Update the gate threshold at runtime (operator ↑/↓ adjustment).
+
+        Plain attribute set: ``threshold_db`` is already read unlocked in
+        ``_callback`` (a float assignment/read is atomic under the GIL),
+        so this needs no additional synchronization.
+        """
+        self.threshold_db = float(threshold_db)
+
     # ----------------------------------------------------------- private
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ARG002 — sd signature
         if status:
