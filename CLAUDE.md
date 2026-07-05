@@ -1,8 +1,30 @@
-# Claude 開発ガイダンス (audio-score-follower)
+# Claude 開発ガイダンス (audio-score-follower-onset)
 
 姉妹プロジェクト `live-score-sync` の方針を踏襲しつつ、本プロジェクト固有の事情を追記する。
 
 このファイルは **別セッションの Claude が冷えた状態から仕様を把握するための地図** を兼ねる。「どのファイルが何を担当しているか」「なぜそうなっているか」「触ってはいけない箇所」を網羅すること。
+
+## このシステムが実現すること（目的）
+
+**本番のオーケストラ演奏をマイクでリアルタイム追跡し、指定小節に到達したら Google Slides を自動でページ送りして聴衆向けの解説を表示する。** 追跡アルゴリズム（OLTW）はこの目的のための手段であり、最終出力はスライド操作である。
+
+エンドツーエンドの流れ:
+
+```
+マイク → OLTW 追随 → 小節番号 → トリガー判定 (main._trigger_loop)
+      → SlideController (Playwright/Chromium) → Google Slides にキー送出
+```
+
+### トリガーシステム（main.py + core/cooldown_timer.py + core/slide_controller.py）
+
+- トリガーは `config.json` の `movements[].triggers[]` で定義: `{"measure": N, "action": "right"}`。action は `slide_controller.py` の `_KEY_MAP` でブラウザのキーに変換（`right`→`ArrowRight`、`space`→`Space` 等。未知の action はそのままキー名として送出）
+- 専用スレッド `_trigger_loop` が `_TRIGGER_POLL_HZ` (=20Hz) で現在小節を監視
+- **発火条件**: 現在小節がトリガー小節に一致 **かつ** smoothed confidence ≥ `_TRIGGER_CONFIDENCE_FLOOR` (=0.30) **かつ** `CooldownTimer.should_trigger()`（`settings.cooldown_seconds`、既定 3.0s）が許可 **かつ** その小節が未発火（`_fired_trigger_measures` で重複防止）
+- `_TRIGGER_CONFIDENCE_FLOOR` (0.30) は `lock_in_confidence` (0.45) より意図的に低い: 旧 live-score-sync の InertiaEngine が担っていた「整列が安定するまで発火しない」ガードの代替で、起動直後の measure-1 誤発火だけを防げばよいため
+- `--slide-url` 省略時は `NullSlideController`（no-op）で**ドライラン**起動する。スライドなしで追随のみ検証できる
+- 手動オーバライド: →/Space キーで「次の未発火トリガーへ進めて発火済みにマーク + OLTW を seek」、← で直前の発火を取り消して戻る（発火順は小節順管理）
+
+「**スライドが送られない / 二重に送られる**」系の問題は `_trigger_loop`（main.py）と `CooldownTimer`、Playwright 側の問題は `core/slide_controller.py` を見る。
 
 ## このプロジェクトのコア発想
 
@@ -12,11 +34,16 @@
 
 本プロジェクトは:
 
-1. **オフライン**: スコア合成 WAV (MuseScore 4 CLI でレンダリング) と、実演奏
+1. **オフライン**: スコア合成 WAV (music21 → MIDI → **FluidSynth** でレンダリング) と、実演奏
    (プロ録音 → リハ録音) を **synctoolbox の MrMsDTW** で対応付け、
    `warping_path` (score_time ↔ reference_time) を保存。
 2. **オンライン**: マイク入力を **同じリファレンス録音** に対して Online DTW で追随。
    出力 reference_time を warp で逆引きして score_time → 小節へ。
+3. **特徴量は CENS + onset の融合**（リポ名 `-onset` の由来）: OLTW の局所コストは
+   chroma (CENS) の cosine 距離と spectral-flux onset の絶対差の加重和。
+   自己類似パッセージ（同和声の再現部・反復主題）は chroma を共有するが
+   attack envelope は共有しないため、onset が曖昧性を解消する。
+   詳細は「特徴量の同一性と CENS+onset 融合」参照。
 
 本番 OLTW のリファレンスが「実演奏の音響」になるため、特徴空間の SN 比が劇的に上がる。
 全工程 Windows ネイティブで完結する (WSL2 不要)。
@@ -27,18 +54,22 @@
 |---|---|
 | OLTW のアルゴリズム本体・DP recurrence・lock-in / inertia 状態機械 | `audio_score_follower/core/oltw_follower.py` |
 | 配信される検出結果 (`FollowResult`) の構造 | 同上、ファイル上部 dataclass |
-| 特徴量 (CENS) のパラメータ・抽出経路 | `audio_score_follower/core/feature_extractor.py`（**オフラインビルドと本番が共有する唯一の経路**） |
+| 特徴量 (CENS + onset) のパラメータ・抽出経路・**融合コスト `fused_local_cost` / `OnsetNormalizer`** | `audio_score_follower/core/feature_extractor.py`（**オフラインビルドと本番が共有する唯一の経路**） |
 | ref_time ↔ score_time ↔ measure の変換・**warp path 検証** | `audio_score_follower/core/warp_lookup.py` |
 | マイク dBFS 監視 + silence 判定 | `audio_score_follower/core/audio_level.py` |
 | Tkinter 起動・キーバインド・silence-gate poll・trigger 発火ループ・**ランタイムジャンプ検出** | `audio_score_follower/main.py` |
-| GUI のレイアウト・モード表示・楽章開始ボタン | `audio_score_follower/ui/gui_tkinter.py` |
+| **Google Slides 自動操作**（Playwright/Chromium、キュー経由の thread-safe キー送出、`NullSlideController`） | `audio_score_follower/core/slide_controller.py` |
+| トリガーの小節単位クールダウン（再発火抑止） | `audio_score_follower/core/cooldown_timer.py` |
+| FluidSynth / SoundFont 実行ファイル検出の一本化 | `audio_score_follower/core/synth_locator.py` |
+| `asf-follow` エントリポイント（`main.main()` への薄い shim） | `audio_score_follower/cli/follow.py` |
+| GUI のレイアウト・モード表示・演奏開始ボタン | `audio_score_follower/ui/gui_tkinter.py` |
 | **起動ランチャー GUI**（config 引数なし起動時。デバイス列挙・フォーム） | `audio_score_follower/ui/launcher.py` |
 | 起動オプションの検証・CLI/ランチャー共通ロジック・**`settings.launcher` の永続化** | `audio_score_follower/launch_options.py`（Tk/sounddevice 非依存の純ロジック） |
 | GUI ↔ ワーカースレッド間で共有される atomic 状態 | `audio_score_follower/core/state_manager.py` (`AppState`) |
 | config.json のパース・`oltw_kwargs` デフォルト・**`loopback_device`** | `audio_score_follower/config/loader.py` |
 | マイク (`FollowerWorker`) / ファイル (`FileWorker`) / **WASAPI ループバック** のスレッド管理 | `audio_score_follower/core/follower_worker.py` |
 | オフラインビルド (`asf-build`) + **ビルド時 warp path 検証** + **合成 BPM 自動推定** | `audio_score_follower/cli/build_reference.py` + `core/reference_builder.py` |
-| MuseScore 4 CLI 連携 (合成 WAV 生成) | `tasks/generate_score_wav.py` |
+| スコア合成 WAV 生成 (MusicXML → music21 → MIDI → FluidSynth) | `tasks/generate_score_wav.py` |
 | **追従品質のヘッドレス計測**（カバレッジ / ジャンプ / stall 統計、パラメータ A/B） | `tasks/eval_tracking.py` |
 
 ユーザーが「**ボタンの挙動を変えたい**」と言ったら `ui/gui_tkinter.py` 単発で済むことが多い。「**追随ロジックが暴走する**」なら `core/oltw_follower.py` の DP recurrence と band 計算。「**測度がずれる**」なら `core/warp_lookup.py` か `core/score_mapper.py`。「**マイクで動かない**」なら `core/audio_level.py` と `_check_silence_gate` (main.py)。「**warp path 検証が落ちる**」なら `core/warp_lookup.py` の `validate()` と、スコアの繰り返し構造を確認する。
@@ -58,7 +89,7 @@ lock-in 判定:
 - `_live_frame_idx > init_search_width`（デフォルト 30 フレーム = 冒頭探索完了）
 - かつ **smoothed** confidence ≥ `lock_in_confidence` (=0.45) が `lock_in_frames` (=30) 連続成立
 - **単調ラッチ**（一度立てたら降りない。降ろすには `reset()` のみ）
-- GUI「▶ 楽章開始」ボタン / **L キー** で `force_lock_in()` を呼んで強制的に立てることも可能
+- GUI「▶ 演奏開始」ボタン / **L キー**（= `main.manual_start()`）で強制的に立てることも可能。ただし**マイクモードの初回押下は演奏開始の宣言のみで `force_lock_in()` は呼ばない**（「silence gate / 手動スタート」参照）。2 回目以降の押下・wav/loopback モードで `force_lock_in()` が呼ばれる
 
 ### 慣性 (inertia) のトリガー
 
@@ -78,7 +109,7 @@ lock-in 判定:
 
 **低 conf 適応キャップ**（`low_conf_advance_frames`、デフォルト 0=無効）: 低 conf 連続時に `max_advance_per_frame` を `max(low_conf_advance_min, ceil(rate × low_conf_advance_factor))` に絞る DP 側オプション。前フレームの streak カウンタを使うので DP 再構成なし。幻想4 実測では有意差なしのため無効で出荷。
 
-**計測**: `python tasks/eval_tracking.py --built-dir <dir> --score <mxl> --input-wav <wav> [--oltw-kwargs '{...}']` でヘッドレスにカバレッジ / ジャンプ / stall / 前進 stddev を測る。パラメータ変更の回帰確認はこれで行う（同録音 100% / conf 0.93+、別演奏 97%+ がベースライン。幻想4 実測: slew で別演奏の前進 stddev 0.66→0.42、カバレッジ・conf 無回帰）。
+**計測**: `python tasks/eval_tracking.py --built-dir <dir> --score <mxl> --input-wav <wav> [--oltw-kwargs '{...}']` でヘッドレスにカバレッジ / ジャンプ / stall / 前進 stddev を測る。パラメータ変更の回帰確認はこれで行う（同録音 100% / conf 0.93+、別演奏 97%+ がベースライン。幻想4 実測: slew で別演奏の前進 stddev 0.66→0.42、カバレッジ・conf 無回帰）。**ベースライン数値は幻想4 の特定 built dir / 入力 wav に対する実測値**であり、他曲の絶対基準ではない — 新曲では最初に同録音 / 別演奏の 2 種を流して曲固有のベースラインを取ってから比較する。
 
 **触ってはいけない**: `_advance_inertia()` で `_current_ref_pos` を書き換えると DP の band がずれ、stuck_dp_reset 後の D_prev 初期化が狂って DP が壊れる。過去にこの罠にハマった。
 
@@ -131,7 +162,7 @@ GUI main thread (100ms poll)
        └─ update_display
             └─ _render_follower_mode(state)
                  ├─ mode ラベルの色/文字を切り替え
-                 └─ 「▶ 楽章開始」ボタンを is_locked_in に応じて pack/forget
+                 └─ 「▶ 演奏開始」ボタンを is_locked_in に応じて pack/forget
 ```
 
 手動スタートの待機状態は `state.waiting_for_start`（`set_waiting_for_start()`）で GUI に伝わり、`_render_follower_mode` が「⏸ 開始待ち」表示と「▶ 演奏開始」ボタンを制御する。
@@ -153,7 +184,7 @@ GUI main thread (100ms poll)
 - **修正→実行→確認ループ**: コードを直したら必ず自分で実行する
 - LLM/ツール呼び出し系の修正は `-v` (verbose) で DEBUG ログを見る
 - テストが存在する箇所を触ったら `python -m pytest tests/ -q` を通す（uv は PATH に入っていない環境がある）
-- OLTW を変更したら **少なくとも `tests/test_oltw_follower.py` 全 31 ケース** が通ることを確認
+- OLTW を変更したら **少なくとも `tests/test_oltw_follower.py` の全ケース** が通ることを確認（具体的なテスト数はここに書かない — 腐るため。`pytest tests/test_oltw_follower.py -q` の結果が正）
 
 ### 4. 自律的なバグ修正
 - バグ報告を受けたらそのまま修正する — 手取り足取りの説明は不要
@@ -174,6 +205,8 @@ GUI main thread (100ms poll)
 ## スコア・参照音源の構造整合性（必須前提）
 
 **スコア、参照音源（リファレンス録音）、本番ライブ入力の 3 つは繰り返し構造と総小節数が一致していなければならない。** これが一致しない状態でビルドしても OLTW は正常に追随できない。
+
+**この前提の検出可能範囲に注意**: `スコア ↔ 参照音源` の不一致はビルド時 `validate()` が検出できるが、**`参照音源 ↔ 本番ライブ` の不一致（本番で指揮者がリピートの取り方を変える等）はビルド時にもランタイムにも検出・回復する仕組みがない**。OLTW は黙って stall→rapid reset→誤追随のいずれかに陥る。本番前に「当日の演奏はどのリピートを取るか」を確認し、参照録音と一致しない場合はリピート構造を合わせた参照で再ビルドするのが唯一の対策。
 
 ### なぜ一致が必要か
 
@@ -241,18 +274,30 @@ MusicXML の繰り返し記号 (`<barline><repeat direction="forward/backward"/>
 
 ## このプロジェクト特有の注意点
 
-### 特徴量の同一性
-- オフラインビルドと本番 OLTW で **CENS のパラメータ** (sr, hop_length, win_length, log compression 係数) が完全一致していないと DTW が外れる
+### 特徴量の同一性と CENS+onset 融合
+- オフラインビルドと本番 OLTW で **CENS と onset の両方のパラメータ** (sr, hop_length, win_length, log compression 係数, onset の正規化窓) が完全一致していないと DTW が外れる
 - `audio_score_follower/core/feature_extractor.py` を **唯一の経路** として、両側から呼ぶ
-- パラメータを変えたらビルド済み `reference_cens.npy` も作り直す (`asf-build` を再実行)
+- パラメータを変えたらビルド済み `reference_cens.npy` / `reference_onset.npy` も作り直す (`asf-build` を再実行)
 - `WarpLookup` は `built_dir` から `feature_config` を読んで OLTW に注入する（手で渡さない）
+
+**融合コスト**（`fused_local_cost`、feature_extractor.py）:
+
+```
+cost[k] = chroma_weight × (1 − <cens_ref[:,k], live_cens>)
+        + onset_weight  × |onset_ref[k] − live_onset|
+```
+
+- 重みは `config.json` の `settings.feature_fusion`（`chroma_weight` / `onset_weight`、既定 **0.7 / 0.3**、`ConfigLoader.get_feature_fusion()`）。両方 ≥ 0 かつ和 > 0 が必須（違反時は warning + デフォルトに戻す）
+- 参照側 onset は `asf-build` が `reference_onset.npy`（global-max 正規化済み）として保存。**欠損時は CENS-only に自動フォールバック**（旧ビルドとの後方互換）
+- ライブ側 onset の正規化は `OnsetNormalizer.for_config()`（`LIVE_ONSET_WINDOW_SEC` = 5 秒の rolling-max 窓）に一本化。ワーカーは楽章ごとに作り直されるため窓は自然にリセットされる（インスタンスを長寿命化する場合は `reset()` が必要）
+- **触ってはいけない #1**: `LIVE_ONSET_WINDOW_SEC` を変えると参照側（global-max）とライブ側の onset スケールの対応が崩れ、融合距離のバランスが黙って狂う
+- **触ってはいけない #2**: fusion 非アクティブ時（onset_weight=0 / reference_onset 欠損）のコストは **chroma_weight を掛けない生 cosine 距離のまま通す**。OLTW の `step_penalty` / `lock_in_confidence` は cost ∈ [0, 2] のスケールでチューニングされており、ここで chroma_weight を掛けると閾値が黙ってリスケールされる（feature_extractor.py に理由コメントあり）
 
 ### 合成は FluidSynth で行う (Windows ネイティブ)
 - `tasks/generate_score_wav.py` は **FluidSynth** を使う。MuseScore 4 は v4.6.5 で CLI バッチモードがハングするバグがあり使用不可。
 - フロー: MusicXML → music21 でテンポ正規化 → MIDI → FluidSynth → WAV。合成は 12 分の曲で約 1 分。
 - music21 で XML のテンポマーキングを剥がし、冒頭に単一 MetronomeMark を入れてから MIDI エクスポート
-- **FluidSynth 検出順**: プロジェクト内 `vendor/FluidSynth/*/bin/fluidsynth.exe` → 環境変数 `FLUIDSYNTH_EXE` → PATH → 既知パス → `LocalAppData\FluidSynth\...\fluidsynth.exe`
-- **SF ファイル検出順**: 環境変数 `SF_FILE` → `C:\Program Files\MuseScore 4\sound\MS Basic.sf3` → MuseScore 3 付属 SF3
+- **FluidSynth / SoundFont の検出は `core/synth_locator.py` に一本化**（`find_fluidsynth()` / `find_soundfont()`。build_reference.py と generate_score_wav.py の両方がここを呼ぶ — 検出順を変えるときはここだけ触る）。検出順: プロジェクト内 `vendor/FluidSynth/*/bin/fluidsynth.exe` → 環境変数 `FLUIDSYNTH_EXE` → PATH → 既知パス → `LocalAppData\FluidSynth\...\fluidsynth.exe`。SF ファイルは環境変数 `SF_FILE` → `C:\Program Files\MuseScore 4\sound\MS Basic.sf3` → MuseScore 3 付属 SF3
 - **FluidSynth インストール推奨手順**: GitHub releases から `fluidsynth-vX.Y.Z-win10-x64-glib.zip` を取得してプロジェクトの `vendor/FluidSynth/` に展開する。LocalAppData に置くと Windows Defender / Controlled Folder Access に削除されるケースあり (実例: 過去に発生)。`vendor/` は `.gitignore` 済み。
 - WSL2 は **不要**。オフラインビルドも本番追随も Windows で完結する
 
