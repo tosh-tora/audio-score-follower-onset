@@ -139,6 +139,7 @@ asf-build `
     [--score-bpm 152] `
     [--start-offset 0.5] `
     [--end-trim 8.0] `
+    [--cens-win 41] `
     [--plot]
 
 # フルパスも引き続き使用可（後方互換）
@@ -172,6 +173,11 @@ Override with --score-bpm if undesirable.
 スキップが大量発生し、ビルド時バリデーション (`max_slope=4.0x`) で失敗することがある。自動推定で
 これを回避する。`--score-wav` を渡す場合は合成テンポを録音から逆算できないため、`--score-bpm`
 の明示指定が必須。
+
+**`--cens-win`**: CENS 平滑窓（フレーム数、既定 41 ≈ 3.8 秒）。`build_meta.json` に永続化され
+ランタイムに自動伝播するので、変更時の追加設定は不要。**既定の 41 を推奨** — 21/11 への縮小を
+幻想4 実測で A/B したが、matched と junk のコスト分離は改善しなかった（詳細は CLAUDE.md
+「特徴量の判別能の実測」）。特徴量パラメータの実験用フラグとして残している。
 
 **末尾無音の自動トリム**: 参照録音の末尾にある無音・拍手（ピークから 45 dB 以上低い区間が
 1.5 秒超）は自動検出してビルド前にカットする。トリムしないと (1) BPM 推定の分母が水増しされて
@@ -228,13 +234,19 @@ python tasks/eval_tracking.py `
     --score data/scores/幻想4_リピート削除.mxl `
     --input-wav "data/reference_audio/<録音>.mp3" `
     [--csv out.csv] `
+    [--follower oltw|posterior] `
     [--oltw-kwargs '{\"display_slew_factor\": 0}']
 ```
 
 出力: カバレッジ%、小節ジャンプ >1 / >3 の回数、最長・累計 stall、per-frame 前進量の
-stddev。`--csv` で per-frame の `live_time, ref_frame, dp_ref_frame, measure,
-confidence` をダンプできる。`--oltw-kwargs` は config を編集せずデフォルトに JSON を
-上書きマージする（例: `'{"display_slew_factor": 0}'` で表示スルー無効の旧挙動と比較）。
+stddev、トリガー可能フレーム率（`conf >= 0.30`）。`--csv` で per-frame の `live_time,
+ref_frame, dp_ref_frame, measure, confidence, raw_local_cost` をダンプできる。
+`--oltw-kwargs` は config を編集せずデフォルトに JSON を上書きマージする（例:
+`'{"display_slew_factor": 0}'` で表示スルー無効の旧挙動と比較）。
+
+`--follower posterior` は実験用の全域観測ベイズフィルタ (`core/posterior_follower.py`)
+で駆動する。**本番は oltw 固定**（A/B の結果、別演奏の滑らかさ・ノイズ耐性・オフセット
+復帰のいずれでも OLTW を上回らなかったため既定化見送り。詳細は CLAUDE.md）。
 
 ### 6. ランチャー GUI（引数なし起動）
 
@@ -390,6 +402,21 @@ GUI 起動後の操作：
 | **R** | 楽章を再ロード (OLTW reset) |
 | **L** / 「▶ 演奏開始」ボタン | **マイクモードの初回押下 = 演奏開始の指示**。起動・楽章ロード直後の OLTW は完全待機（咳・物音では一切動かない）で、この押下で追随が解禁される。押しズレは自動補正: 早押しなら音が持続するまで待機、遅押しなら初回探索（`start_search_seconds`、既定 10 秒）で実位置に着地。押下後、**最初の持続音で演奏進行中と確定**し、以後 silence gate は freeze を発火しない（one-shot release、Issue #13: 弱奏の冒頭で音量が閾値を跨いで上下しても追随が止まらない）。**2 回目以降の押下**（および wav / loopback モード）は従来の強制 lock-in（慣性 arm）。ボタンは lock-in 成立後に自動非表示。L キーは常時有効 |
 | **↑ / ↓** | 無音判定閾値をその場で **±0.2 dB** 調整（マイクモードのみ。wav/loopback は gate 自体が無効なので no-op）。演奏開始の前後を問わず有効。ランタイムのみの変更で config.json には保存されない（再起動すると測定値/設定値に戻る）。マイクレベル表示の閾値がその場で更新される |
+
+### GUI の確信度表示（コストベース）
+
+GUI の「確信度」は **絶対マッチ品質**（融合局所コストの 5 フレーム平滑を 0.05→0.22 で 1→0 に
+線形写像）を表示する。OLTW 内部の confidence（band 相対値）は、非負 chroma の cosine 床の
+ため**無関係な音でも 0.6-0.8 に張り付く**という実測に基づき、表示には使わない：
+
+| 入力 | 内部 conf | GUI 表示 |
+|---|---|---|
+| 同録音 | 0.93 | **~98%** |
+| 別演奏（正解） | 0.64 | **~74%** |
+| 無関係なピアノ BGM | 0.4-0.7 | **~0%** |
+
+内部 confidence は lock-in・トリガー床・慣性復帰の判定用としてそのまま使われる（表示のみの
+変更）。既知の限界: 白色ノイズ的な広帯域音は全ピッチクラスを含むため中間値（~50%）を示す。
 
 ### 演奏とカウントがずれた時の対処
 

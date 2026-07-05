@@ -60,3 +60,18 @@ def test_cooldown_activate_sets_flag_immediately():
     assert state.get_all()["cooldown_active"] is True
     state.deactivate_cooldown()
     assert state.get_all()["cooldown_active"] is False
+
+
+def test_display_confidence_setter_and_reset():
+    state = AppState()
+    state.set_display_confidence(0.73)
+    assert state.get_all()["display_confidence"] == 0.73
+    # Clamped to [0, 1].
+    state.set_display_confidence(1.5)
+    assert state.get_all()["display_confidence"] == 1.0
+    state.set_display_confidence(-0.2)
+    assert state.get_all()["display_confidence"] == 0.0
+    # Movement load resets it alongside the internal confidence.
+    state.set_display_confidence(0.9)
+    state.set_movement(movement_id=1, xml_file="x.mxl", triggers=[])
+    assert state.get_all()["display_confidence"] == 0.0

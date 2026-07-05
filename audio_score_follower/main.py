@@ -38,10 +38,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -91,6 +93,32 @@ _THRESHOLD_STEP_DB = 0.2
 # live-score-sync; below this, alignment hasn't stabilised yet and
 # firing the measure-1 trigger at startup would be spurious.
 _TRIGGER_CONFIDENCE_FLOOR = 0.30
+# Operator-facing (display) confidence: match-quality ramp over the
+# smoothed ABSOLUTE fused local cost. The OLTW's internal confidence is
+# band-relative and floors at ~0.6-0.8 even on unrelated audio (the
+# non-negative chroma cosine floor), which misleads the operator ("piano
+# BGM reads 70%"). This ramp maps smoothed cost LO→HI onto 1→0.
+# Calibrated on 幻想4 measurements (2026-07): same recording p50=0.014,
+# alt performance p50=0.082/p90=0.159, wrong movement p50=0.189,
+# unrelated piano p50=0.300 → same ≈100%, alt ≈40-90%, piano ≈0%.
+# Display only — lock-in / trigger floor / resync keep the internal scale.
+_DISPLAY_CONF_COST_LO = 0.05
+_DISPLAY_CONF_COST_HI = 0.22
+# Frames of cost smoothing for the display ramp (matches the OLTW's own
+# confidence_smoothing default; ~0.46s at 10.77 Hz).
+_DISPLAY_CONF_SMOOTHING = 5
+
+
+def display_confidence_from_cost(smoothed_cost: float) -> float:
+    """Map a smoothed fused local cost to the operator-facing confidence.
+
+    Linear ramp: cost <= LO → 1.0, cost >= HI → 0.0. NaN (frozen frames,
+    where OLTW reports no cost) → 0.0.
+    """
+    if math.isnan(smoothed_cost):
+        return 0.0
+    span = _DISPLAY_CONF_COST_HI - _DISPLAY_CONF_COST_LO
+    return max(0.0, min(1.0, (_DISPLAY_CONF_COST_HI - smoothed_cost) / span))
 
 
 class AudioScoreFollowerApp:
@@ -192,6 +220,13 @@ class AudioScoreFollowerApp:
         # second. Set from _on_oltw_result, which fires per CENS frame
         # (~10 Hz) and would otherwise flood the log.
         self._last_diag_log_sec = 0
+
+        # Rolling window of fused local costs feeding the operator-facing
+        # display confidence (see display_confidence_from_cost). Only
+        # touched from the OLTW worker thread (_on_oltw_result).
+        self._display_cost_window: deque[float] = deque(
+            maxlen=_DISPLAY_CONF_SMOOTHING
+        )
 
         logger.info("Initialisation complete")
 
@@ -408,6 +443,7 @@ class AudioScoreFollowerApp:
 
         self.cooldown.cleanup_old()
         self._fired_trigger_measures.clear()
+        self._display_cost_window.clear()
 
         triggers = movement.get("triggers", [])
         total_measures = self.score_mapper.get_total_measures()
@@ -480,6 +516,15 @@ class AudioScoreFollowerApp:
             continuous_beat, measure, beat_in_measure_display
         )
         self.state.set_confidence(result.confidence)
+        # Operator-facing confidence: absolute match quality from the
+        # smoothed fused cost. Frozen frames report NaN cost → display 0
+        # without polluting the smoothing window.
+        if math.isnan(result.raw_local_cost):
+            self.state.set_display_confidence(0.0)
+        else:
+            self._display_cost_window.append(result.raw_local_cost)
+            smoothed = sum(self._display_cost_window) / len(self._display_cost_window)
+            self.state.set_display_confidence(display_confidence_from_cost(smoothed))
         # Mirror OLTW follower mode into AppState so the GUI tracking
         # panel reflects lock-in / inertia transitions in real time.
         if self.oltw is not None:
@@ -524,9 +569,10 @@ class AudioScoreFollowerApp:
             except Exception:  # noqa: BLE001
                 mic_part = ""
             logger.info(
-                "OLTW: m=%d β=%.2f conf=%.2f raw_cost=%.3f ref_t=%.1fs "
-                "band=[%d,%d)%s",
+                "OLTW: m=%d β=%.2f conf=%.2f disp=%.2f raw_cost=%.3f "
+                "ref_t=%.1fs band=[%d,%d)%s",
                 measure, beat_in_measure_display, result.confidence,
+                self.state.get_all().get("display_confidence", 0.0),
                 result.raw_local_cost, result.ref_time_sec,
                 result.band_lo, result.band_hi, mic_part,
             )

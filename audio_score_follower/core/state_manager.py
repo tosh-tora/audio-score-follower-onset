@@ -47,6 +47,13 @@ class AppState:
         # state-sync loop, so time-signature changes are honored.
         self.current_beat_in_measure: float = 1.0
         self.confidence: float = 0.0
+        # Operator-facing confidence derived from the ABSOLUTE fused local
+        # cost (match quality), not from the OLTW's band-relative formula.
+        # The internal ``confidence`` stays high (~0.6-0.8) even on
+        # unrelated audio because non-negative chroma cosine has a high
+        # floor; this display value collapses to ~0 there. Internal gates
+        # (lock-in, trigger floor, resync) keep using ``confidence``.
+        self.display_confidence: float = 0.0
 
         # Trigger/cooldown state
         self.next_trigger_measure: Optional[int] = None
@@ -99,6 +106,7 @@ class AppState:
                 'measure': self.current_measure,
                 'beat_in_measure': self.current_beat_in_measure,
                 'confidence': self.confidence,
+                'display_confidence': self.display_confidence,
                 'cooldown_active': self.cooldown_active,
                 'next_trigger_measure': self.next_trigger_measure,
                 'mic_level_db': self.mic_level_db,
@@ -144,6 +152,16 @@ class AppState:
         with self._lock:
             self.confidence = max(0.0, min(1.0, confidence))
 
+    def set_display_confidence(self, confidence: float):
+        """
+        Update the operator-facing (cost-based) confidence.
+
+        Args:
+            confidence: [0.0, 1.0]
+        """
+        with self._lock:
+            self.display_confidence = max(0.0, min(1.0, confidence))
+
     def set_movement(
         self,
         movement_id: int,
@@ -173,6 +191,7 @@ class AppState:
             self.current_measure = 1
             self.current_beat_in_measure = 1.0
             self.confidence = 0.0
+            self.display_confidence = 0.0
             self.cooldown_active = False
             self.next_trigger_measure = None
 

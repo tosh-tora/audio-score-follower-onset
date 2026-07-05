@@ -377,8 +377,12 @@ class FollowerGUI:
             beat_in_measure = state.get('beat_in_measure', 1.0)
             self.label_beat.config(text=f"♩ {int(beat_in_measure)}")
 
-            # 確信度（色分け）
-            conf = state['confidence']
+            # 確信度（色分け）— 表示は絶対コスト由来の display_confidence を
+            # 使う。OLTW 内部の confidence は band 相対値で、無関係な音でも
+            # 0.6-0.8 に張り付くため操作者を誤解させる(実測: 無関係なピアノ
+            # BGM で内部 conf ~0.4-0.7 / display ~0)。内部値は lock-in・
+            # トリガー床の判定用としてそのまま state に残っている。
+            conf = state.get('display_confidence', state['confidence'])
             if conf > 0.6:
                 color = "green"
             elif conf > 0.4:

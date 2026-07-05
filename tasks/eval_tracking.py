@@ -71,6 +71,8 @@ def parse_args() -> argparse.Namespace:
                    help="JSON dict merged over the default OLTW kwargs")
     p.add_argument("--chroma-weight", type=float, default=0.7)
     p.add_argument("--onset-weight", type=float, default=0.3)
+    p.add_argument("--follower", choices=("oltw", "posterior"), default="oltw",
+                   help="tracking core to evaluate (default: oltw)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -119,14 +121,30 @@ def main() -> int:
         frame_rate, total_measures,
     )
 
-    oltw = OnlineDTWFollower(
-        reference_cens=reference_cens,
-        feature_config=cfg,
-        reference_onset=reference_onset if onset_enabled else None,
-        chroma_weight=args.chroma_weight,
-        onset_weight=args.onset_weight if onset_enabled else 0.0,
-        **oltw_kwargs,
-    )
+    if args.follower == "posterior":
+        from audio_score_follower.core.posterior_follower import (  # noqa: E402
+            PosteriorFollower,
+        )
+        # PosteriorFollower accepts-and-ignores band-DP kwargs, so the
+        # same default dict drives both cores unchanged.
+        oltw = PosteriorFollower(
+            reference_cens=reference_cens,
+            feature_config=cfg,
+            reference_onset=reference_onset if onset_enabled else None,
+            chroma_weight=args.chroma_weight,
+            onset_weight=args.onset_weight if onset_enabled else 0.0,
+            **oltw_kwargs,
+        )
+    else:
+        oltw = OnlineDTWFollower(
+            reference_cens=reference_cens,
+            feature_config=cfg,
+            reference_onset=reference_onset if onset_enabled else None,
+            chroma_weight=args.chroma_weight,
+            onset_weight=args.onset_weight if onset_enabled else 0.0,
+            **oltw_kwargs,
+        )
+    logger.info("Follower: %s", args.follower)
 
     # ---- live features -------------------------------------------------
     import librosa  # heavy import, deferred
@@ -212,6 +230,12 @@ def main() -> int:
     print(f"final measure   : {measures[-1]} / {total_measures} "
           f"(coverage {coverage:.1f}%)")
     print(f"mean confidence : {confs.mean():.3f} (p10 {np.percentile(confs, 10):.3f})")
+    # Fraction of frames a trigger could fire (confidence >= floor). On a
+    # wrong piece / noise this should be near 0 for a follower that
+    # actually detects the mismatch. Uses the production trigger floor.
+    trig_floor = 0.30
+    print(f"trigger-eligible: {100.0 * (confs >= trig_floor).mean():.1f}% "
+          f"of frames (conf >= {trig_floor})")
     print(f"measure jumps >1: {int((m_delta > 1).sum())}")
     print(f"measure jumps >{_JUMP_ANOMALY_MEASURES}: {int((m_delta > _JUMP_ANOMALY_MEASURES).sum())} "
           f"(max jump {int(m_delta.max()) if m_delta.size else 0})")

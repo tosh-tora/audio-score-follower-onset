@@ -254,6 +254,13 @@ def main() -> int:
         help="Hop length in samples for CENS. Default 2048 (~93ms@22050).",
     )
     parser.add_argument(
+        "--cens-win", type=int, default=41,
+        help="CENS smoothing window in frames (41 ≈ 3.8s at the default "
+             "hop). Smaller = sharper temporal discrimination but less "
+             "robustness to tempo wobble / reverb. Persisted into "
+             "build_meta.json so the runtime picks it up automatically.",
+    )
+    parser.add_argument(
         "--plot", action="store_true",
         help="Write warp_path.png into --output (requires matplotlib).",
     )
@@ -291,6 +298,7 @@ def main() -> int:
     cfg = FeatureConfig(
         sample_rate=args.sample_rate,
         hop_length=args.hop_length,
+        cens_win=args.cens_win,
     )
 
     # Parse the score once up front: we need total_beats for BPM
