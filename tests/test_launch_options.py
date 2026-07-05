@@ -326,7 +326,7 @@ class TestReadLauncherSettings:
 # ---------------------------------------------------------------- silence threshold
 class TestComputeSilenceThreshold:
     def test_formula_median_plus_lower_spread_plus_margin(self):
-        # Wide ambient fluctuation (spread > MIN_SPREAD_DB floor):
+        # Wide ambient fluctuation:
         # p10≈-68, median=-60 → threshold = -60 + 8 + 3 = -49.0
         samples = list(np.linspace(-70.0, -50.0, 100))
         result = compute_silence_threshold(samples)
@@ -335,15 +335,16 @@ class TestComputeSilenceThreshold:
         assert result.p10_db == pytest.approx(-68.0, abs=0.2)
         assert result.count == 100
 
-    def test_min_spread_floor_on_steady_ambient(self):
-        # Very steady noise floor (median ≈ p10): the raw lower-spread
-        # term would give threshold ≈ median + 3dB, which ambient-level
-        # fluctuation (HVAC / fan spin-up) can cross on its own —
-        # 実測: 演奏前に追随が始まる。MIN_SPREAD_DB floors the headroom.
+    def test_no_spread_floor_on_steady_ambient(self):
+        # Very steady noise floor (median ≈ p10): the threshold tracks
+        # the measured spread with no floor. A 6dB floor used to push
+        # the threshold to median+9dB, and quiet playing never opened
+        # the gate (Issue #19) — with manual start + one-shot gate
+        # governance the floor's false-start protection is redundant.
         samples = list(np.linspace(-60.5, -59.5, 100))  # spread ≈ 0.4dB
         result = compute_silence_threshold(samples)
-        # threshold = median + max(0.4, 6.0) + 3 = -60 + 9 = -51
-        assert result.threshold_db == pytest.approx(-51.0, abs=0.3)
+        # threshold = median + 0.4 + 3 ≈ -56.6
+        assert result.threshold_db == pytest.approx(-56.6, abs=0.3)
 
     def test_robust_to_incidental_spikes(self):
         # 3% loud spikes (a cough) must not move the threshold: median and
@@ -383,9 +384,9 @@ class TestComputeSilenceThreshold:
         assert high.threshold_db <= 0.0
 
     def test_custom_margin(self):
-        # zero spread → floored at MIN_SPREAD_DB → median + 6 + margin
+        # zero spread → median + 0 + margin
         samples = [-60.0] * 50
-        assert compute_silence_threshold(samples, margin_db=5.0).threshold_db == -49.0
+        assert compute_silence_threshold(samples, margin_db=5.0).threshold_db == -55.0
 
 
 # ---------------------------------------------------------------- rematch
