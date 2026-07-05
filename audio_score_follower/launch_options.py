@@ -246,18 +246,6 @@ def save_launcher_settings(
 # launcher's 60ms poll rate).
 MIN_SILENCE_SAMPLES = 30
 
-# Floor on the estimated upper spread of the ambient distribution (dB).
-# A very steady noise floor during measurement (median ≈ p10) says
-# nothing about SLOW fluctuations the short measurement window cannot
-# see — HVAC cycling on, PC fans spinning up, distant traffic. Without
-# a floor the threshold lands ~3 dB above the median and those
-# fluctuations reopen the gate with no music playing (実測: 幻想4 マイク
-# 運用で演奏前に追随が始まる). Music onsets are ≥20 dB above ambient,
-# so a 6 dB floor (≈9 dB total headroom over median) costs nothing in
-# detection latency.
-MIN_SPREAD_DB = 6.0
-
-
 @dataclass
 class SilenceMeasurement:
     """Result of an ambient-noise measurement for the silence gate."""
@@ -276,16 +264,23 @@ def compute_silence_threshold(
     The gate freezes OLTW when level <= threshold, so the threshold must
     sit ABOVE (nearly) the whole ambient distribution. Formula::
 
-        threshold = median + max(median - p10, MIN_SPREAD_DB) + margin_db
+        threshold = median + (median - p10) + margin_db
 
     The upper spread is estimated by mirroring the LOWER half of the
     distribution: incidental sounds during measurement (coughs, chairs,
     nearby talk) only contaminate the upper tail, so median and p10 stay
     clean while a direct high percentile would not. The (median - p10)
     term adapts the margin to how much the venue's ambient level
-    fluctuates (HVAC cycling etc.), and ``MIN_SPREAD_DB`` floors it so a
-    suspiciously steady measurement window doesn't produce a threshold
-    the ambient level can cross on its own (fan spin-up, HVAC cycle).
+    fluctuates (HVAC cycling etc.).
+
+    There is deliberately NO floor on the spread (Issue #19): a 6 dB
+    floor put the threshold at median+9dB in steady rooms, and quiet
+    playing never crossed it — the gate stayed shut and tracking never
+    started, which is the fatal failure now that manual start + the
+    one-shot gate governance (Issue #13) already suppress false starts.
+    A spurious open only matters in the short window between the start
+    press and the first real sound, and still requires
+    ``gate_activation_sec`` of continuous level above threshold.
 
     Non-finite samples (monitor not yet delivering) are dropped. Raises
     ValueError when fewer than MIN_SILENCE_SAMPLES remain.
@@ -300,7 +295,7 @@ def compute_silence_threshold(
         )
     median = float(np.percentile(arr, 50))
     p10 = float(np.percentile(arr, 10))
-    threshold = median + max(median - p10, MIN_SPREAD_DB) + margin_db
+    threshold = median + (median - p10) + margin_db
     threshold = min(max(threshold, -120.0), 0.0)
     return SilenceMeasurement(
         threshold_db=round(threshold, 1),
