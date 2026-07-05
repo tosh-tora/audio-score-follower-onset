@@ -68,9 +68,11 @@
 | GUI ↔ ワーカースレッド間で共有される atomic 状態 | `audio_score_follower/core/state_manager.py` (`AppState`) |
 | config.json のパース・`oltw_kwargs` デフォルト・**`loopback_device`** | `audio_score_follower/config/loader.py` |
 | マイク (`FollowerWorker`) / ファイル (`FileWorker`) / **WASAPI ループバック** のスレッド管理 | `audio_score_follower/core/follower_worker.py` |
-| オフラインビルド (`asf-build`) + **ビルド時 warp path 検証** + **合成 BPM 自動推定** | `audio_score_follower/cli/build_reference.py` + `core/reference_builder.py` |
+| **実験資産: 全域観測ベイズフィルタ**（本番不使用・eval の `--follower posterior` 専用。「確信度の二本立てと特徴量の判別能」参照） | `audio_score_follower/core/posterior_follower.py` |
+| オフラインビルド (`asf-build`) + **ビルド時 warp path 検証** + **合成 BPM 自動推定** + `--cens-win` | `audio_score_follower/cli/build_reference.py` + `core/reference_builder.py` |
 | スコア合成 WAV 生成 (MusicXML → music21 → MIDI → FluidSynth) | `tasks/generate_score_wav.py` |
-| **追従品質のヘッドレス計測**（カバレッジ / ジャンプ / stall 統計、パラメータ A/B） | `tasks/eval_tracking.py` |
+| **追従品質のヘッドレス計測**（カバレッジ / ジャンプ / stall 統計、パラメータ A/B、`--follower` 切替） | `tasks/eval_tracking.py` |
+| **表示確信度**（コストベース。`display_confidence_from_cost` + `_DISPLAY_CONF_COST_LO/HI`） | `audio_score_follower/main.py`（GUI 反映は `state_manager.set_display_confidence` → `gui_tkinter`） |
 
 ユーザーが「**ボタンの挙動を変えたい**」と言ったら `ui/gui_tkinter.py` 単発で済むことが多い。「**追随ロジックが暴走する**」なら `core/oltw_follower.py` の DP recurrence と band 計算。「**測度がずれる**」なら `core/warp_lookup.py` か `core/score_mapper.py`。「**マイクで動かない**」なら `core/audio_level.py` と `_check_silence_gate` (main.py)。「**warp path 検証が落ちる**」なら `core/warp_lookup.py` の `validate()` と、スコアの繰り返し構造を確認する。
 
@@ -292,6 +294,27 @@ cost[k] = chroma_weight × (1 − <cens_ref[:,k], live_cens>)
 - ライブ側 onset の正規化は `OnsetNormalizer.for_config()`（`LIVE_ONSET_WINDOW_SEC` = 5 秒の rolling-max 窓）に一本化。ワーカーは楽章ごとに作り直されるため窓は自然にリセットされる（インスタンスを長寿命化する場合は `reset()` が必要）
 - **触ってはいけない #1**: `LIVE_ONSET_WINDOW_SEC` を変えると参照側（global-max）とライブ側の onset スケールの対応が崩れ、融合距離のバランスが黙って狂う
 - **触ってはいけない #2**: fusion 非アクティブ時（onset_weight=0 / reference_onset 欠損）のコストは **chroma_weight を掛けない生 cosine 距離のまま通す**。OLTW の `step_penalty` / `lock_in_confidence` は cost ∈ [0, 2] のスケールでチューニングされており、ここで chroma_weight を掛けると閾値が黙ってリスケールされる（feature_extractor.py に理由コメントあり）
+
+### 確信度の二本立てと特徴量の判別能（2026-07 実測。再実験の前に必読）
+
+**確信度は 2 本ある**:
+
+| | 算出 | 用途 |
+|---|---|---|
+| 内部 confidence（`FollowResult.confidence`） | band 内の match_score × margin（band **相対**値） | lock-in・トリガー床 (0.30)・慣性復帰。**チューニング済みスケールなので触らない** |
+| 表示 confidence（`state.display_confidence`） | 融合コスト 5 フレーム平滑を `_DISPLAY_CONF_COST_LO=0.05 → HI=0.22` で 1→0 に線形写像（**絶対**マッチ品質。`main.display_confidence_from_cost`） | GUI 表示のみ |
+
+分離した理由: 非負 chroma 同士の cosine には床があり（無関係な音でも cos 0.5–0.8）、内部 confidence は**無関係な入力でも 0.6–0.8 に張り付く**。「無関係なピアノ BGM で確信度 70%」という操作者の混乱の正体はこれで、特徴量の失敗ではない（下記実測参照）。LO/HI は幻想4 実測から校正: 同録音 cost p50=0.014 / 別演奏 0.082 / 違う楽章 0.189 / 無関係ピアノ 0.300。曲や録音条件が大きく変わったら eval CSV の `raw_local_cost` 分布で再校正する。
+
+**特徴量の判別能の実測結果**（幻想4、eval_tracking + 合成ピアノ BGM で計測）:
+
+- **無関係なピアノ BGM は特徴空間で明確に分離できている**（cost 0.300 vs matched 0.082 の 3.7 倍）。「特徴を掴めていない」わけではなく、旧表示式が cost 0.30 → 70% に写像していただけ
+- **本質的に重なるのは「同一オケの別の楽章」vs「別演奏の正解楽章」**（junk p10 0.095 vs matched p90 0.159）。この重なりは特徴パラメータでは解消できないことを確認済み:
+  - onset 重み {0.7/0.3→0.6/0.4→0.5/0.5}: separation 改善なし（−0.064→−0.063→−0.072）
+  - `cens_win` {41→21→11}: separation 改善なし（matched と junk のコストが同時に上がるだけ）。**既定 41 を維持**。`asf-build --cens-win` は実験用に残置（build_meta 経由でランタイム自動伝播）
+- 白色ノイズ的な広帯域音は全ピッチクラスを含むため表示確信度も中間値（~50%）になる（既知の限界）
+
+**実験資産 `core/posterior_follower.py`**（全域観測ベイズフィルタ）: 「ずれの検知・訂正の根本解決」として実装し A/B したが、別演奏の滑らかさ（jump 8 vs OLTW 0）・ノイズ耐性・オフセット復帰のすべてで OLTW を上回らず**既定化見送り**。オケの自己類似（行進曲テーマの反復）では全域観測が誤マッチ源になり、対策（バンド拘束・近傍優先・有界リカバリ）を入れると OLTW の設計に収束する、が結論。本番経路は無改変（`main.py` は `OnlineDTWFollower` 固定）。テストは `tests/test_posterior_follower.py`、駆動は `eval_tracking --follower posterior` のみ。
 
 ### 合成は FluidSynth で行う (Windows ネイティブ)
 - `tasks/generate_score_wav.py` は **FluidSynth** を使う。MuseScore 4 は v4.6.5 で CLI バッチモードがハングするバグがあり使用不可。
