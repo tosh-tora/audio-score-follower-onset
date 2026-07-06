@@ -141,12 +141,13 @@ class ConfigLoader:
                         f"(got {trig['measure']!r})"
                     )
 
-                action = trig.get("action")
+                action = trig.get("action", "right")
                 if action not in _VALID_ACTIONS:
                     raise ConfigError(
                         f"{tp}.action: 'right' または 'left' が必要です "
                         f"(got {action!r})"
                     )
+                trig["action"] = action
 
         logger.debug("Config validation passed (%d movements)", len(self.movements))
 
