@@ -324,7 +324,7 @@ asf-follow
       "built_dir": "../data/built/piece_recording",
       "triggers": [
         {"measure": 1,  "action": "right", "note": "開始"},
-        {"measure": 17, "action": "right", "note": "第二主題"}
+        {"measure": 17, "note": "第二主題（action 省略 → right 扱い）"}
       ]
     }
   ]
@@ -394,7 +394,7 @@ asf-follow
 | `id` | ○ | 楽章番号（任意の整数。順序の識別用）。 |
 | `xml_file` | ○ | MusicXML / MXL ファイルのパス。config ファイルからの相対パス可。 |
 | `built_dir` | ○ | `asf-build` の出力ディレクトリ。 |
-| `triggers` | ○ | スライド操作の定義リスト。`measure`（小節番号）と `action`（`"right"` / `"left"`）が必須。`note` は任意メモ。 |
+| `triggers` | ○ | スライド操作の定義リスト。`measure`（小節番号）が必須。`action`（`"right"` / `"left"`）は任意で、省略時は `"right"` 扱い。`note` は任意メモ。 |
 
 ## ライブ操作
 
