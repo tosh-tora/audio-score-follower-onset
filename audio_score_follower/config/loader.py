@@ -390,7 +390,12 @@ class ConfigLoader:
             "mismatch_clear_margin": 0.03,
             "mismatch_probe_interval_seconds": 1.0,
             "mismatch_recovery_cost_ceiling": 0.08,
-            "mismatch_recovery_max_jump_seconds": 90.0,
+            # 10s search window: the operator corrects coarse drift
+            # manually before it grows large, so auto-recovery only needs
+            # to close the residual gap after a trigger-granularity manual
+            # correction, or catch a gradual drift early. Smaller window =
+            # less self-similar exposure.
+            "mismatch_recovery_max_jump_seconds": 10.0,
         }
         user_kwargs = self.settings.get("oltw_kwargs", {})
         if not isinstance(user_kwargs, dict):

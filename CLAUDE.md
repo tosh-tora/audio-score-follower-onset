@@ -145,7 +145,7 @@ stuck/rapid reset は「前進が止まった」ときしか発火しない。**
 
 - **検知**: smoothed cost（`_cost_history` 平均）> `mismatch_cost_threshold`(0.18) が `mismatch_seconds`(8s) **連続**で `_mismatch_active=True`。lock-in 済み・非 frozen・非慣性のフレームのみカウント。校正根拠: 別演奏（正解）の最長連続超過は 5.4s → 8s 持続で**誤検知ゼロ**（この校正が最重要ゲート。曲が変わったら「別演奏の閾値超え最長連続秒数 < mismatch_seconds」を必ず再確認）
 - **フラグ中**: `FollowResult.is_mismatched` → main がトリガー抑止 + GUI「⚠ 追随ずれ疑い」表示。解除はヒステリシス（threshold−0.03 を ~1s）または任意の意図的テレポート
-- **リカバリ**: 1s ごとに `_probe_decisive_forward_match` を前方 90s 窓で呼ぶ。**四重ガード**: ①cost margin 0.08 ②discriminability ratio 0.75 ③**絶対 ceiling 0.08**（matched 帯のみ。過去の catchup 失敗は相対ガードのみだったため）④**2 連続 probe の位置整合**（候補が演奏進行 ~1.0 rate と整合。瞬時コストの裾が偶発的に ceiling を割っても、1s 後に整合位置で再発しない限り跳ばない — 違う楽章入力での誤テレポート 2 件をこれで根絶した実測あり）
+- **リカバリ**: 1s ごとに `_probe_decisive_forward_match` を前方 10s 窓で呼ぶ（大きなずれは操作者が手動で先に補正する前提。自動リカバリは手動補正後の残差や早期の緩やかなドリフトを拾う用途で、窓を狭めるほど自己類似露出も減る）。**四重ガード**: ①cost margin 0.08 ②discriminability ratio 0.75 ③**絶対 ceiling 0.08**（matched 帯のみ。過去の catchup 失敗は相対ガードのみだったため）④**2 連続 probe の位置整合**（候補が演奏進行 ~1.0 rate と整合。瞬時コストの裾が偶発的に ceiling を割っても、1s 後に整合位置で再発しない限り跳ばない — 違う楽章入力での誤テレポート 2 件をこれで根絶した実測あり）
 - **クリア箇所**: `_anchor_dp_at`（全テレポート経路）・`freeze()`・`reset()`・ヒステリシス解除の全てで streak/flag/pending をクリア。手動 seek 後に残ったずれは 8s 後に再検知され probe がリトライする（= ワンショット post-seek catchup の「リトライあり」版）
 - **実測の限界（幻想4）**: ①白色ノイズはコスト帯が matched と重なり検知不能 ②ずれ先が自己類似箇所だと局所コストが本当に一致し、検知もリカバリも原理的に不能（offset-60 実験: probe 候補が反復テーマの 2 クラスタ間で振れ、ガードが正しく棄却。検知フラグも「別の提示部で本当にマッチ」して解除される）。**この限界を閾値緩和で破ろうとしないこと** — 別演奏の誤検知ゼロが崩れる
 

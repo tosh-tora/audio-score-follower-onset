@@ -125,7 +125,7 @@ class OnlineDTWFollower:
         mismatch_clear_margin: float = 0.03,
         mismatch_probe_interval_seconds: float = 1.0,
         mismatch_recovery_cost_ceiling: float = 0.08,
-        mismatch_recovery_max_jump_seconds: float = 90.0,
+        mismatch_recovery_max_jump_seconds: float = 10.0,
     ) -> None:
         """
         Args:
@@ -326,9 +326,13 @@ class OnlineDTWFollower:
             mismatch_recovery_max_jump_seconds: forward search window of
                 the recovery probe. Bounded — never the whole reference
                 (a global search teleports to far self-similar repeats;
-                measured with the posterior-follower experiment). 90s
-                covers a 60s start offset plus the gap growth while the
-                detector accumulates evidence.
+                measured with the posterior-follower experiment). 10s is
+                sufficient by design: the operator corrects a coarse drift
+                manually well before it grows large, so auto-recovery only
+                needs to close the residual gap (a few seconds) left after
+                a trigger-granularity manual correction, or catch a gradual
+                drift early. A smaller window also reduces self-similar
+                exposure.
         """
         if reference_cens.ndim != 2 or reference_cens.shape[0] != 12:
             raise ValueError(
