@@ -54,6 +54,10 @@ class AppState:
         # floor; this display value collapses to ~0 there. Internal gates
         # (lock-in, trigger floor, resync) keep using ``confidence``.
         self.display_confidence: float = 0.0
+        # Drift-suspicion flag from the OLTW mismatch detector: True while
+        # smoothed cost has stayed above the calibrated junk threshold.
+        # Triggers are suppressed and the GUI shows a warning while set.
+        self.is_mismatched: bool = False
 
         # Trigger/cooldown state
         self.next_trigger_measure: Optional[int] = None
@@ -107,6 +111,7 @@ class AppState:
                 'beat_in_measure': self.current_beat_in_measure,
                 'confidence': self.confidence,
                 'display_confidence': self.display_confidence,
+                'is_mismatched': self.is_mismatched,
                 'cooldown_active': self.cooldown_active,
                 'next_trigger_measure': self.next_trigger_measure,
                 'mic_level_db': self.mic_level_db,
@@ -162,6 +167,18 @@ class AppState:
         with self._lock:
             self.display_confidence = max(0.0, min(1.0, confidence))
 
+    def set_mismatch(self, mismatched: bool):
+        """
+        Update the drift-suspicion flag from the OLTW mismatch detector.
+
+        Args:
+            mismatched: True while the follower suspects the count has
+                drifted from the performance (triggers are suppressed
+                and the GUI shows a warning).
+        """
+        with self._lock:
+            self.is_mismatched = bool(mismatched)
+
     def set_movement(
         self,
         movement_id: int,
@@ -192,6 +209,7 @@ class AppState:
             self.current_beat_in_measure = 1.0
             self.confidence = 0.0
             self.display_confidence = 0.0
+            self.is_mismatched = False
             self.cooldown_active = False
             self.next_trigger_measure = None
 

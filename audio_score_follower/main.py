@@ -516,6 +516,7 @@ class AudioScoreFollowerApp:
             continuous_beat, measure, beat_in_measure_display
         )
         self.state.set_confidence(result.confidence)
+        self.state.set_mismatch(result.is_mismatched)
         # Operator-facing confidence: absolute match quality from the
         # smoothed fused cost. Frozen frames report NaN cost → display 0
         # without polluting the smoothing window.
@@ -648,6 +649,14 @@ class AudioScoreFollowerApp:
 
                 # Don't fire until OLTW has locked in.
                 if snapshot["confidence"] < _TRIGGER_CONFIDENCE_FLOOR:
+                    time.sleep(interval)
+                    continue
+
+                # Don't fire while the drift detector suspects the count
+                # has lost the performance — advancing slides on a
+                # mistracked position is worse than a late slide the
+                # operator fixes manually.
+                if snapshot.get("is_mismatched"):
                     time.sleep(interval)
                     continue
 

@@ -19,7 +19,7 @@
 
 - トリガーは `config.json` の `movements[].triggers[]` で定義: `{"measure": N, "action": "right"}`。action は `slide_controller.py` の `_KEY_MAP` でブラウザのキーに変換（`right`→`ArrowRight`、`space`→`Space` 等。未知の action はそのままキー名として送出）
 - 専用スレッド `_trigger_loop` が `_TRIGGER_POLL_HZ` (=20Hz) で現在小節を監視
-- **発火条件**: 現在小節がトリガー小節に一致 **かつ** smoothed confidence ≥ `_TRIGGER_CONFIDENCE_FLOOR` (=0.30) **かつ** `CooldownTimer.should_trigger()`（`settings.cooldown_seconds`、既定 3.0s）が許可 **かつ** その小節が未発火（`_fired_trigger_measures` で重複防止）
+- **発火条件**: 現在小節がトリガー小節に一致 **かつ** smoothed confidence ≥ `_TRIGGER_CONFIDENCE_FLOOR` (=0.30) **かつ** mismatch フラグが立っていない（`state.is_mismatched` — 「mismatch 検知 + 有界前方リカバリ」参照）**かつ** `CooldownTimer.should_trigger()`（`settings.cooldown_seconds`、既定 3.0s）が許可 **かつ** その小節が未発火（`_fired_trigger_measures` で重複防止）
 - `_TRIGGER_CONFIDENCE_FLOOR` (0.30) は `lock_in_confidence` (0.45) より意図的に低い: 旧 live-score-sync の InertiaEngine が担っていた「整列が安定するまで発火しない」ガードの代替で、起動直後の measure-1 誤発火だけを防げばよいため
 - `--slide-url` 省略時は `NullSlideController`（no-op）で**ドライラン**起動する。スライドなしで追随のみ検証できる
 - 手動オーバライド: →/Space キーで「次の未発火トリガーへ進めて発火済みにマーク + OLTW を seek」、← で直前の発火を取り消して戻る（発火順は小節順管理）
@@ -52,7 +52,7 @@
 
 | 触る目的 | 場所 |
 |---|---|
-| OLTW のアルゴリズム本体・DP recurrence・lock-in / inertia 状態機械 | `audio_score_follower/core/oltw_follower.py` |
+| OLTW のアルゴリズム本体・DP recurrence・lock-in / inertia 状態機械・**mismatch 検知 + 有界リカバリ** | `audio_score_follower/core/oltw_follower.py` |
 | 配信される検出結果 (`FollowResult`) の構造 | 同上、ファイル上部 dataclass |
 | 特徴量 (CENS + onset) のパラメータ・抽出経路・**融合コスト `fused_local_cost` / `OnsetNormalizer`** | `audio_score_follower/core/feature_extractor.py`（**オフラインビルドと本番が共有する唯一の経路**） |
 | ref_time ↔ score_time ↔ measure の変換・**warp path 検証** | `audio_score_follower/core/warp_lookup.py` |
@@ -138,6 +138,16 @@ lock-in 判定:
 **触ってはいけない**: rapid reset の発火後は `D_prev[:current_ref_pos]=inf, D_prev[current_ref_pos]=0` にリシードされる。このリシードを省くと後退アトラクタが残り、次フレームでまた即 rapid reset が発火してしまう。
 
 **過去に試して捨てた**: rapid reset 後に「stall 中経過した live frame 数だけ前方ローカル探索してジャンプ」する catchup を実装したが、`raw_cost ~ 0.20` の曖昧 chroma 区間で 15 frame 程度の探索ではノイズと真のマッチを区別できず、誤ジャンプ → 監視 → 再 rapid reset → 誤ジャンプ … のサイクルで遅延を悪化させた（実測: 終端 m=176 → m=172 への regression）。代替案として discriminability ratio ガードを加えたり cost margin を厳しくする方向も考えられるが、まだ実装していない。stall ごとの ~10 frame の永続遅延は当面受け入れる。
+
+### mismatch 検知 + 有界前方リカバリ（2026-07 追加）
+
+stuck/rapid reset は「前進が止まった」ときしか発火しない。**前進しながらずれている**状態（junk 入力上の marching、大きなオフセット）は絶対コストで検知する（`_update_mismatch`、oltw_follower.py）:
+
+- **検知**: smoothed cost（`_cost_history` 平均）> `mismatch_cost_threshold`(0.18) が `mismatch_seconds`(8s) **連続**で `_mismatch_active=True`。lock-in 済み・非 frozen・非慣性のフレームのみカウント。校正根拠: 別演奏（正解）の最長連続超過は 5.4s → 8s 持続で**誤検知ゼロ**（この校正が最重要ゲート。曲が変わったら「別演奏の閾値超え最長連続秒数 < mismatch_seconds」を必ず再確認）
+- **フラグ中**: `FollowResult.is_mismatched` → main がトリガー抑止 + GUI「⚠ 追随ずれ疑い」表示。解除はヒステリシス（threshold−0.03 を ~1s）または任意の意図的テレポート
+- **リカバリ**: 1s ごとに `_probe_decisive_forward_match` を前方 10s 窓で呼ぶ（大きなずれは操作者が手動で先に補正する前提。自動リカバリは手動補正後の残差や早期の緩やかなドリフトを拾う用途で、窓を狭めるほど自己類似露出も減る）。**四重ガード**: ①cost margin 0.08 ②discriminability ratio 0.75 ③**絶対 ceiling 0.08**（matched 帯のみ。過去の catchup 失敗は相対ガードのみだったため）④**2 連続 probe の位置整合**（候補が演奏進行 ~1.0 rate と整合。瞬時コストの裾が偶発的に ceiling を割っても、1s 後に整合位置で再発しない限り跳ばない — 違う楽章入力での誤テレポート 2 件をこれで根絶した実測あり）
+- **クリア箇所**: `_anchor_dp_at`（全テレポート経路）・`freeze()`・`reset()`・ヒステリシス解除の全てで streak/flag/pending をクリア。手動 seek 後に残ったずれは 8s 後に再検知され probe がリトライする（= ワンショット post-seek catchup の「リトライあり」版）
+- **実測の限界（幻想4）**: ①白色ノイズはコスト帯が matched と重なり検知不能 ②ずれ先が自己類似箇所だと局所コストが本当に一致し、検知もリカバリも原理的に不能（offset-60 実験: probe 候補が反復テーマの 2 クラスタ間で振れ、ガードが正しく棄却。検知フラグも「別の提示部で本当にマッチ」して解除される）。**この限界を閾値緩和で破ろうとしないこと** — 別演奏の誤検知ゼロが崩れる
 
 ### unfreeze 後の DP 復帰経路
 
