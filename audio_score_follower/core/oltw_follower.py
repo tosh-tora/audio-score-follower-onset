@@ -73,6 +73,10 @@ class FollowResult:
     # Diagnostic: lets eval tooling compare the smoothed output against
     # the DP's actual estimate.
     dp_ref_frame: int = 0
+    # True while the mismatch detector suspects the count has drifted
+    # from the performance (sustained high absolute cost). Triggers are
+    # suppressed and the GUI shows a warning while this is up.
+    is_mismatched: bool = False
 
 
 class OnlineDTWFollower:
@@ -116,6 +120,12 @@ class OnlineDTWFollower:
         low_conf_advance_frames: int = 0,
         low_conf_advance_factor: float = 4.0,
         low_conf_advance_min: int = 4,
+        mismatch_cost_threshold: float = 0.18,
+        mismatch_seconds: float = 8.0,
+        mismatch_clear_margin: float = 0.03,
+        mismatch_probe_interval_seconds: float = 1.0,
+        mismatch_recovery_cost_ceiling: float = 0.08,
+        mismatch_recovery_max_jump_seconds: float = 90.0,
     ) -> None:
         """
         Args:
@@ -289,6 +299,36 @@ class OnlineDTWFollower:
             low_conf_advance_factor: multiplier on the estimated rate
                 for the adaptive low-confidence cap.
             low_conf_advance_min: floor (frames) for the adaptive cap.
+            mismatch_cost_threshold: smoothed fused cost above which a
+                frame counts toward mismatch ("count is drifting from the
+                performance") detection. Calibrated on 幻想4 (2026-07):
+                matched alt-performance longest run above 0.18 is 5.4s
+                (48% margin below the 8s duration gate), while
+                wrong-piece / offset scenarios sustain 13-30s runs.
+                Set 0 to disable the detector entirely.
+            mismatch_seconds: the cost must stay above the threshold for
+                this long CONTINUOUSLY before the mismatch flag raises.
+                Must comfortably exceed the matched-performance longest
+                run (see above) — false positives on a correct performance
+                are the failure mode this guards against; a missed
+                detection merely keeps today's behaviour.
+            mismatch_clear_margin: hysteresis; the flag clears after the
+                smoothed cost stays below ``threshold - margin`` for ~1s.
+            mismatch_probe_interval_seconds: cadence of the bounded
+                forward recovery probe while the flag is up.
+            mismatch_recovery_cost_ceiling: ABSOLUTE guard on recovery
+                jumps — the candidate's local cost must be inside the
+                matched band (≈ alt-performance p50 = 0.08) on top of
+                the relative probe guards. The historical catchup
+                false-jump cycle happened because only relative guards
+                existed. A second temporal guard (two consecutive
+                position-consistent probes) is always applied on top.
+            mismatch_recovery_max_jump_seconds: forward search window of
+                the recovery probe. Bounded — never the whole reference
+                (a global search teleports to far self-similar repeats;
+                measured with the posterior-follower experiment). 90s
+                covers a 60s start offset plus the gap growth while the
+                detector accumulates evidence.
         """
         if reference_cens.ndim != 2 or reference_cens.shape[0] != 12:
             raise ValueError(
@@ -496,6 +536,45 @@ class OnlineDTWFollower:
         self._low_conf_advance_frames = int(low_conf_advance_frames)
         self._low_conf_advance_factor = float(low_conf_advance_factor)
         self._low_conf_advance_min = int(low_conf_advance_min)
+
+        # ---- mismatch detector + bounded recovery --------------------
+        if mismatch_cost_threshold < 0:
+            raise ValueError("mismatch_cost_threshold must be >= 0")
+        if mismatch_seconds <= 0:
+            raise ValueError("mismatch_seconds must be > 0")
+        if mismatch_clear_margin < 0:
+            raise ValueError("mismatch_clear_margin must be >= 0")
+        if mismatch_probe_interval_seconds <= 0:
+            raise ValueError("mismatch_probe_interval_seconds must be > 0")
+        if mismatch_recovery_cost_ceiling <= 0:
+            raise ValueError("mismatch_recovery_cost_ceiling must be > 0")
+        if mismatch_recovery_max_jump_seconds <= 0:
+            raise ValueError("mismatch_recovery_max_jump_seconds must be > 0")
+        fr = self._cfg.effective_frame_rate()
+        self._mismatch_cost_threshold = float(mismatch_cost_threshold)
+        self._mismatch_frames = max(1, int(round(mismatch_seconds * fr)))
+        self._mismatch_clear_margin = float(mismatch_clear_margin)
+        # Hysteresis release: cost must stay below (threshold - margin)
+        # for ~1s before the flag clears.
+        self._mismatch_clear_frames = max(1, int(round(1.0 * fr)))
+        self._mismatch_probe_interval_frames = max(
+            1, int(round(mismatch_probe_interval_seconds * fr))
+        )
+        self._mismatch_recovery_cost_ceiling = float(mismatch_recovery_cost_ceiling)
+        self._mismatch_recovery_max_jump_frames = max(
+            1, int(round(mismatch_recovery_max_jump_seconds * fr))
+        )
+        self._mismatch_streak = 0
+        self._mismatch_clear_streak = 0
+        self._mismatch_active = False
+        self._frames_since_mismatch_probe = 0
+        # Two-probe confirmation for recovery: (candidate_pos, live_frame
+        # at probe time). A jump requires TWO consecutive probes whose
+        # candidates are position-consistent with the performance
+        # advancing at ~live rate in between. Uncorrelated junk-audio
+        # cost dips pass the guards on one frame but not at a consistent
+        # position 1s later; a real performance does.
+        self._pending_recovery: Optional[tuple[int, int]] = None
 
         self._state_lock = threading.Lock()
         # Per-frame scratch field set at the top of process_frame and
@@ -729,6 +808,155 @@ class OnlineDTWFollower:
         # Reseed DP: clear cumulative history, anchor at the new position.
         self._anchor_dp_at(new_pos, best_cost)
         return True
+
+    def _update_mismatch(self, live: np.ndarray, smoothed_cost: float) -> bool:
+        """Sustained-high-cost drift detector + bounded forward recovery.
+
+        The stuck/rapid-reset hatches only fire when the DP STALLS; a
+        count that keeps advancing while drifted from the performance
+        never trips them. This detector watches the ABSOLUTE smoothed
+        fused cost instead: on a correct performance it sits in the
+        matched band (alt p50 ≈ 0.08) with only transient excursions
+        (longest measured run above 0.20 is 5.0s), while a drifted /
+        wrong-input state sustains 13-30s runs. Sustained excess raises
+        ``_mismatch_active``; the runtime then suppresses triggers, shows
+        a GUI warning, and this method probes a bounded forward window
+        for a triple-guarded re-anchor once per probe interval.
+
+        This also upgrades the one-shot post-seek catchup: after a coarse
+        manual → / ← correction (trigger-measure granularity) misses, the
+        residual drift re-raises the flag and the probe retries every
+        interval instead of giving up after a single frame.
+
+        Returns True if a recovery jump re-anchored the DP this frame.
+        """
+        if self._mismatch_cost_threshold <= 0:
+            return False
+        # Only meaningful while genuinely tracking: pre-lock-in cost is
+        # noisy by design, and inertia frames don't observe the
+        # performance at the reported position.
+        if not self._locked_in or self._inertia_active:
+            self._mismatch_streak = 0
+            self._mismatch_clear_streak = 0
+            if self._mismatch_active:
+                self._mismatch_active = False
+                logger.info("OLTW mismatch flag cleared (inertia / not locked in)")
+            return False
+
+        if not self._mismatch_active:
+            if smoothed_cost > self._mismatch_cost_threshold:
+                self._mismatch_streak += 1
+                if self._mismatch_streak >= self._mismatch_frames:
+                    self._mismatch_active = True
+                    self._mismatch_clear_streak = 0
+                    self._frames_since_mismatch_probe = 0
+                    logger.warning(
+                        "OLTW mismatch detected at ref_frame=%d: smoothed "
+                        "cost %.3f > %.2f sustained %.1fs — count may have "
+                        "drifted from the performance (triggers suppressed)",
+                        self._current_ref_pos, smoothed_cost,
+                        self._mismatch_cost_threshold,
+                        self._mismatch_streak / self._cfg.effective_frame_rate(),
+                    )
+            else:
+                self._mismatch_streak = 0
+            return False
+
+        # Flag is up — hysteresis release: cost must sit clearly back in
+        # the matched band for ~1s before we trust the track again.
+        if smoothed_cost < self._mismatch_cost_threshold - self._mismatch_clear_margin:
+            self._mismatch_clear_streak += 1
+            if self._mismatch_clear_streak >= self._mismatch_clear_frames:
+                self._mismatch_active = False
+                self._mismatch_streak = 0
+                self._mismatch_clear_streak = 0
+                self._pending_recovery = None
+                logger.info(
+                    "OLTW mismatch cleared: cost back in matched band at "
+                    "ref_frame=%d",
+                    self._current_ref_pos,
+                )
+                return False
+        else:
+            self._mismatch_clear_streak = 0
+
+        # Periodic bounded recovery probe while the flag stays up.
+        self._frames_since_mismatch_probe += 1
+        if self._frames_since_mismatch_probe >= self._mismatch_probe_interval_frames:
+            self._frames_since_mismatch_probe = 0
+            return self._try_mismatch_recovery(live)
+        return False
+
+    def _try_mismatch_recovery(self, live: np.ndarray) -> bool:
+        """Bounded forward re-anchor attempt while mismatched.
+
+        Reuses ``_probe_decisive_forward_match`` (relative guards: cost
+        margin + discriminability ratio) and adds a third ABSOLUTE guard:
+        the candidate's local cost must be inside the matched band
+        (``mismatch_recovery_cost_ceiling``). The historical catchup
+        false-jump cycle (jump → monitor → reset → jump …) happened
+        because only relative guards existed — on wrong-input audio the
+        "best" of a junk window still won relatively. Forward-only and
+        bounded: backward correction stays manual (←), and a global
+        search would teleport to far self-similar repeats (measured).
+
+        Returns True if a jump was performed.
+        """
+        min_pos = self._current_ref_pos + 1
+        max_pos = min(
+            self._N,
+            self._current_ref_pos + self._mismatch_recovery_max_jump_frames + 1,
+        )
+        if max_pos <= min_pos:
+            return False
+        current_cost = self._local_cost_scalar(self._current_ref_pos, live)
+        probe = self._probe_decisive_forward_match(
+            live, min_pos, max_pos, current_cost, log_tag="mismatch-recovery",
+        )
+        if probe is None:
+            return False
+        new_pos, best_cost, ratio, median_cost = probe
+        # Guard 3 (absolute): only re-anchor onto something that looks
+        # like the correct performance, not merely the least-bad junk.
+        if best_cost > self._mismatch_recovery_cost_ceiling:
+            logger.debug(
+                "OLTW mismatch-recovery: candidate rejected by absolute "
+                "guard (cost %.3f > ceiling %.3f)",
+                best_cost, self._mismatch_recovery_cost_ceiling,
+            )
+            return False
+        # Guard 4 (temporal): require a SECOND consecutive probe whose
+        # candidate is consistent with the previous one advancing at
+        # ~live rate. Instantaneous junk cost has heavy tails — a single
+        # frame can dip under the ceiling by chance (measured: 2 false
+        # teleports on a wrong-piece input without this guard) — but
+        # chance dips don't recur at the position the performance would
+        # have reached 1s later.
+        if self._pending_recovery is not None:
+            prev_cand, prev_frame = self._pending_recovery
+            expected = prev_cand + (self._live_frame_idx - prev_frame)
+            if abs(new_pos - expected) <= 20:
+                logger.info(
+                    "OLTW mismatch-recovery: jumping ref_frame %d→%d "
+                    "(+%.1fs, local cost %.3f→%.3f, discrim_ratio %.2f, "
+                    "median %.3f, confirmed by 2 probes)",
+                    self._current_ref_pos, new_pos,
+                    (new_pos - self._current_ref_pos)
+                    / self._cfg.effective_frame_rate(),
+                    current_cost, best_cost, ratio, median_cost,
+                )
+                # _anchor_dp_at also clears the mismatch state
+                # (intentional teleport = fresh evaluation).
+                self._anchor_dp_at(new_pos, best_cost)
+                self._pending_recovery = None
+                return True
+        logger.debug(
+            "OLTW mismatch-recovery: candidate ref_frame=%d (cost %.3f) "
+            "pending confirmation on the next probe",
+            new_pos, best_cost,
+        )
+        self._pending_recovery = (new_pos, self._live_frame_idx)
+        return False
 
     def _process_subsequent_frame(self, live: np.ndarray) -> FollowResult:
         """Standard DP update for live frames > 0.
@@ -1008,6 +1236,18 @@ class OnlineDTWFollower:
             self._high_conf_streak = 0
         self._update_lock_in()
 
+        # ---- mismatch detection + bounded recovery ---------------------
+        # "Advancing but drifted" states never trip the stuck/rapid-reset
+        # hatches (those need a stall). Detect them via the ABSOLUTE
+        # smoothed cost instead, and attempt a triple-guarded bounded
+        # forward re-anchor while the flag is up. No-op on healthy
+        # tracking (calibrated so a matched alt-performance never trips).
+        if self._update_mismatch(live, smoothed_cost):
+            # Recovery re-anchored the DP — surface the jump in this
+            # frame's result instead of lagging one frame behind.
+            new_pos = self._current_ref_pos
+            local_cost_at_best = self._local_cost_scalar(new_pos, live)
+
         # Inertia management: ONLY enter via the explicit silence-gate
         # freeze() path (handled in process_frame's frozen branch).
         # Low DP confidence alone is NOT enough — orchestral pp / pizz
@@ -1086,6 +1326,7 @@ class OnlineDTWFollower:
             dist_chroma=dist_chroma,
             dist_onset=dist_onset,
             dp_ref_frame=new_pos,
+            is_mismatched=self._mismatch_active,
         )
 
     # ------------------------------------------------------------ frozen path
@@ -1315,6 +1556,13 @@ class OnlineDTWFollower:
             if self._frozen:
                 return
             self._frozen = True
+            # Frozen frames don't observe the performance — mismatch
+            # evidence collected before the freeze is stale by the time
+            # we unfreeze. Re-arm from zero.
+            self._mismatch_streak = 0
+            self._mismatch_clear_streak = 0
+            self._mismatch_active = False
+            self._pending_recovery = None
             if self._locked_in and self._max_inertia_seconds > 0:
                 self._inertia_active = True
                 # Start inertia from the *displayed* position when the
@@ -1467,6 +1715,15 @@ class OnlineDTWFollower:
         self._prev_band_hi = ref_frame + 1
         self._current_ref_pos = ref_frame
         self._display_ref_pos = float(ref_frame)  # intentional teleport: snap
+        # Every intentional teleport (seek / rematch / catchup / mismatch
+        # recovery) is a fresh declaration of position — stale mismatch
+        # evidence must not carry across it. The detector re-arms from
+        # zero, so a residual drift after a coarse manual correction is
+        # re-detected after mismatch_seconds of sustained high cost.
+        self._mismatch_streak = 0
+        self._mismatch_clear_streak = 0
+        self._mismatch_active = False
+        self._pending_recovery = None
 
     def _reseed_at(self, ref_frame: int) -> None:
         """Re-anchor the DP at ``ref_frame`` with a fresh cost field.
@@ -1567,6 +1824,11 @@ class OnlineDTWFollower:
             self._last_good_rate = 1.0
             self._display_ref_pos = 0.0
             self._pre_lockin_resume_pos = None
+            self._mismatch_streak = 0
+            self._mismatch_clear_streak = 0
+            self._mismatch_active = False
+            self._frames_since_mismatch_probe = 0
+            self._pending_recovery = None
         logger.info("OLTW reset")
 
     # ------------------------------------------------------------ getters
@@ -1606,6 +1868,13 @@ class OnlineDTWFollower:
     def is_locked_in(self) -> bool:
         """True once lock-in latch has fired (auto or manual)."""
         return self._locked_in
+
+    @property
+    def is_mismatched(self) -> bool:
+        """True while the drift detector suspects the count has lost the
+        performance (sustained high absolute cost). Cleared by recovery,
+        hysteresis release, any intentional teleport, freeze, or reset."""
+        return self._mismatch_active
 
     @property
     def is_in_inertia(self) -> bool:

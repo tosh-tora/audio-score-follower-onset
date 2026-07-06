@@ -196,6 +196,17 @@ class FollowerGUI:
         )
         self.label_confidence.pack(side=tk.LEFT, padx=10)
 
+        # ずれ検知警告 — mismatch detector が「カウントが演奏からずれた疑い」
+        # を立てている間だけ表示する。操作者は ←/→ で手動補正できる。
+        # 毎フレーム pack/forget しない（差分時のみ。落とし穴 #6）。
+        self.label_mismatch = tk.Label(
+            self.root,
+            text="⚠ 追随ずれ疑い — ←/→ で補正可",
+            font=(family, _CONFIDENCE_FONT_SIZE, "bold"),
+            bg="#c62828", fg="white", padx=12, pady=4,
+        )
+        self._mismatch_visible = False
+
         # マイクレベル — 確信度バーの直下に置く。確信度はマイク入力に直結する
         # ので並べて確認できると運用しやすい。下にある要素（クールダウン等）が
         # ウィンドウ高さの関係で見切れても、入力レベルだけは見えるようにする。
@@ -390,6 +401,15 @@ class FollowerGUI:
             else:
                 color = "red"
             self.label_confidence.config(text=f"{int(conf*100)}%", fg=color)
+
+            # ずれ検知警告 — 差分時のみ pack/forget（落とし穴 #6）
+            mismatched = bool(state.get('is_mismatched'))
+            if mismatched != self._mismatch_visible:
+                self._mismatch_visible = mismatched
+                if mismatched:
+                    self.label_mismatch.pack(pady=4, before=self.label_mic_level)
+                else:
+                    self.label_mismatch.pack_forget()
 
             # 次のトリガー
             next_trig = state['next_trigger_measure']

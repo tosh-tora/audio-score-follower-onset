@@ -190,6 +190,7 @@ def main() -> int:
             "raw_local_cost": result.raw_local_cost,
             "is_inertia": int(oltw.is_in_inertia),
             "is_locked_in": int(oltw.is_locked_in),
+            "is_mismatched": int(result.is_mismatched),
         })
     elapsed = time.monotonic() - t0
     logger.info("Processed %d frames in %.1fs (%.0fx realtime)",
@@ -236,6 +237,16 @@ def main() -> int:
     trig_floor = 0.30
     print(f"trigger-eligible: {100.0 * (confs >= trig_floor).mean():.1f}% "
           f"of frames (conf >= {trig_floor})")
+    # Mismatch detector: percent of frames flagged + time of first raise.
+    # A matched performance must show 0.0% (false-positive gate); junk /
+    # offset inputs should raise within tens of seconds.
+    mismatch = np.array([r.get("is_mismatched", 0) for r in rows], dtype=bool)
+    if mismatch.any():
+        first_sec = float(np.argmax(mismatch)) / frame_rate
+        print(f"mismatch flagged: {100.0 * mismatch.mean():.1f}% of frames "
+              f"(first at {first_sec:.1f}s)")
+    else:
+        print("mismatch flagged: 0.0% of frames")
     print(f"measure jumps >1: {int((m_delta > 1).sum())}")
     print(f"measure jumps >{_JUMP_ANOMALY_MEASURES}: {int((m_delta > _JUMP_ANOMALY_MEASURES).sum())} "
           f"(max jump {int(m_delta.max()) if m_delta.size else 0})")

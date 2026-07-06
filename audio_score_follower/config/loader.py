@@ -379,6 +379,18 @@ class ConfigLoader:
             "low_conf_advance_frames": 0,
             "low_conf_advance_factor": 4.0,
             "low_conf_advance_min": 4,
+            # Mismatch (drift) detector + bounded forward recovery.
+            # Calibrated on 幻想4 (2026-07): a matched alt-performance
+            # never sustains smoothed cost > 0.18 longer than 5.4s (48%
+            # margin under the 8s gate → zero false positives measured),
+            # while wrong-piece / offset-start states sustain 13-30s runs.
+            # mismatch_cost_threshold 0 disables the detector entirely.
+            "mismatch_cost_threshold": 0.18,
+            "mismatch_seconds": 8.0,
+            "mismatch_clear_margin": 0.03,
+            "mismatch_probe_interval_seconds": 1.0,
+            "mismatch_recovery_cost_ceiling": 0.08,
+            "mismatch_recovery_max_jump_seconds": 90.0,
         }
         user_kwargs = self.settings.get("oltw_kwargs", {})
         if not isinstance(user_kwargs, dict):
