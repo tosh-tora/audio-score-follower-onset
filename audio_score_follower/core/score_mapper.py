@@ -337,8 +337,14 @@ class ScoreMapper:
                 break
 
         if start_beat is None:
-            logger.warning(f"Measure {measure_num} not found in score")
-            return (0.0, 0.0)
+            # Do NOT fall back to (0.0, 0.0): callers (manual ←/→ slide
+            # override in main.py) convert this into a ref_time and seek
+            # OLTW there. A silent (0.0, 0.0) means "seek to the very
+            # start of the recording", which looks like the measure
+            # count resetting to measure 1 (Issue #11). Raising lets the
+            # existing try/except in main.py fall back to a bare slide
+            # press with no OLTW seek instead.
+            raise ValueError(f"Measure {measure_num} not found in score")
 
         return (start_beat, end_beat)
 
