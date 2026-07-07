@@ -145,6 +145,7 @@ class FollowerWorker:
         # sounddevice is lazy-imported so the rest of the app still works
         # on machines without PortAudio (CI etc.). Failure to open the
         # stream is recorded into ``_fatal_error`` but does not raise.
+        resolved_device: Optional[Union[int, str]] = self._mic_device
         try:
             import sounddevice as sd  # type: ignore
 
@@ -161,6 +162,7 @@ class FollowerWorker:
                 device = self._mic_device
                 if device is None:
                     device = sd.default.device[1]  # system default output
+                resolved_device = device
                 self._stream = sd.InputStream(
                     samplerate=self._cfg.sample_rate,
                     channels=2,
@@ -195,7 +197,7 @@ class FollowerWorker:
                 "Check device=%r in config and that sounddevice/PortAudio "
                 "is installed.",
                 "loopback" if self._loopback else "mic input",
-                type(exc).__name__, exc, self._mic_device,
+                type(exc).__name__, exc, resolved_device,
             )
         finally:
             self._ready_event.set()
