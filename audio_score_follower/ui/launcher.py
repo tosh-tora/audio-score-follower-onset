@@ -28,6 +28,7 @@ from audio_score_follower.launch_options import (
     LaunchOptions,
     coerce_device,
     compute_silence_threshold,
+    default_config_dir,
     read_launcher_settings,
     rematch_device,
     resolve_input_wav,
@@ -37,8 +38,6 @@ from audio_score_follower.launch_options import (
 from audio_score_follower.ui.gui_tkinter import _pick_font_family
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_CONFIG_DIR = Path("config")
 
 _WINDOW_GEOMETRY = "760x680"
 _DEFAULT_DEVICE_LABEL = "既定のデバイス"
@@ -560,12 +559,18 @@ class _LauncherWindow:
         self.root.destroy()
 
 
-def run_launcher(config_dir: Path = DEFAULT_CONFIG_DIR) -> Optional[LaunchOptions]:
+def run_launcher(config_dir: Optional[Path] = None) -> Optional[LaunchOptions]:
     """Show the launcher window (blocking). None = cancelled / closed.
+
+    ``config_dir`` defaults to the project's config/ directory resolved
+    independently of the CWD (Issue #7); pass an explicit path to
+    override (tests do).
 
     The Tk root is destroyed before returning so the follower app can
     create its own root afterwards.
     """
+    if config_dir is None:
+        config_dir = default_config_dir()
     root = tk.Tk()
     try:
         window = _LauncherWindow(root, config_dir)
