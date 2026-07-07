@@ -251,14 +251,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--hop-length", type=int, default=2048,
-        help="Hop length in samples for CENS. Default 2048 (~93ms@22050).",
+        help="Hop length in samples for CENS. Default 2048 (~93ms@22050). "
+             "Affects RUNTIME matching features only — the offline "
+             "MrMsDTW alignment uses a fixed 50 Hz synctoolbox pipeline.",
     )
     parser.add_argument(
         "--cens-win", type=int, default=41,
         help="CENS smoothing window in frames (41 ≈ 3.8s at the default "
              "hop). Smaller = sharper temporal discrimination but less "
              "robustness to tempo wobble / reverb. Persisted into "
-             "build_meta.json so the runtime picks it up automatically.",
+             "build_meta.json so the runtime picks it up automatically. "
+             "Affects RUNTIME matching features only, not the warp-path "
+             "alignment.",
     )
     parser.add_argument(
         "--plot", action="store_true",
