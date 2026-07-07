@@ -10,7 +10,6 @@ mechanism.
 
 import logging
 import threading
-import time
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
@@ -290,12 +289,8 @@ class AppState:
         with self._lock:
             self.cooldown_active = True
 
-        # Timer to auto-clear
-        def clear_cooldown():
-            time.sleep(duration_sec)
-            self.deactivate_cooldown()
-
-        threading.Timer(duration_sec, clear_cooldown).start()
+        # Timer to auto-clear after duration_sec.
+        threading.Timer(duration_sec, self.deactivate_cooldown).start()
 
     def deactivate_cooldown(self):
         """Deactivate cooldown."""

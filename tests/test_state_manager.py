@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """AppState の特性テスト（リファクタ前の挙動固定）。"""
+import time
+
 from audio_score_follower.core.state_manager import AppState
 
 
@@ -59,6 +61,17 @@ def test_cooldown_activate_sets_flag_immediately():
     state.activate_cooldown(60.0)  # 長時間にして自動クリアがテスト中に走らないようにする
     assert state.get_all()["cooldown_active"] is True
     state.deactivate_cooldown()
+    assert state.get_all()["cooldown_active"] is False
+
+
+def test_cooldown_auto_clears_after_duration_not_double():
+    """自動クリアが duration_sec で走ること（Issue #16: 旧実装は 2倍残った）。"""
+    state = AppState()
+    state.activate_cooldown(0.1)
+    assert state.get_all()["cooldown_active"] is True
+    # duration の 2 倍待つ。旧実装（time.sleep(duration) + Timer(duration)）なら
+    # ここではまだ True のまま = 回帰を捕捉できる。
+    time.sleep(0.2)
     assert state.get_all()["cooldown_active"] is False
 
 
