@@ -77,6 +77,32 @@ class LaunchOptions:
         return None
 
 
+def default_config_dir() -> Path:
+    """Locate the project's ``config/`` directory independent of CWD.
+
+    The launcher is usually started as the ``asf-follow`` console script
+    from an arbitrary working directory (a desktop shortcut, or a fresh
+    terminal after a reboot). A bare ``Path("config")`` then resolves
+    against that CWD and finds nothing, so every persisted launcher
+    setting appears lost even though it is safely written in the
+    project's ``config/*.json`` (Issue #7).
+
+    Prefer a ``config/`` under the CWD when one actually exists (honours
+    an intentional per-directory config set and preserves the old
+    behaviour); otherwise fall back to the ``config/`` that ships at the
+    repository root, located relative to this package.
+    """
+    cwd_config = Path("config")
+    if cwd_config.is_dir():
+        return cwd_config
+    # launch_options.py lives at <repo>/audio_score_follower/, so parents[1]
+    # is the repo root that holds the JSON config/ directory.
+    pkg_config = Path(__file__).resolve().parents[1] / "config"
+    if pkg_config.is_dir():
+        return pkg_config
+    return cwd_config
+
+
 def resolve_input_wav(raw: Optional[Path]) -> Optional[Path]:
     """Resolve a bare filename (no directory component) to data/reference_audio/."""
     if raw is None:

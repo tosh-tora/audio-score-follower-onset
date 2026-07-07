@@ -16,6 +16,7 @@ from audio_score_follower.launch_options import (
     LaunchOptions,
     coerce_device,
     compute_silence_threshold,
+    default_config_dir,
     from_cli_args,
     read_launcher_settings,
     rematch_device,
@@ -413,3 +414,24 @@ class TestRematchDevice:
 
     def test_none_stored(self):
         assert rematch_device(None, None, self.DEVICES) is None
+
+
+# ---------------------------------------------------- default_config_dir
+class TestDefaultConfigDir:
+    def test_prefers_cwd_config_when_present(self, tmp_path, monkeypatch):
+        (tmp_path / "config").mkdir()
+        monkeypatch.chdir(tmp_path)
+        assert default_config_dir() == Path("config")
+
+    def test_falls_back_to_package_config_from_foreign_cwd(
+        self, tmp_path, monkeypatch
+    ):
+        # No config/ under the CWD (the reboot-from-home scenario, Issue #7):
+        # must locate the config/ shipped at the repo root, not return the
+        # empty CWD-relative path.
+        monkeypatch.chdir(tmp_path)
+        assert not (tmp_path / "config").exists()
+        result = default_config_dir()
+        assert result.is_absolute()
+        assert result.name == "config"
+        assert result.is_dir()
