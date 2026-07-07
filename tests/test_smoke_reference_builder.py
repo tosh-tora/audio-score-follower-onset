@@ -19,6 +19,22 @@ def _make_synth_audio(sr: int, duration_sec: float, freq: float = 440.0) -> np.n
     return (0.5 * np.sin(2 * np.pi * freq * t) + 0.01 * rng.standard_normal(len(t))).astype(np.float32)
 
 
+def _make_note_sequence(sr: int, note_durations_sec: list[float]) -> np.ndarray:
+    """Ascending diatonic note sequence (one sine per note).
+
+    Chroma varies over time, so DTW can localize — a single sustained
+    tone has constant chroma and any warp path is equally cheap.
+    """
+    # C4, D4, E4, F4, G4, A4, B4, C5 — well inside synctoolbox's
+    # MIDI 21-108 pitch-feature band.
+    freqs = [261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88, 523.25]
+    assert len(note_durations_sec) == len(freqs)
+    parts = []
+    for freq, dur in zip(freqs, note_durations_sec):
+        parts.append(_make_synth_audio(sr, dur, freq))
+    return np.concatenate(parts)
+
+
 def test_build_reference_smoke(tmp_path):
     pytest.importorskip("librosa")
     pytest.importorskip("synctoolbox")
@@ -73,6 +89,76 @@ def test_build_reference_smoke(tmp_path):
     import json
     meta = json.loads((out_dir / "build_meta.json").read_text(encoding="utf-8"))
     assert meta.get("has_onset") is True
+
+
+def test_build_reference_recovers_known_tempo_warp(tmp_path):
+    """Issue #32 regression guard: the warp path must capture tempo変化.
+
+    旧実装はランタイム CENS (10.77 Hz, 重平滑) を sync_via_mrmsdtw に
+    渡しており、multiscale smoothing が全レベルで過平滑になって warp が
+    「平均テンポの対角線」に退化していた (幻想4 実測: 2947 ステップ中
+    2937 が完全対角)。既知の区分的タイムストレッチを復元できることを
+    確認する — 退化した対角パスはここで必ず落ちる。
+    """
+    pytest.importorskip("librosa")
+    pytest.importorskip("synctoolbox")
+    from scipy.io import wavfile  # type: ignore
+    from audio_score_follower.core.feature_extractor import FeatureConfig
+    from audio_score_follower.core.reference_builder import build_reference
+
+    sr = 22050
+    cfg = FeatureConfig(sample_rate=sr, hop_length=2048)
+
+    # Score: 8 notes × 0.5 s = 4.0 s at "constant tempo".
+    score_durs = [0.5] * 8
+    score_audio = _make_note_sequence(sr, score_durs)
+    score_path = tmp_path / "score.wav"
+    wavfile.write(str(score_path), sr, (score_audio * 32000).astype(np.int16))
+
+    # Reference: same notes, first half slower (0.75 s/note), second
+    # half faster (0.375 s/note) — total 4.5 s, known piecewise warp.
+    ref_durs = [0.75] * 4 + [0.375] * 4
+    ref_audio = _make_note_sequence(sr, ref_durs)
+    ref_path = tmp_path / "ref.wav"
+    wavfile.write(str(ref_path), sr, (ref_audio * 32000).astype(np.int16))
+
+    out_dir = tmp_path / "built_warp"
+    result = build_reference(
+        score_wav=score_path,
+        reference_wav=ref_path,
+        output_dir=out_dir,
+        score_bpm=120.0,
+        feature_config=cfg,
+        plot=False,
+    )
+
+    # Analytic ground truth from the note boundaries: ref_t → score_t.
+    score_bounds = np.cumsum([0.0] + score_durs)
+    ref_bounds = np.cumsum([0.0] + ref_durs)
+
+    def gt_score_time(ref_t: float) -> float:
+        return float(np.interp(ref_t, ref_bounds, score_bounds))
+
+    # Probe at mid-note reference positions (skip first/last notes:
+    # endpoint snapping makes them trivially correct even when degenerate).
+    probes = [(ref_bounds[i] + ref_bounds[i + 1]) / 2 for i in range(1, 7)]
+    for ref_t in probes:
+        got = float(np.interp(ref_t, result.ref_times, result.score_times))
+        expect = gt_score_time(ref_t)
+        assert abs(got - expect) < 0.3, (
+            f"warp path inaccurate at ref_t={ref_t:.3f}s: "
+            f"got score_t={got:.3f}, expected {expect:.3f}"
+        )
+
+    # Anti-degeneracy: a diagonal-at-global-ratio path must NOT fit.
+    ratio = result.score_times[-1] / max(result.ref_times[-1], 1e-9)
+    max_dev = float(np.max(np.abs(
+        result.score_times - result.ref_times * ratio
+    )))
+    assert max_dev > 0.3, (
+        f"warp path is (near-)degenerate diagonal: max deviation "
+        f"{max_dev:.3f}s from the global-ratio line"
+    )
 
 
 def test_build_reference_end_trim(tmp_path):
