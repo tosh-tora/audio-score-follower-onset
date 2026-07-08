@@ -90,6 +90,12 @@ class AppState:
         # Always False in wav/loopback modes (auto-start).
         self.waiting_for_start: bool = False
 
+        # One-shot startup warning from mic_effects_probe (mic mode only):
+        # non-None while the selected mic's OS-level noise suppression
+        # was detected active (or could not be confirmed absent). None =
+        # no warning to show. Set once at startup, not polled live.
+        self.mic_effects_warning: Optional[str] = None
+
     def get_all(self) -> dict:
         """
         Atomically get snapshot of all state.
@@ -118,6 +124,7 @@ class AppState:
                 'mic_monitor_available': self.mic_monitor_available,
                 'silence_threshold_db': self.silence_threshold_db,
                 'waiting_for_start': self.waiting_for_start,
+                'mic_effects_warning': self.mic_effects_warning,
                 'is_locked_in': self.is_locked_in,
                 'is_in_inertia': self.is_in_inertia,
                 'inertia_elapsed_sec': self.inertia_elapsed_sec,
@@ -242,6 +249,11 @@ class AppState:
         """Update the mic-mode manual-start waiting flag."""
         with self._lock:
             self.waiting_for_start = waiting
+
+    def set_mic_effects_warning(self, message: Optional[str]) -> None:
+        """Record (or clear) the startup mic-noise-suppression warning."""
+        with self._lock:
+            self.mic_effects_warning = message
 
     def set_follower_mode(
         self,

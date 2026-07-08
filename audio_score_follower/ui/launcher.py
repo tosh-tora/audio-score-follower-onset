@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -35,11 +36,15 @@ from audio_score_follower.launch_options import (
     save_launcher_settings,
     validate,
 )
+from audio_score_follower.core.mic_effects_probe import (
+    SOUND_SETTINGS_URI,
+    probe_capture_effects,
+)
 from audio_score_follower.ui.gui_tkinter import _pick_font_family
 
 logger = logging.getLogger(__name__)
 
-_WINDOW_GEOMETRY = "760x680"
+_WINDOW_GEOMETRY = "760x780"
 _DEFAULT_DEVICE_LABEL = "既定のデバイス"
 # Poll interval for the silence-threshold measurement. The monitor's RMS
 # block is 1024/16000 ≈ 64ms, so 60ms samples each block roughly once.
@@ -303,18 +308,31 @@ class _LauncherWindow:
         self.label_measure.grid(
             row=1, column=0, columnspan=3, sticky="w", padx=8
         )
+        self.button_check_nc = ttk.Button(
+            frm_adv, text="マイクのノイズキャンセル検知", command=self._on_check_nc
+        )
+        self.button_check_nc.grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        self.label_nc = ttk.Label(
+            frm_adv, text="", font=self._font_small, wraplength=680, justify="left",
+        )
+        self.label_nc.grid(row=3, column=0, columnspan=3, sticky="w", padx=8)
+        self.button_open_sound_settings = ttk.Button(
+            frm_adv, text="サウンド設定を開く", command=self._on_open_sound_settings,
+        )
+        self._nc_settings_button_visible = False
+
         ttk.Label(frm_adv, text="トリガ間隔 cooldown_seconds (秒):").grid(
-            row=2, column=0, sticky="w", padx=8, pady=4
+            row=4, column=0, sticky="w", padx=8, pady=4
         )
         self.var_cooldown = tk.StringVar(value="3.0")
         ttk.Spinbox(
             frm_adv, textvariable=self.var_cooldown,
             from_=0.0, to=60.0, increment=0.5, width=8,
-        ).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ).grid(row=4, column=1, sticky="w", padx=8, pady=4)
         self.var_verbose = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frm_adv, text="詳細ログ (-v)", variable=self.var_verbose
-        ).grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        ).grid(row=5, column=0, sticky="w", padx=8, pady=4)
 
         # --- buttons -------------------------------------------------------
         frm_btn = ttk.Frame(body)
@@ -484,6 +502,55 @@ class _LauncherWindow:
         monitor.stop()
         self.button_measure.configure(text="無音測定")
         self.label_measure.configure(text="")
+
+    # ---------------------------------------------- noise-suppression check
+    def _on_check_nc(self) -> None:
+        """Probe the currently-selected mic for OS-level noise suppression.
+
+        Always reads from the mic picker regardless of the active input
+        source, mirroring the 無音測定 button (Issue #19 lesson: source-
+        linked disabling confused operators before). The WinRT call
+        blocks the UI briefly (~100-300ms observed); acceptable for a
+        one-shot pre-flight check.
+        """
+        self.button_check_nc.configure(state="disabled")
+        self.label_nc.configure(text="確認中…", foreground="#555")
+        self.root.update_idletasks()
+        try:
+            report = probe_capture_effects(self.pick_mic.value())
+        finally:
+            self.button_check_nc.configure(state="normal")
+
+        headline = report.headline_ja()
+        if report.has_noise_suppression or report.suspicious_name:
+            color = "#c00"
+        elif not report.probe_available or not report.device_matched:
+            color = "#c60"
+        else:
+            color = "#080"
+        self.label_nc.configure(text=headline, foreground=color)
+
+        show_settings_button = report.has_noise_suppression
+        if show_settings_button and not self._nc_settings_button_visible:
+            self.button_open_sound_settings.grid(
+                row=2, column=1, columnspan=2, sticky="w", padx=8, pady=4
+            )
+            self._nc_settings_button_visible = True
+        elif not show_settings_button and self._nc_settings_button_visible:
+            self.button_open_sound_settings.grid_forget()
+            self._nc_settings_button_visible = False
+
+    def _on_open_sound_settings(self) -> None:
+        try:
+            os.startfile(SOUND_SETTINGS_URI)  # noqa: S606 (fixed OS URI, no user input)
+        except OSError as exc:
+            logger.warning("Failed to open sound settings: %s", exc)
+            messagebox.showwarning(
+                "起動エラー",
+                f"サウンド設定を開けませんでした ({exc})。\n"
+                "手動でマイクのプロパティ→「レベル」/「拡張機能」タブを確認してください。",
+                parent=self.root,
+            )
 
     def _on_browse_wav(self) -> None:
         initial = str(Path("data") / "reference_audio")
