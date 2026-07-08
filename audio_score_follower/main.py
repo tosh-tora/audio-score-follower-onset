@@ -59,6 +59,7 @@ from audio_score_follower.config.loader import ConfigError, ConfigLoader
 from audio_score_follower.core.audio_level import AudioLevelMonitor
 from audio_score_follower.core.cooldown_timer import CooldownTimer
 from audio_score_follower.core.follower_worker import FileWorker, FollowerWorker
+from audio_score_follower.core.mic_effects_probe import probe_capture_effects
 from audio_score_follower.core.oltw_follower import (
     FollowResult,
     OnlineDTWFollower,
@@ -240,6 +241,7 @@ class AudioScoreFollowerApp:
             self.state.set_silence_threshold(
                 self.config.get_silence_threshold_db()
             )
+            self._check_mic_effects()
             try:
                 self.audio_monitor.start()
             except BaseException as exc:  # noqa: BLE001
@@ -294,6 +296,28 @@ class AudioScoreFollowerApp:
             logger.info("Interrupted")
         finally:
             self._cleanup()
+
+    def _check_mic_effects(self) -> None:
+        """One-shot mic-mode startup check for OS-level noise suppression.
+
+        The feature space (CENS + onset) assumes an unprocessed signal —
+        NC distorts both chroma and attack envelopes and silently
+        degrades tracking (see CLAUDE.md). This does not block startup
+        (detection has known blind spots: hardware-embedded NC and
+        upstream virtual mics are invisible to this probe), it only
+        surfaces a GUI warning so the operator can check Windows sound
+        settings before a performance.
+        """
+        try:
+            report = probe_capture_effects(self.config.get_mic_device())
+        except BaseException as exc:  # noqa: BLE001
+            logger.warning("Mic effects probe raised: %s", exc)
+            return
+        if report.has_noise_suppression or report.suspicious_name:
+            logger.warning("Mic effects check: %s", report.headline_ja())
+            self.state.set_mic_effects_warning(report.headline_ja())
+        else:
+            logger.info("Mic effects check: %s", report.headline_ja())
 
     def _on_gui_closing(self) -> None:
         logger.info("GUI closing")

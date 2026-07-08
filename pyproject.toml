@@ -19,6 +19,15 @@ dependencies = [
     "sounddevice>=0.4.6",
     "playwright>=1.40",
     "music21>=8.0",
+    # WinRT AudioEffectsManager projection, used by
+    # core.mic_effects_probe to detect OS-level mic noise suppression.
+    # Windows-only (feature degrades to "確認できません" without it).
+    "winrt-runtime>=3.0; sys_platform == 'win32'",
+    "winrt-Windows.Foundation>=3.0; sys_platform == 'win32'",
+    "winrt-Windows.Devices.Enumeration>=3.0; sys_platform == 'win32'",
+    "winrt-Windows.Media.Capture>=3.0; sys_platform == 'win32'",
+    "winrt-Windows.Media.Devices>=3.0; sys_platform == 'win32'",
+    "winrt-Windows.Media.Effects>=3.0; sys_platform == 'win32'",
     # NOTE: synctoolbox is NOT listed here because synctoolbox 1.4.1 pins
     # numpy<2 / pandas<2 / music21<6 which conflict with our modern stack.
     # Install separately: pip install --no-deps synctoolbox libfmp ipython

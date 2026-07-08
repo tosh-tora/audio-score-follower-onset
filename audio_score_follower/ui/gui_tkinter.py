@@ -207,6 +207,18 @@ class FollowerGUI:
         )
         self._mismatch_visible = False
 
+        # マイクのノイズ抑制フィルター警告 — 起動時に一度だけ判定される
+        # mic_effects_warning が非 None の間表示する（mismatch と同じ
+        # 差分時のみ pack/forget パターン。落とし穴 #6）。
+        self.label_mic_effects = tk.Label(
+            self.root,
+            text="",
+            font=(family, _CONFIDENCE_FONT_SIZE, "bold"),
+            bg="#e65100", fg="white", padx=12, pady=4,
+            wraplength=1300, justify="center",
+        )
+        self._mic_effects_visible = False
+
         # マイクレベル — 確信度バーの直下に置く。確信度はマイク入力に直結する
         # ので並べて確認できると運用しやすい。下にある要素（クールダウン等）が
         # ウィンドウ高さの関係で見切れても、入力レベルだけは見えるようにする。
@@ -410,6 +422,17 @@ class FollowerGUI:
                     self.label_mismatch.pack(pady=4, before=self.label_mic_level)
                 else:
                     self.label_mismatch.pack_forget()
+
+            # マイクのノイズ抑制フィルター警告（起動時 one-shot 判定）
+            mic_warning = state.get('mic_effects_warning')
+            mic_warning_active = bool(mic_warning)
+            if mic_warning_active != self._mic_effects_visible:
+                self._mic_effects_visible = mic_warning_active
+                if mic_warning_active:
+                    self.label_mic_effects.config(text=mic_warning)
+                    self.label_mic_effects.pack(pady=4, before=self.label_mic_level)
+                else:
+                    self.label_mic_effects.pack_forget()
 
             # 次のトリガー
             next_trig = state['next_trigger_measure']
