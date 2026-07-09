@@ -67,12 +67,14 @@ from audio_score_follower.core.oltw_follower import (
 from audio_score_follower.core.score_mapper import ScoreMapper
 from audio_score_follower.core.slide_controller import NullSlideController, SlideController
 from audio_score_follower.core.state_manager import AppState
+from audio_score_follower.core.viz_feed import VizFeed, VizThresholds
 from audio_score_follower.core.warp_lookup import (
     WarpLookup,
     load_reference_cens,
     load_reference_onset,
 )
 from audio_score_follower.ui.gui_tkinter import FollowerGUI
+from audio_score_follower.ui.viz_window import VizWindow
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +136,7 @@ class AudioScoreFollowerApp:
         play_audio: bool = False,
         loopback: bool = False,
         loopback_device=None,
+        viz: bool = False,
     ) -> None:
         logger.info(
             "Initialising AudioScoreFollowerApp (config=%s, input_wav=%s, "
@@ -146,6 +149,7 @@ class AudioScoreFollowerApp:
         self.input_wav = input_wav
         self.play_audio = play_audio
         self.loopback = loopback
+        self.viz = viz
         # loopback_device: CLI wins; fall back to config; None = OS default output
         self.loopback_device = (
             loopback_device
@@ -212,6 +216,24 @@ class AudioScoreFollowerApp:
             self.state,
             on_start=self.manual_start,
         )
+
+        # Optional realtime feature/confidence visualiser (--viz). The feed
+        # is a pure data channel; the window is a separate Toplevel consumer
+        # so a future audience-facing screen can share the same feed. When
+        # disabled, viz_feed stays None and _on_oltw_result skips the push.
+        self.viz_feed: VizFeed | None = None
+        if self.viz:
+            self.viz_feed = VizFeed(
+                VizThresholds(
+                    display_conf_cost_lo=_DISPLAY_CONF_COST_LO,
+                    display_conf_cost_hi=_DISPLAY_CONF_COST_HI,
+                    mismatch_cost=self.config.get_oltw_kwargs().get(
+                        "mismatch_cost_threshold", 0.18
+                    ),
+                )
+            )
+            VizWindow(self.root, self.viz_feed)
+            logger.info("Realtime visualiser enabled (--viz)")
 
         self._workers_stop = threading.Event()
         self._trigger_thread: threading.Thread | None = None
@@ -446,6 +468,7 @@ class AudioScoreFollowerApp:
                 reference_onset=reference_onset,
                 chroma_weight=chroma_weight,
                 onset_weight=onset_weight,
+                capture_viz=self.viz,
                 **oltw_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
@@ -545,11 +568,37 @@ class AudioScoreFollowerApp:
         # smoothed fused cost. Frozen frames report NaN cost → display 0
         # without polluting the smoothing window.
         if math.isnan(result.raw_local_cost):
-            self.state.set_display_confidence(0.0)
+            display_conf = 0.0
         else:
             self._display_cost_window.append(result.raw_local_cost)
             smoothed = sum(self._display_cost_window) / len(self._display_cost_window)
-            self.state.set_display_confidence(display_confidence_from_cost(smoothed))
+            display_conf = display_confidence_from_cost(smoothed)
+        self.state.set_display_confidence(display_conf)
+
+        # Feed the realtime visualiser (--viz only). Reuses the measure and
+        # display confidence already computed above; no-op when disabled.
+        if self.viz_feed is not None:
+            # Ground the "演奏位置さがし" panel in real measure numbers: map
+            # the band edges and the DP peak (reference frames) to measures
+            # via the same warp lookup. ~3 cheap lookups/frame at 10 Hz.
+            frame_rate = lookup.feature_config.effective_frame_rate()
+
+            def _frame_measure(frame: int):
+                try:
+                    return lookup.ref_to_measure_and_beat(
+                        frame / frame_rate, mapper
+                    )[0]
+                except Exception:  # noqa: BLE001 — edge frames may fall off
+                    return None
+
+            self.viz_feed.push(
+                result,
+                measure=measure,
+                display_confidence=display_conf,
+                band_lo_measure=_frame_measure(result.band_lo),
+                band_hi_measure=_frame_measure(max(result.band_lo, result.band_hi - 1)),
+                peak_measure=_frame_measure(result.dp_ref_frame),
+            )
         # Mirror OLTW follower mode into AppState so the GUI tracking
         # panel reflects lock-in / inertia transitions in real time.
         if self.oltw is not None:
@@ -998,6 +1047,12 @@ def main() -> int:
              "省略すると OS デフォルト出力デバイスを使用。"
              "利用可能なデバイス一覧は python -c \"import sounddevice; print(sounddevice.query_devices())\" で確認。",
     )
+    parser.add_argument(
+        "--viz", action="store_true",
+        help="特徴量 (ライブ vs 参照 chroma)・融合コスト時系列・探索バンド内"
+             "コスト曲線をリアルタイム表示する可視化ウィンドウを別途開く。"
+             "追随本体には影響しない診断/デモ用。",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1054,6 +1109,7 @@ def main() -> int:
             play_audio=opts.play_audio,
             loopback=(opts.input_source == launch_options.INPUT_SOURCE_LOOPBACK),
             loopback_device=opts.loopback_device,
+            viz=opts.viz,
         )
         app.run()
         return 0

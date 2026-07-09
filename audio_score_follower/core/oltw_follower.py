@@ -77,6 +77,15 @@ class FollowResult:
     # from the performance (sustained high absolute cost). Triggers are
     # suppressed and the GUI shows a warning while this is up.
     is_mismatched: bool = False
+    # Opt-in visualisation payload (populated only when the follower is
+    # constructed with capture_viz=True; None otherwise so production has
+    # zero copy cost). ``band_costs`` is the full fused local-cost curve
+    # over the search band [band_lo, band_hi); ``live_chroma`` /
+    # ``ref_chroma`` are the (12,) CENS vectors being compared at the
+    # chosen position. Read-only copies — never the follower's own arrays.
+    band_costs: Optional[np.ndarray] = None
+    live_chroma: Optional[np.ndarray] = None
+    ref_chroma: Optional[np.ndarray] = None
 
 
 class OnlineDTWFollower:
@@ -126,6 +135,7 @@ class OnlineDTWFollower:
         mismatch_probe_interval_seconds: float = 1.0,
         mismatch_recovery_cost_ceiling: float = 0.08,
         mismatch_recovery_max_jump_seconds: float = 10.0,
+        capture_viz: bool = False,
     ) -> None:
         """
         Args:
@@ -352,6 +362,12 @@ class OnlineDTWFollower:
         self._ref = np.ascontiguousarray(reference_cens, dtype=np.float32)
         self._N = reference_cens.shape[1]
         self._cfg = feature_config
+
+        # When True, process_frame attaches read-only copies of the band
+        # cost curve and the compared chroma vectors to each FollowResult
+        # for the realtime visualiser. Off by default: production pays no
+        # copy cost. Pure diagnostic tap — never feeds back into the DP.
+        self._capture_viz = bool(capture_viz)
 
         # Feature fusion (CENS + onset). Reference onset is L2-comparable
         # to live onset because both are normalised: reference by global
@@ -639,6 +655,24 @@ class OnlineDTWFollower:
             return self._process_first_frame(live)
         return self._process_subsequent_frame(live)
 
+    def _viz_payload(
+        self, local_costs: np.ndarray, live: np.ndarray, ref_pos: int
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Read-only visualisation snapshot for the current frame.
+
+        Returns (band_costs, live_chroma, ref_chroma) as fresh copies when
+        capture_viz is enabled, else (None, None, None). Copies decouple the
+        consumer thread from the follower's internal buffers; the arrays are
+        never used by the DP.
+        """
+        if not self._capture_viz:
+            return None, None, None
+        return (
+            np.array(local_costs, dtype=np.float32),
+            np.array(live, dtype=np.float32),
+            np.array(self._ref[:, ref_pos], dtype=np.float32),
+        )
+
     def _local_cost_block(self, lo: int, hi: int, live_cens: np.ndarray) -> np.ndarray:
         """Fused local cost over reference slice [lo, hi)."""
         onset_block = self._ref_onset[lo:hi] if self._ref_onset is not None else None
@@ -697,6 +731,7 @@ class OnlineDTWFollower:
             and self._ref_onset is not None
             else 0.0
         )
+        viz_band, viz_live, viz_ref = self._viz_payload(local_costs, live, best)
         return FollowResult(
             ref_frame=best,
             ref_time_sec=best / self._cfg.effective_frame_rate(),
@@ -707,6 +742,9 @@ class OnlineDTWFollower:
             dist_chroma=dist_chroma,
             dist_onset=dist_onset,
             dp_ref_frame=best,
+            band_costs=viz_band,
+            live_chroma=viz_live,
+            ref_chroma=viz_ref,
         )
 
     def _probe_decisive_forward_match(
@@ -1320,6 +1358,7 @@ class OnlineDTWFollower:
             "dist_chroma=%.4f dist_onset=%.4f dist_total=%.4f at ref=%d",
             dist_chroma, dist_onset, local_cost_at_best, new_pos,
         )
+        viz_band, viz_live, viz_ref = self._viz_payload(local_costs, live, new_pos)
         return FollowResult(
             ref_frame=out_pos,
             ref_time_sec=out_pos / self._cfg.effective_frame_rate(),
@@ -1331,6 +1370,9 @@ class OnlineDTWFollower:
             dist_onset=dist_onset,
             dp_ref_frame=new_pos,
             is_mismatched=self._mismatch_active,
+            band_costs=viz_band,
+            live_chroma=viz_live,
+            ref_chroma=viz_ref,
         )
 
     # ------------------------------------------------------------ frozen path

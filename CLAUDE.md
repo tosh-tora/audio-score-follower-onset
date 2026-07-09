@@ -74,6 +74,8 @@
 | スコア合成 WAV 生成 (MusicXML → music21 → MIDI → FluidSynth) | `tasks/generate_score_wav.py` |
 | **追従品質のヘッドレス計測**（カバレッジ / ジャンプ / stall 統計、パラメータ A/B、`--follower` 切替） | `tasks/eval_tracking.py` |
 | **表示確信度**（コストベース。`display_confidence_from_cost` + `_DISPLAY_CONF_COST_LO/HI`） | `audio_score_follower/main.py`（GUI 反映は `state_manager.set_display_confidence` → `gui_tkinter`） |
+| **リアルタイム可視化**（`--viz`。一致度ゲージ・ライブ vs 参照 chroma 比較バー・一致度推移の面グラフ・「演奏位置さがし」の山。指標語は「一致度」に統一、上=良い/緑=良いの直感文法）: スレッド安全な純データ供給層 | `audio_score_follower/core/viz_feed.py`（`VizFeed` / `VizThresholds`） |
+| 同上の描画層（別 Toplevel、Canvas、`root.after` 100ms poll）。**将来の観客用画面は同じ `VizFeed` を読む別描画クラスとして `ui/` に追加する設計** | `audio_score_follower/ui/viz_window.py`（`VizWindow`） |
 
 ユーザーが「**ボタンの挙動を変えたい**」と言ったら `ui/gui_tkinter.py` 単発で済むことが多い。「**追随ロジックが暴走する**」なら `core/oltw_follower.py` の DP recurrence と band 計算。「**測度がずれる**」なら `core/warp_lookup.py` か `core/score_mapper.py`。「**マイクで動かない**」なら `core/audio_level.py` と `_check_silence_gate` (main.py)。「**warp path 検証が落ちる**」なら `core/warp_lookup.py` の `validate()` と、スコアの繰り返し構造を確認する。
 

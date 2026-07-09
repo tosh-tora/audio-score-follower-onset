@@ -333,6 +333,10 @@ class _LauncherWindow:
         ttk.Checkbutton(
             frm_adv, text="詳細ログ (-v)", variable=self.var_verbose
         ).grid(row=5, column=0, sticky="w", padx=8, pady=4)
+        self.var_viz = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm_adv, text="特徴量・確信度モニタを開く (--viz)", variable=self.var_viz
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=4)
 
         # --- buttons -------------------------------------------------------
         frm_btn = ttk.Frame(body)
@@ -407,6 +411,7 @@ class _LauncherWindow:
         self.var_wav.set(saved["input_wav"] or "")
         self.var_play_audio.set(bool(saved["play_audio"]))
         self.var_verbose.set(bool(saved["verbose"]))
+        self.var_viz.set(bool(saved["viz"]))
         self.var_silence.set(str(saved["silence_threshold_db"]))
         self.var_cooldown.set(str(saved["cooldown_seconds"]))
         self.pick_mic.restore(saved["mic_device"], saved["mic_device_name"])
@@ -593,6 +598,7 @@ class _LauncherWindow:
             verbose=bool(self.var_verbose.get()),
             silence_threshold_db=silence,
             cooldown_seconds=cooldown,
+            viz=bool(self.var_viz.get()),
         )
 
     def _on_start(self) -> None:

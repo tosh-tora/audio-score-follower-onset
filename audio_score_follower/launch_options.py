@@ -68,6 +68,10 @@ class LaunchOptions:
     verbose: bool = False
     silence_threshold_db: Optional[float] = None
     cooldown_seconds: Optional[float] = None
+    # Operator/dev diagnostic: open the realtime feature/confidence
+    # visualiser. Settable from both the CLI (--viz) and the launcher
+    # checkbox, and persisted in the settings.launcher block.
+    viz: bool = False
 
     @property
     def effective_input_wav(self) -> Optional[Path]:
@@ -162,6 +166,7 @@ def from_cli_args(args) -> LaunchOptions:
         play_audio=args.play_audio,
         loopback_device=coerce_device(args.loopback_device),
         verbose=args.verbose,
+        viz=getattr(args, "viz", False),
     )
 
 
@@ -173,6 +178,7 @@ _LAUNCHER_DEFAULTS = {
     "input_wav": None,
     "play_audio": False,
     "verbose": False,
+    "viz": False,
     "mic_device_name": None,
     "loopback_device_name": None,
 }
@@ -236,6 +242,7 @@ def save_launcher_settings(
         "input_wav": str(opts.input_wav) if opts.input_wav is not None else None,
         "play_audio": bool(opts.play_audio),
         "verbose": bool(opts.verbose),
+        "viz": bool(opts.viz),
         "mic_device_name": mic_device_name,
         "loopback_device_name": loopback_device_name,
     }
