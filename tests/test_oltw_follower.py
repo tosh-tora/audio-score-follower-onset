@@ -1367,3 +1367,55 @@ def test_seek_clears_prelockin_snapshot():
     assert follower.dp_ref_frame == 50, (
         f"seek must supersede the rewind snapshot; got {follower.dp_ref_frame}"
     )
+
+
+# ------------------------------------------------------------ capture_viz tap
+
+def test_capture_viz_disabled_by_default():
+    """既定 (capture_viz=False) では viz フィールドは None のまま。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20)
+    for j in range(10):
+        r = follower.process_frame(ref[:, j])
+        assert r.band_costs is None
+        assert r.live_chroma is None
+        assert r.ref_chroma is None
+
+
+def test_capture_viz_populates_arrays():
+    """capture_viz=True で band_costs / live_chroma / ref_chroma が
+    正しい shape で埋まる（初回フレームと後続フレームの両方）。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20, capture_viz=True)
+
+    # First frame.
+    r0 = follower.process_frame(ref[:, 0])
+    assert r0.live_chroma is not None and r0.live_chroma.shape == (12,)
+    assert r0.ref_chroma is not None and r0.ref_chroma.shape == (12,)
+    assert r0.band_costs is not None and r0.band_costs.ndim == 1
+    assert r0.band_costs.shape[0] == r0.band_hi - r0.band_lo
+
+    # Subsequent frames.
+    for j in range(1, 15):
+        r = follower.process_frame(ref[:, j])
+        assert r.band_costs is not None
+        assert r.band_costs.shape[0] == r.band_hi - r.band_lo
+        assert r.live_chroma.shape == (12,)
+        assert r.ref_chroma.shape == (12,)
+
+
+def test_capture_viz_arrays_are_copies():
+    """viz 配列は follower 内部バッファのコピー（書き換えても DP に
+    波及しない）。"""
+    cfg = FeatureConfig()
+    ref = _make_chroma_sequence(60)
+    follower = OnlineDTWFollower(ref, cfg, search_width=20, capture_viz=True)
+    follower.process_frame(ref[:, 0])
+    r = follower.process_frame(ref[:, 1])
+    ref_before = follower._ref[:, r.dp_ref_frame].copy()
+    r.ref_chroma[:] = -999.0  # mutate the returned copy
+    assert np.allclose(follower._ref[:, r.dp_ref_frame], ref_before), (
+        "mutating viz payload must not touch the follower's reference"
+    )
