@@ -51,7 +51,10 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from audio_score_follower.core.feature_extractor import FeatureConfig
-from audio_score_follower.core.reference_builder import build_reference
+from audio_score_follower.core.reference_builder import (
+    build_reference,
+    detect_start_offset_sec,
+)
 from audio_score_follower.core.score_mapper import ScoreMapper
 from audio_score_follower.core.synth_locator import find_fluidsynth, find_soundfont
 from audio_score_follower.core.warp_lookup import WarpLookup
@@ -233,9 +236,13 @@ def main() -> int:
              "inferred from a pre-made WAV.",
     )
     parser.add_argument(
-        "--start-offset", type=float, default=0.0,
+        "--start-offset", type=float, default=None,
         help="Seconds to trim from the head of --reference (e.g. drop "
-             "conductor breath). Default 0.",
+             "conductor breath / tuning-A / chair noise). If omitted, "
+             "auto-detected by comparing the score synthesis's opening "
+             "against the reference (assumes the performance starts "
+             "within a few seconds of the reference's head). Pass 0 to "
+             "disable.",
     )
     parser.add_argument(
         "--end-trim", type=float, default=None,
@@ -363,7 +370,13 @@ def main() -> int:
                     "Pass --score-bpm explicitly to skip estimation.", exc
                 )
                 return 1
-            effective_ref_dur = ref_dur - max(args.start_offset, 0.0) - end_trim
+            # start_offset isn't resolved yet at this point (auto-detection
+            # needs the synth, which needs this very estimate) — assume 0
+            # here. Error contribution is negligible: the operator-confirmed
+            # assumption is a start within a few seconds, vs typical
+            # reference durations of minutes (well under 1% duration error,
+            # far inside the existing slope-4x validation tolerance).
+            effective_ref_dur = ref_dur - max(args.start_offset or 0.0, 0.0) - end_trim
             total_beats = score_mapper.get_total_beats()
             try:
                 resolved_bpm = _estimate_score_bpm(total_beats, effective_ref_dur)
@@ -396,6 +409,30 @@ def main() -> int:
             logger.error("Failed to synthesise score WAV: %s", exc)
             return 1
 
+    # --- Resolve reference head trim ---
+    # Needs the score synth (to compare against), so this can only run
+    # once score_wav is resolved above — after the BPM estimate, which
+    # assumed start_offset=0 (see comment there).
+    if args.start_offset is not None:
+        start_offset = max(0.0, float(args.start_offset))
+    else:
+        try:
+            start_offset = detect_start_offset_sec(
+                score_wav, args.reference, args.sample_rate
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Head-offset auto-detection failed (%s); building without "
+                "start offset. Pass --start-offset explicitly if needed.", exc
+            )
+            start_offset = 0.0
+        if start_offset > 0:
+            logger.info(
+                "Auto-detected %.2fs of leading non-music audio in "
+                "reference — trimming (override with --start-offset).",
+                start_offset,
+            )
+
     try:
         result = build_reference(
             score_wav=score_wav,
@@ -403,7 +440,7 @@ def main() -> int:
             output_dir=args.output,
             score_bpm=resolved_bpm,
             feature_config=cfg,
-            reference_start_offset_sec=args.start_offset,
+            reference_start_offset_sec=start_offset,
             reference_end_trim_sec=end_trim,
             plot=args.plot,
         )

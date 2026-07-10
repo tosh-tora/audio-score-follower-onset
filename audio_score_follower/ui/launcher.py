@@ -346,6 +346,9 @@ class _LauncherWindow:
         ttk.Button(frm_btn, text="キャンセル", command=self._on_cancel).pack(
             side="right", padx=10
         )
+        ttk.Button(
+            frm_btn, text="オフラインビルドを作成…", command=self._on_open_build
+        ).pack(side="left", padx=10)
 
         self._on_source_changed()
 
@@ -630,6 +633,28 @@ class _LauncherWindow:
         self._abort_measure()
         self.result = None
         self.root.destroy()
+
+    # ------------------------------------------------------------ offline build
+    def _on_open_build(self) -> None:
+        """Open the offline-build screen; pre-select a config it generates.
+
+        Lazy import keeps the launcher's cold-start free of the build
+        screen's module until the operator actually asks for it.
+        """
+        self._abort_measure()  # release the measurement mic before navigating
+        from audio_score_follower.ui.build_window import run_build_window
+
+        generated = run_build_window(self.root, self.config_dir)
+        if generated is None:
+            return
+        self._refresh_config_list()
+        path_str = str(generated)
+        values = list(self.combo_config["values"])
+        if path_str not in values:
+            values.insert(0, path_str)
+            self.combo_config["values"] = values
+        self.var_config.set(path_str)
+        self._on_config_selected()
 
 
 def run_launcher(config_dir: Optional[Path] = None) -> Optional[LaunchOptions]:
