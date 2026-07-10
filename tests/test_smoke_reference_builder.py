@@ -219,3 +219,63 @@ def test_build_reference_end_trim(tmp_path):
             reference_end_trim_sec=100.0,
             plot=False,
         )
+
+
+def test_detect_start_offset_sec_clean_start_returns_zero(tmp_path):
+    """A reference whose head already matches the score must not be trimmed.
+
+    detect_start_offset_sec must not manufacture a trim when there is no
+    confident junk→music ramp (contrast below _HEAD_DETECT_CONTRAST_MIN).
+    """
+    pytest.importorskip("librosa")
+    from scipy.io import wavfile  # type: ignore
+    from audio_score_follower.core.reference_builder import detect_start_offset_sec
+
+    sr = 22050
+    notes = _make_note_sequence(sr, [0.5] * 8)  # 4s ascending sequence
+    score_path = tmp_path / "score.wav"
+    wavfile.write(str(score_path), sr, (notes * 32000).astype(np.int16))
+    ref_path = tmp_path / "ref_clean.wav"
+    wavfile.write(str(ref_path), sr, (notes * 32000).astype(np.int16))
+
+    offset = detect_start_offset_sec(score_path, ref_path, sample_rate=sr)
+    assert offset == pytest.approx(0.0, abs=0.05)
+
+
+def test_detect_start_offset_sec_tonal_head_noise_detected_conservatively(tmp_path):
+    """A sustained tuning-A-like tone before the music must be caught.
+
+    Energy-only silence detection is blind to this (the tone is not
+    quiet); comparing against the score synthesis separates it. The
+    detector must never OVER-trim into the true music start — prototype
+    validation (see reference_builder.detect_start_offset_sec docstring)
+    showed every tonal-junk scenario resolves to an under-trim, never a
+    cut into the music, so we only assert offset stays within
+    [0, true_offset] with a small safety margin.
+    """
+    pytest.importorskip("librosa")
+    from scipy.io import wavfile  # type: ignore
+    from audio_score_follower.core.reference_builder import detect_start_offset_sec
+
+    sr = 22050
+    notes = _make_note_sequence(sr, [0.5] * 8)
+    score_path = tmp_path / "score.wav"
+    wavfile.write(str(score_path), sr, (notes * 32000).astype(np.int16))
+
+    true_offset_sec = 1.2
+    rng = np.random.default_rng(0)
+    t = np.arange(int(true_offset_sec * sr)) / sr
+    tuning_a = (0.12 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    tuning_a += (0.01 * rng.standard_normal(len(t))).astype(np.float32)
+    ref_audio = np.concatenate([tuning_a, notes])
+    ref_path = tmp_path / "ref_noisy_head.wav"
+    wavfile.write(str(ref_path), sr, (ref_audio * 32000).astype(np.int16))
+
+    offset = detect_start_offset_sec(score_path, ref_path, sample_rate=sr)
+    assert offset > 0.3, (
+        f"expected the tonal head noise to be detected (got {offset:.2f}s)"
+    )
+    assert offset <= true_offset_sec + 0.1, (
+        f"must never trim past the true music start: "
+        f"offset={offset:.2f}s true={true_offset_sec:.2f}s"
+    )

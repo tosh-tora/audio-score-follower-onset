@@ -283,6 +283,160 @@ def _run_mrmsdtw(
     return np.asarray(wp, dtype=np.int64)
 
 
+# ---------------------------------------------------------------------------
+# Head-offset auto-detection (leading conductor breath / tuning-A / chair
+# noise). Complements the existing tail-silence auto-detection
+# (cli/build_reference._detect_tail_silence_sec), which is energy-only and
+# therefore blind to head noise that is not quiet (a sustained tuning A,
+# breathing, a cough). Those are only distinguishable from the true music
+# start by comparing against WHAT the music actually sounds like — hence
+# this lives next to the alignment features, not next to the tail detector.
+# ---------------------------------------------------------------------------
+
+# Deliberately independent of both the runtime FeatureConfig (cens_win=41,
+# ~3.8s smoothing — too blurry to localise a sub-second boundary) and the
+# 50 Hz MrMsDTW alignment pipeline (a different feature space entirely).
+# This is a THIRD, narrow-purpose pipeline used only to find where the
+# music starts.
+_HEAD_DETECT_CENS_WIN = 11
+_HEAD_DETECT_CHROMA_WEIGHT = 0.7
+_HEAD_DETECT_ONSET_WEIGHT = 0.3
+_HEAD_DETECT_WINDOW_SEC = 1.0
+# Operator assumption (confirmed): performance starts within ~2s of
+# playback. +0.5s slack keeps the search cheap without cutting it close.
+_HEAD_DETECT_SEARCH_SEC = 2.5
+# Minimum high→low cost drop to trust that a ramp represents "junk → music"
+# rather than sensor noise in an already-clean opening. Calibrated on
+# synthetic head-noise scenarios (silence / 440Hz tuning-A / broadband
+# noise / a realistic silence+tuning+breath composite prepended to a real
+# recording): a clean start measures contrast ~0.01, while every junk
+# scenario with tonal content measured contrast >= 0.45. Featureless
+# broadband noise alone (no pitch, no attack) measures a much smaller
+# contrast (~0.04) and is intentionally left BELOW this gate — that
+# scenario also does the least harm to MrMsDTW (no misleading harmonic
+# content to lock onto), so under-detecting it is the safe failure mode.
+_HEAD_DETECT_CONTRAST_MIN = 0.15
+# Crossing point as a fraction of the peak→floor drop. 0.4 (closer to the
+# floor than the peak) with the backoff below errs toward leaving a
+# little junk rather than clipping into the music.
+_HEAD_DETECT_DROP_FRAC = 0.4
+# Trim slightly BEFORE the detected crossing — every synthetic scenario
+# tested resolved to an UNDER-trim with this margin (never cut into the
+# music); see the prototype numbers in the function docstring.
+_HEAD_DETECT_BACKOFF_SEC = 0.2
+
+
+def detect_start_offset_sec(
+    score_wav: Path,
+    reference_wav: Path,
+    sample_rate: int = 22050,
+) -> float:
+    """Auto-detect leading non-music audio in ``reference_wav`` by comparing
+    its opening against the score synthesis's opening.
+
+    Energy-only silence detection (as used for the tail — see
+    ``cli/build_reference._detect_tail_silence_sec``) cannot see head noise
+    that is not quiet: a conductor's tuning-A, a breath, a chair creak all
+    sound "present" to an RMS gate. But none of them resemble the score's
+    actual opening harmony/onset pattern, so comparing against the score
+    synthesis (which this project already produces) separates them.
+
+    Algorithm: take the score synthesis's opening
+    ``_HEAD_DETECT_WINDOW_SEC`` as a template (chroma+onset fused cost,
+    ``fused_local_cost``-style weights), slide it across the reference's
+    first ``_HEAD_DETECT_SEARCH_SEC`` seconds (after trimming pure
+    leading silence with the same energy method used for the tail), and
+    look for a confident high→low "junk → music" ramp: the first frame
+    whose cost falls below ``floor + _HEAD_DETECT_DROP_FRAC * contrast``,
+    backed off by ``_HEAD_DETECT_BACKOFF_SEC`` for safety.
+
+    Returns 0.0 (i.e. "do not trim") whenever the ramp isn't confident
+    (``contrast < _HEAD_DETECT_CONTRAST_MIN``) — a clean opening and a
+    featureless-noise opening both degrade to this safe default. This
+    mirrors the fail-safe stance of the NC-detection probe
+    (``core/mic_effects_probe.py``): a missed head-noise costs a slightly
+    worse warp near measure 1; a false-positive trim risks losing the
+    opening measure outright, which is the worse failure.
+
+    Validated on synthetic head-noise prepended to a real recording
+    (silence / 440Hz tuning-A / broadband noise / a silence+tuning+breath
+    composite): every tonal-noise scenario resolved to an UNDER-trim
+    (never cut into the music, error -0.5s to -1.2s vs the true onset);
+    a clean opening and pure-silence opening resolved with ~0 error. Not
+    yet calibrated against a real head-noise recording — see the
+    ``--start-offset`` manual override for whenever this proves too
+    conservative or too aggressive on a particular recording.
+    """
+    import librosa  # type: ignore — heavy, defer
+
+    cfg = FeatureConfig(sample_rate=sample_rate, cens_win=_HEAD_DETECT_CENS_WIN)
+    fps = cfg.effective_frame_rate()
+
+    score_audio = _load_audio_mono(score_wav, sample_rate)
+    # Trim any leading silence in the SYNTH too, so the template genuinely
+    # starts at the music (FluidSynth renders can have a few ms of lead-in).
+    score_audio, _ = librosa.effects.trim(score_audio, top_db=40)
+    template_len = int((_HEAD_DETECT_WINDOW_SEC + 0.5) * sample_rate)
+    score_audio = score_audio[:template_len]
+
+    ref_audio = _load_audio_mono(reference_wav, sample_rate)
+    needed = int((_HEAD_DETECT_WINDOW_SEC + _HEAD_DETECT_SEARCH_SEC + 1.0) * sample_rate)
+    if len(ref_audio) < needed:
+        logger.debug(
+            "Reference too short for head-offset detection (%d < %d samples); "
+            "skipping (no trim).", len(ref_audio), needed,
+        )
+        return 0.0
+    # Energy pre-trim: same idiom as the tail detector, applied to the head.
+    _, idx = librosa.effects.trim(ref_audio[:needed], top_db=40)
+    energy_trim_sec = idx[0] / sample_rate
+    ref_search = ref_audio[idx[0]:idx[0] + needed]
+
+    def _features(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        cens = compute_cens(audio, cfg)
+        onset = normalize_onset_global(compute_onset(audio, cfg))
+        n = min(cens.shape[1], onset.shape[0])
+        return cens[:, :n], onset[:n]
+
+    sc_cens, sc_onset = _features(score_audio)
+    win_frames = int(_HEAD_DETECT_WINDOW_SEC * fps)
+    n = min(sc_cens.shape[1], win_frames)
+    if n < 3:
+        return 0.0
+    sc_cens, sc_onset = sc_cens[:, :n], sc_onset[:n]
+
+    rf_cens, rf_onset = _features(ref_search)
+    search_frames = int(_HEAD_DETECT_SEARCH_SEC * fps)
+    costs = []
+    for s in range(min(search_frames, rf_cens.shape[1] - n + 1)):
+        seg_c = rf_cens[:, s:s + n]
+        seg_o = rf_onset[s:s + n]
+        chroma_cost = 1.0 - np.sum(sc_cens * seg_c, axis=0)
+        onset_cost = np.abs(sc_onset - seg_o)
+        costs.append(float(np.mean(
+            _HEAD_DETECT_CHROMA_WEIGHT * chroma_cost
+            + _HEAD_DETECT_ONSET_WEIGHT * onset_cost
+        )))
+    if len(costs) < 5:
+        return round(energy_trim_sec, 3) if energy_trim_sec > 0 else 0.0
+
+    costs_arr = np.array(costs)
+    floor = float(np.min(costs_arr))
+    peak_frames = min(len(costs_arr), max(1, int(0.6 * fps) + 1))
+    peak = float(np.max(costs_arr[:peak_frames]))
+    contrast = peak - floor
+    if contrast < _HEAD_DETECT_CONTRAST_MIN:
+        return round(energy_trim_sec, 3) if energy_trim_sec > 0 else 0.0
+
+    threshold = floor + _HEAD_DETECT_DROP_FRAC * contrast
+    crossing = next((i for i, c in enumerate(costs_arr) if c <= threshold), None)
+    if crossing is None:
+        return round(energy_trim_sec, 3) if energy_trim_sec > 0 else 0.0
+
+    detected_in_search = max(0.0, crossing / fps - _HEAD_DETECT_BACKOFF_SEC)
+    return round(energy_trim_sec + detected_in_search, 3)
+
+
 def build_reference(
     score_wav: Path,
     reference_wav: Path,

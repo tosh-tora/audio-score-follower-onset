@@ -65,12 +65,13 @@
 | `asf-follow` エントリポイント（`main.main()` への薄い shim） | `audio_score_follower/cli/follow.py` |
 | GUI のレイアウト・モード表示・演奏開始ボタン | `audio_score_follower/ui/gui_tkinter.py` |
 | **起動ランチャー GUI**（config 引数なし起動時。デバイス列挙・フォーム） | `audio_score_follower/ui/launcher.py` |
+| **オフラインビルド GUI 画面**（ランチャーから遷移。`asf-build` をサブプロセス起動して進捗ストリーム表示 + config 生成。純ロジック `build_command` / `generate_config_dict` / `write_config` はテスト可能） | `audio_score_follower/ui/build_window.py`（`BuildWindow` / `run_build_window`） |
 | 起動オプションの検証・CLI/ランチャー共通ロジック・**`settings.launcher` の永続化** | `audio_score_follower/launch_options.py`（Tk/sounddevice 非依存の純ロジック） |
 | GUI ↔ ワーカースレッド間で共有される atomic 状態 | `audio_score_follower/core/state_manager.py` (`AppState`) |
 | config.json のパース・`oltw_kwargs` デフォルト・**`loopback_device`** | `audio_score_follower/config/loader.py` |
 | マイク (`FollowerWorker`) / ファイル (`FileWorker`) / **WASAPI ループバック** のスレッド管理 | `audio_score_follower/core/follower_worker.py` |
 | **実験資産: 全域観測ベイズフィルタ**（本番不使用・eval の `--follower posterior` 専用。「確信度の二本立てと特徴量の判別能」参照） | `audio_score_follower/core/posterior_follower.py` |
-| オフラインビルド (`asf-build`) + **ビルド時 warp path 検証** + **合成 BPM 自動推定** + `--cens-win` | `audio_score_follower/cli/build_reference.py` + `core/reference_builder.py` |
+| オフラインビルド (`asf-build`) + **ビルド時 warp path 検証** + **合成 BPM 自動推定** + **先頭雑音自動トリム (`detect_start_offset_sec`)** + `--cens-win` | `audio_score_follower/cli/build_reference.py` + `core/reference_builder.py` |
 | スコア合成 WAV 生成 (MusicXML → music21 → MIDI → FluidSynth) | `tasks/generate_score_wav.py` |
 | **追従品質のヘッドレス計測**（カバレッジ / ジャンプ / stall 統計、パラメータ A/B、`--follower` 切替） | `tasks/eval_tracking.py` |
 | **表示確信度**（コストベース。`display_confidence_from_cost` + `_DISPLAY_CONF_COST_LO/HI`） | `audio_score_follower/main.py`（GUI 反映は `state_manager.set_display_confidence` → `gui_tkinter`） |
@@ -250,6 +251,18 @@ estimated_bpm = total_beats * 60.0 / ref_duration_sec
 
 **症状からの逆引き**: 「追随は最後まで正常なのに、最終小節の数小節手前で頭打ちになる」場合はまずこれを疑う。eval CSV の末尾で conf が高く 1:1 前進のまま入力が尽きていたら、参照側の warp が無音に食われている。
 
+### 先頭雑音の自動トリム（`--start-offset` / `detect_start_offset_sec()`、2026-07 追加）
+
+指揮者のブレス・椅子の音・チューニングA音等の**先頭雑音はエネルギーだけでは検出できない**（雑音自体が「鳴っている」ため、末尾無音と違い RMS ゲートに引っかからない）。`core/reference_builder.py` の `detect_start_offset_sec()` は**スコア合成の冒頭とリファレンス録音の冒頭を比較**することでこれを解決する: 雑音はスコアの和声・オンセットパターンと一致しないが、演奏開始はスコアと一致し始めるため、比較コストの「高→低」の落差（knee）で境界を検出できる。
+
+- 前提: 「演奏は再生開始から数秒以内に始まる」（探索窓 `_HEAD_DETECT_SEARCH_SEC=2.5s`）
+- ランタイム FeatureConfig（`cens_win=41`）・MrMsDTW の 50Hz アラインメント特徴量のどちらとも独立な**第三の特徴量経路**（`_HEAD_DETECT_CENS_WIN=11`、境界を鋭く捉えるため）。build_meta.json やランタイムには影響しない、検出専用の使い捨て計算
+- **安全側設計**: 高→低の落差が `_HEAD_DETECT_CONTRAST_MIN`(0.15) 未満なら「確信なし」としてトリム量 0 を返す（クリーンな冒頭・特徴を持たない広帯域ノイズは安全側でトリムしない）。閾値交差点はさらに `_HEAD_DETECT_BACKOFF_SEC`(0.2s) 手前にバックオフする（過剰トリムで冒頭小節を切り落とすより、雑音を少し残す方を選ぶ）
+- 実測（人工雑音を実録音の頭に付加した検証。校正用の実雑音入り録音がないため代替）: チューニングA音・広帯域ノイズ・「無音+A音+ブレス」複合のいずれも、検出結果が真の開始位置を**超えて切り込むことは一度もなかった**（誤差 −0.5〜−1.2s の under-trim = 安全側）。クリーンな冒頭では誤トリムなし
+- 実測（幻想4 Berlin 録音、実データ）: 自動検出は 1.86s を検出してトリム（内訳はほぼ純粋な先頭無音 ~1.75s + 比較による微調整）。トリム有無で warp 検証・coverage 178/178・別演奏 eval のカバレッジ/確信度に**回帰なし**（同録音 eval で stall が微増したのは「トリム後の参照 vs 未トリムの同ファイルをそのまま live 入力に使う」検証手法特有のアーティファクトで、本番の手動スタート + silence gate 下では発生しない）
+- `--start-offset <秒>` で手動指定、`--start-offset 0` で無効化。トリム量は `build_meta.json` の `reference_start_offset_sec` に永続化（既存の kwarg、シグネチャ変更なし）
+- **未校正の限界**: 実際に頭雑音が入ったリハ/ゲネプロ録音での動作点（`_HEAD_DETECT_DROP_FRAC` / `_HEAD_DETECT_BACKOFF_SEC`）の最終校正はまだ行っていない。検出結果に違和感があれば `--start-offset` で明示上書きする
+
 **ルール**:
 - `--score-bpm` 明示指定: その値を使う（手動オーバライド）
 - `--score-bpm` 省略 & `--score-wav` なし: 上式で推定。推定値は `build_meta.json` の `score_bpm` フィールドに永続化される
@@ -340,7 +353,7 @@ cost[k] = chroma_weight × (1 − <cens_ref[:,k], live_cens>)
 
 ### リハ録音冒頭の指揮ブレス
 - リハ録音冒頭の指揮者ブレス・椅子の音は **スコアに無い**ので、warp が外れやすい
-- `asf-build --start-offset` で先頭を手動カットする運用
+- `asf-build` は既定でこれを自動検出してトリムする（「先頭雑音の自動トリム」参照）。検出結果に違和感があれば `--start-offset` で手動カット
 
 ### silence gate / 手動スタート / 慣性進行（3 段構えの誤スタート防御）
 
