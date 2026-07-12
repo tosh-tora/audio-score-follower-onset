@@ -2,8 +2,9 @@
 """
 score_mapper.py - Partitura-based Beat ↔ Measure Conversion
 
-Converts continuous beat counts (from pymatchmaker DTW) to measure numbers,
-accounting for variable time signatures (3/4, 4/4, 5/8, etc.).
+Converts continuous beat counts (score_time from the warp lookup) to
+measure numbers, accounting for variable time signatures (3/4, 4/4,
+5/8, etc.).
 
 Also provides beat-within-measure calculations for detailed position tracking.
 """
@@ -130,7 +131,7 @@ class ScoreMapper:
         duration.  We compute ``divs_per_beat`` from the most common full
         measure and use ``measure.duration / divs_per_beat`` for each measure,
         so that a 1-beat anacrusis contributes exactly 1 beat to the cumulative
-        counter — matching what pymatchmaker produces for the same score.
+        counter — matching the beat axis the offline warp path is built on.
         """
         cumulative_beat = 0.0
 

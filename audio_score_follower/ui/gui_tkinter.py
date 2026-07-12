@@ -481,8 +481,3 @@ class FollowerGUI:
 
         # Schedule next poll
         self.root.after(100, self._poll_state)
-
-    def on_closing(self):
-        """Handle window close event."""
-        logger.info("GUI closing")
-        self.root.destroy()

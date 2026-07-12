@@ -215,6 +215,11 @@ class BuildWindow:
         self._log_queue: "queue.Queue[tuple]" = queue.Queue()
         self._cancelled = False
         self._generated_config: Optional[Path] = None
+        # True once the operator edits the config name manually (stops the
+        # output→config-name auto-mirror in _on_output_changed).
+        self._config_name_touched = False
+        # Config path to generate after a successful build (None = skip).
+        self._pending_config_path: Optional[Path] = None
 
         self.top = tk.Toplevel(root)
         self.top.title("オフラインビルド作成")
@@ -380,7 +385,7 @@ class BuildWindow:
     def _on_output_changed(self, *_args) -> None:
         # Mirror the output name into the config name until the operator
         # edits the config name themselves.
-        if not getattr(self, "_config_name_touched", False):
+        if not self._config_name_touched:
             self.var_config_name.set(self.var_output.get().strip())
 
     def _on_gen_config_toggled(self) -> None:
@@ -406,16 +411,16 @@ class BuildWindow:
             messagebox.showerror("入力エラー", "出力名を入力してください", parent=self.top)
             return None
 
-        def _opt_float(var, name):
+        def _opt_float(var):
             raw = var.get().strip()
             if not raw:
                 return None
             return float(raw)
 
         try:
-            score_bpm = _opt_float(self.var_bpm, "BPM")
-            start_offset = _opt_float(self.var_start, "start-offset")
-            end_trim = _opt_float(self.var_endtrim, "end-trim")
+            score_bpm = _opt_float(self.var_bpm)
+            start_offset = _opt_float(self.var_start)
+            end_trim = _opt_float(self.var_endtrim)
             cens_win = int(self.var_cens.get().strip() or _DEFAULT_CENS_WIN)
             hop_length = int(self.var_hop.get().strip() or _DEFAULT_HOP_LENGTH)
             sample_rate = int(self.var_sr.get().strip() or _DEFAULT_SAMPLE_RATE)
@@ -536,7 +541,7 @@ class BuildWindow:
         self._maybe_generate_config()
 
     def _maybe_generate_config(self) -> None:
-        config_path = getattr(self, "_pending_config_path", None)
+        config_path = self._pending_config_path
         if config_path is None:
             messagebox.showinfo(
                 "完了",

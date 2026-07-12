@@ -237,7 +237,7 @@ class OnlineDTWFollower:
                 rematch may jump. Caps catastrophic mis-jumps where a
                 self-similar passage far ahead in the score (e.g. the
                 end of a march/the recapitulation) happens to match the
-                current live chroma. Default 720 (~67s).
+                current live chroma. Default 480 (~45s).
             stuck_rematch_min_discriminability_ratio: how SHARPLY the
                 global-best position must stand out from the bulk of
                 forward positions to accept the jump. Defined as

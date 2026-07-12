@@ -375,7 +375,7 @@ class VizWindow:
         hist = snap["display_confidence_hist"]
         if len(hist) < 2:
             return
-        x0, y0, x1, y1 = self._trend_geom
+        x0, _, x1, y1 = self._trend_geom
         m = len(hist)
         span = x1 - x0
         pts: list[float] = []
