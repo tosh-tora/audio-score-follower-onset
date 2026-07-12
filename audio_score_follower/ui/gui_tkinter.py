@@ -16,28 +16,13 @@ from tkinter import font
 from typing import Callable, Optional
 
 from audio_score_follower.core.state_manager import AppState
+from audio_score_follower.ui.common import (
+    CONFIDENCE_GOOD_THRESHOLD,
+    CONFIDENCE_MID_THRESHOLD,
+    pick_font_family,
+)
 
 logger = logging.getLogger(__name__)
-
-# Font families preferred for rendering Japanese filenames / labels.  We pick
-# the first one that the local Tk installation actually has — falling back to
-# the generic "TkDefaultFont" so the GUI still works (with tofu glyphs) when
-# no CJK font is installed.  On WSL2/Ubuntu, `sudo apt install fonts-noto-cjk`
-# makes "Noto Sans CJK JP" available.
-_PREFERRED_FONT_FAMILIES = (
-    "Noto Sans CJK JP",
-    "Noto Sans JP",
-    "Yu Gothic UI",
-    "Yu Gothic",
-    "Meiryo",
-    "MS Gothic",
-    "TakaoPGothic",
-    "TakaoGothic",
-    "IPAexGothic",
-    "IPAPGothic",
-    "Hiragino Sans",
-    "DejaVu Sans",
-)
 
 # Font sizes were originally tuned for a 900x500 window with ~12pt body text.
 # Bumped to ~2x so the operator can read the GUI from across the pit.
@@ -62,24 +47,6 @@ _MODE_COLOR_FLASH = ("#2255ff", "white")      # blue bg for start-button flash
 
 # Window geometry scaled ~2x to match the large pit-readable fonts.
 _WINDOW_GEOMETRY = "1400x1000"
-
-
-def _pick_font_family(root: tk.Tk) -> str:
-    """Return the first available CJK-capable font family for this Tk root."""
-    try:
-        available = set(font.families(root=root))
-    except Exception:  # noqa: BLE001 — Tk could be in a weird state
-        available = set()
-    for family in _PREFERRED_FONT_FAMILIES:
-        if family in available:
-            logger.info("GUI font family: %s", family)
-            return family
-    logger.warning(
-        "No CJK-capable font found among %s — Japanese text may render as tofu. "
-        "Install fonts-noto-cjk (Ubuntu) or equivalent.",
-        _PREFERRED_FONT_FAMILIES,
-    )
-    return "TkDefaultFont"
 
 
 class FollowerGUI:
@@ -119,7 +86,7 @@ class FollowerGUI:
         # Pick a font family that can actually render Japanese.  The previous
         # hard-coded "Arial" has no CJK glyphs, so Japanese filenames (e.g.
         # "運命_冒頭_guide.mxl") rendered as tofu boxes.
-        self._font_family = _pick_font_family(self.root)
+        self._font_family = pick_font_family(self.root)
 
         # Start button flash state (drives a 1s blue label immediately
         # after the button is pressed, then reverts to the regular
@@ -406,9 +373,9 @@ class FollowerGUI:
             # BGM で内部 conf ~0.4-0.7 / display ~0)。内部値は lock-in・
             # トリガー床の判定用としてそのまま state に残っている。
             conf = state.get('display_confidence', state['confidence'])
-            if conf > 0.6:
+            if conf > CONFIDENCE_GOOD_THRESHOLD:
                 color = "green"
-            elif conf > 0.4:
+            elif conf > CONFIDENCE_MID_THRESHOLD:
                 color = "orange"
             else:
                 color = "red"

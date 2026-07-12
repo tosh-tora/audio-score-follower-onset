@@ -40,7 +40,7 @@ from audio_score_follower.core.mic_effects_probe import (
     SOUND_SETTINGS_URI,
     probe_capture_effects,
 )
-from audio_score_follower.ui.gui_tkinter import _pick_font_family
+from audio_score_follower.ui.common import apply_base_style
 
 logger = logging.getLogger(__name__)
 
@@ -186,12 +186,7 @@ class _LauncherWindow:
 
         root.title("audio-score-follower ランチャー")
         root.geometry(_WINDOW_GEOMETRY)
-        family = _pick_font_family(root)
-        self._font = (family, 12)
-        self._font_small = (family, 10)
-        style = ttk.Style(root)
-        style.configure(".", font=self._font)
-        root.option_add("*Font", self._font)
+        self._font, self._font_small = apply_base_style(root)
 
         self._config_paths: list[Path] = []
         # Silence-threshold measurement state: the monitor is non-None

@@ -38,7 +38,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from audio_score_follower.ui.gui_tkinter import _pick_font_family
+from audio_score_follower.ui.common import apply_base_style
 
 logger = logging.getLogger(__name__)
 
@@ -224,11 +224,7 @@ class BuildWindow:
         self.top = tk.Toplevel(root)
         self.top.title("オフラインビルド作成")
         self.top.geometry(_WINDOW_GEOMETRY)
-        family = _pick_font_family(root)
-        self._font = (family, 12)
-        self._font_small = (family, 10)
-        ttk.Style(self.top).configure(".", font=self._font)
-        self.top.option_add("*Font", self._font)
+        self._font, self._font_small = apply_base_style(self.top, font_source=root)
 
         self._build_widgets()
         self.top.protocol("WM_DELETE_WINDOW", self._on_back)

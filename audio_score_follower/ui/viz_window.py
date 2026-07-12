@@ -38,7 +38,11 @@ from typing import Optional
 import numpy as np
 
 from audio_score_follower.core.viz_feed import VizFeed
-from audio_score_follower.ui.gui_tkinter import _pick_font_family
+from audio_score_follower.ui.common import (
+    CONFIDENCE_GOOD_THRESHOLD,
+    CONFIDENCE_MID_THRESHOLD,
+    pick_font_family,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +63,8 @@ _TERRAIN_LINE = "#c3e88d"   # green ridge line
 _TERRAIN_FILL = "#2c4232"   # dim green under the ridge
 _NEEDLE = "#ffffff"
 
-# Confidence colour steps — same 0.6 / 0.4 breakpoints as the main GUI's
-# confidence label so both screens tell the same story.
+# Confidence colours — breakpoints shared with the main GUI via
+# ui/common.py (CONFIDENCE_*_THRESHOLD) so both screens tell the same story.
 _CONF_GOOD = "#43a047"
 _CONF_MID = "#ef9a1a"
 _CONF_BAD = "#e53935"
@@ -73,9 +77,9 @@ _WINDOW_GEOMETRY = "980x920+40+40"
 
 
 def _conf_color(value: float) -> str:
-    if value >= 0.6:
+    if value >= CONFIDENCE_GOOD_THRESHOLD:
         return _CONF_GOOD
-    if value >= 0.4:
+    if value >= CONFIDENCE_MID_THRESHOLD:
         return _CONF_MID
     return _CONF_BAD
 
@@ -95,7 +99,7 @@ class VizWindow:
         self.top.lift()
         self.top.attributes("-topmost", True)
         self.top.after(400, lambda: self.top.attributes("-topmost", False))
-        self._font = _pick_font_family(root)
+        self._font = pick_font_family(root)
 
         self.canvas = tk.Canvas(self.top, bg=_BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
