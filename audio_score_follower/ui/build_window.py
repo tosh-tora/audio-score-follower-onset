@@ -25,19 +25,18 @@ Design notes
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import queue
 import subprocess
 import sys
-import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+from audio_score_follower.launch_options import atomic_write_json
 from audio_score_follower.ui.common import apply_base_style
 
 logger = logging.getLogger(__name__)
@@ -170,26 +169,13 @@ def generate_config_dict(score: Path, built_dir: Path, config_dir: Path) -> dict
 def write_config(config_path: Path, config_dict: dict) -> None:
     """Atomically write ``config_dict`` to ``config_path`` (UTF-8, indent 2).
 
-    tempfile + os.replace, ensure_ascii=False — same approach as
-    ``launch_options.save_launcher_settings`` so Japanese notes are kept
-    and a partial write can never corrupt an existing config.
+    Delegates to ``launch_options.atomic_write_json`` (tempfile +
+    os.replace, ensure_ascii=False) so Japanese notes are kept and a
+    partial write can never corrupt an existing config.
     """
     config_path = Path(config_path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(config_path.parent), prefix=config_path.name, suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(config_dict, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, config_path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(config_path, config_dict)
     logger.info("Generated config written to %s", config_path)
 
 
