@@ -42,6 +42,9 @@ from audio_score_follower.core.feature_extractor import (  # noqa: E402
 )
 from audio_score_follower.core.oltw_follower import OnlineDTWFollower  # noqa: E402
 from audio_score_follower.core.score_mapper import ScoreMapper  # noqa: E402
+from audio_score_follower.core.trigger_engine import (  # noqa: E402
+    _TRIGGER_CONFIDENCE_FLOOR,
+)
 from audio_score_follower.core.warp_lookup import (  # noqa: E402
     WarpLookup,
     load_reference_cens,
@@ -234,7 +237,7 @@ def main() -> int:
     # Fraction of frames a trigger could fire (confidence >= floor). On a
     # wrong piece / noise this should be near 0 for a follower that
     # actually detects the mismatch. Uses the production trigger floor.
-    trig_floor = 0.30
+    trig_floor = _TRIGGER_CONFIDENCE_FLOOR
     print(f"trigger-eligible: {100.0 * (confs >= trig_floor).mean():.1f}% "
           f"of frames (conf >= {trig_floor})")
     # Mismatch detector: percent of frames flagged + time of first raise.

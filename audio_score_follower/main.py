@@ -45,7 +45,6 @@ import time
 import tkinter as tk
 from collections import deque
 from pathlib import Path
-from typing import Dict, Optional
 
 # Windows cp932/cp1252 stdout cannot encode em-dashes or Japanese. Force
 # UTF-8 so logging, argparse help, and Japanese error messages survive.
@@ -67,6 +66,7 @@ from audio_score_follower.core.oltw_follower import (
 from audio_score_follower.core.score_mapper import ScoreMapper
 from audio_score_follower.core.slide_controller import NullSlideController, SlideController
 from audio_score_follower.core.state_manager import AppState
+from audio_score_follower.core.trigger_engine import TriggerEngine
 from audio_score_follower.core.viz_feed import VizFeed, VizThresholds
 from audio_score_follower.core.warp_lookup import (
     WarpLookup,
@@ -78,8 +78,6 @@ from audio_score_follower.ui.viz_window import VizWindow
 
 logger = logging.getLogger(__name__)
 
-# How often the trigger executor checks for measure hits.
-_TRIGGER_POLL_HZ = 20
 # How often we poll the silence gate from the Tk main loop.
 _GATE_POLL_MS = 50
 # Maximum measure jump allowed between consecutive OLTW frames without a
@@ -91,11 +89,6 @@ _MAX_FRAME_MEASURE_JUMP = 3
 _SEEK_GRACE_SEC = 2.0
 # Step size for the operator's runtime silence-threshold nudge (↑/↓ keys).
 _THRESHOLD_STEP_DB = 0.2
-# Minimum smoothed OLTW confidence before triggers are allowed to fire.
-# Acts as the "lock-in" condition that InertiaEngine provided in
-# live-score-sync; below this, alignment hasn't stabilised yet and
-# firing the measure-1 trigger at startup would be spurious.
-_TRIGGER_CONFIDENCE_FLOOR = 0.30
 # Operator-facing (display) confidence: match-quality ramp over the
 # smoothed ABSOLUTE fused local cost. The OLTW's internal confidence is
 # band-relative and floors at ~0.6-0.8 even on unrelated audio (the
@@ -175,8 +168,6 @@ class AudioScoreFollowerApp:
         # interface so callers don't need to special-case them.
         self.worker: FollowerWorker | FileWorker | None = None
 
-        self._fired_trigger_measures: set[int] = set()
-
         # Manual performance start (mic mode only): the follower stays
         # frozen and ignores the silence gate until the operator presses
         # 「▶ 演奏開始」 (or L). wav/loopback modes auto-start as before.
@@ -236,8 +227,24 @@ class AudioScoreFollowerApp:
             logger.info("Realtime visualiser enabled (--viz)")
 
         self._workers_stop = threading.Event()
-        self._trigger_thread: threading.Thread | None = None
         self._prev_gate_active = False
+
+        # Slide triggering + manual overrides live in TriggerEngine. The
+        # per-movement objects (oltw / warp_lookup / score_mapper) are
+        # recreated on each load, so the engine reads them via getters
+        # rather than a captured reference. notify_seek records the seek
+        # time the jump detector uses for its grace period.
+        self.trigger_engine = TriggerEngine(
+            state=self.state,
+            cooldown=self.cooldown,
+            slide_controller=self.slide_controller,
+            stop_event=self._workers_stop,
+            get_oltw=lambda: self.oltw,
+            get_warp_lookup=lambda: self.warp_lookup,
+            get_score_mapper=lambda: self.score_mapper,
+            get_cooldown_seconds=self.config.get_cooldown_seconds,
+            notify_seek=self._record_seek,
+        )
 
         # Diagnostic log throttle: emit one OLTW state log per wall-clock
         # second. Set from _on_oltw_result, which fires per CENS frame
@@ -295,10 +302,7 @@ class AudioScoreFollowerApp:
         logger.info("Loading first movement …")
         self._load_current_movement()
 
-        self._trigger_thread = threading.Thread(
-            target=self._trigger_loop, name="trigger-executor", daemon=True
-        )
-        self._trigger_thread.start()
+        self.trigger_engine.start()
 
         if self.input_wav is None and not self.loopback:
             self.root.after(_GATE_POLL_MS, self._check_silence_gate)
@@ -489,7 +493,7 @@ class AudioScoreFollowerApp:
             logger.info("Waiting for operator start (▶ 演奏開始 / L key)")
 
         self.cooldown.cleanup_old()
-        self._fired_trigger_measures.clear()
+        self.trigger_engine.reset_for_movement()
         self._display_cost_window.clear()
 
         triggers = movement.get("triggers", [])
@@ -699,214 +703,15 @@ class AudioScoreFollowerApp:
         if not self._workers_stop.is_set():
             self.root.after(_GATE_POLL_MS, self._check_silence_gate)
 
-    # ---------------------------------------------------- trigger loop
-    def _trigger_loop(self) -> None:
-        logger.info("Trigger loop started (%.0f Hz)", _TRIGGER_POLL_HZ)
-        interval = 1.0 / _TRIGGER_POLL_HZ
-        while not self._workers_stop.is_set():
-            try:
-                snapshot = self.state.get_all()
-                triggers = self.state.current_triggers
-                current_measure = snapshot["measure"]
+    # ---------------------------------------------------- seek grace
+    def _record_seek(self) -> None:
+        """Record the wall-clock time of a forward re-anchor.
 
-                if not triggers:
-                    time.sleep(interval)
-                    continue
-
-                upcoming = [
-                    t["measure"] for t in triggers
-                    if t["measure"] > current_measure
-                    and t["measure"] not in self._fired_trigger_measures
-                ]
-                self.state.set_next_trigger(min(upcoming) if upcoming else None)
-
-                # Don't fire until OLTW has locked in.
-                if snapshot["confidence"] < _TRIGGER_CONFIDENCE_FLOOR:
-                    time.sleep(interval)
-                    continue
-
-                # Don't fire while the drift detector suspects the count
-                # has lost the performance — advancing slides on a
-                # mistracked position is worse than a late slide the
-                # operator fixes manually.
-                if snapshot.get("is_mismatched"):
-                    time.sleep(interval)
-                    continue
-
-                if snapshot["cooldown_active"]:
-                    time.sleep(interval)
-                    continue
-
-                for trig in triggers:
-                    if trig["measure"] != current_measure:
-                        continue
-                    if current_measure in self._fired_trigger_measures:
-                        continue
-                    if not self.cooldown.should_trigger(current_measure):
-                        continue
-
-                    action = trig.get("action", "right")
-                    self._execute_action(action, source="auto", trigger=trig)
-                    self.cooldown.mark_triggered(current_measure)
-                    self.state.activate_cooldown(self.config.get_cooldown_seconds())
-                    self._fired_trigger_measures.add(current_measure)
-                    break
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Trigger loop error: %s", exc, exc_info=True)
-            time.sleep(interval)
-        logger.info("Trigger loop exiting")
-
-    def _execute_action(
-        self,
-        action: str,
-        *,
-        source: str = "auto",
-        trigger: Optional[Dict] = None,
-    ) -> None:
-        """Send a single slide keypress and log it with provenance.
-
-        Args:
-            action: "right" or "left".
-            source: "auto" (fired by trigger loop from OLTW position) or
-                "manual" (user pressed ← / → / Space). Goes into the
-                log line so post-hoc review can tell which advances
-                were the human compensating for tracking drift.
-            trigger: the trigger dict (with measure, note) when known;
-                included in the log for context.
+        Called by TriggerEngine after a forward seek so _on_oltw_result's
+        jump detector suppresses the (expected) post-seek measure jump
+        during the grace period.
         """
-        try:
-            self.slide_controller.press(action)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Slide action %s failed [%s]: %s", action, source, exc, exc_info=True
-            )
-            return
-        if trigger is not None:
-            logger.info(
-                "Slide %s [%s] measure=%d note=%s",
-                action, source, trigger.get("measure"),
-                trigger.get("note", ""),
-            )
-        else:
-            logger.info("Slide %s [%s]", action, source)
-
-    # ----------------------- manual override helpers -----------------
-    def _find_next_pending_trigger(self) -> Optional[Dict]:
-        """Lowest-measure trigger that hasn't been fired yet.
-
-        Returns None when every trigger in the current movement has
-        already fired.
-        """
-        triggers = self.state.current_triggers
-        pending = [
-            t for t in triggers
-            if t["measure"] not in self._fired_trigger_measures
-        ]
-        if not pending:
-            return None
-        return min(pending, key=lambda t: t["measure"])
-
-    def _find_last_fired_trigger(self) -> Optional[Dict]:
-        """Highest-measure trigger that has been fired so far.
-
-        We use "highest measure" rather than "most-recently-fired by
-        wall-clock time" because triggers naturally fire in score order
-        during live performance; if the user has been pressing manual
-        overrides out of order they probably want to undo the latest
-        position in the score, not the latest in time.
-        """
-        if not self._fired_trigger_measures:
-            return None
-        last_measure = max(self._fired_trigger_measures)
-        triggers = self.state.current_triggers
-        for t in triggers:
-            if t["measure"] == last_measure:
-                return t
-        return None
-
-    def _seek_oltw_to_ref_time(
-        self, ref_time_sec: float, *, allow_catchup: bool = True
-    ) -> None:
-        if self.oltw is None or self.warp_lookup is None:
-            return
-        fr = self.warp_lookup.feature_config.effective_frame_rate()
-        target_frame = int(round(ref_time_sec * fr))
-        self.oltw.seek(target_frame, allow_catchup=allow_catchup)
         self._last_seek_time = time.monotonic()
-
-    def _manual_advance_to_next_trigger(self) -> None:
-        """User pressed →: send slide right, then re-sync OLTW.
-
-        The user is saying "the performance is at or past the next
-        trigger measure" — so we (1) send the press, (2) mark that
-        trigger as fired so the auto loop doesn't double-fire, and
-        (3) seek OLTW to that measure's reference time so future
-        auto-triggers fire from the correct downstream context.
-        """
-        nxt = self._find_next_pending_trigger()
-        if nxt is None or self.warp_lookup is None or self.score_mapper is None:
-            # No trigger to consume — fall back to bare slide press.
-            self._execute_action("right", source="manual")
-            return
-
-        measure = int(nxt["measure"])
-        try:
-            ref_t = self.warp_lookup.measure_to_ref_time(measure, self.score_mapper)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("measure_to_ref_time failed for m=%d: %s", measure, exc)
-            self._execute_action("right", source="manual")
-            return
-
-        self._execute_action(nxt.get("action", "right"), source="manual", trigger=nxt)
-        self.cooldown.mark_triggered(measure)
-        self.state.activate_cooldown(self.config.get_cooldown_seconds())
-        self._fired_trigger_measures.add(measure)
-        self._seek_oltw_to_ref_time(ref_t)
-        logger.info(
-            "Manual sync: OLTW re-anchored to measure %d (ref_t=%.2fs)",
-            measure, ref_t,
-        )
-
-    def _manual_back_to_prev_trigger(self) -> None:
-        """User pressed ←: send slide left, then re-sync OLTW backwards.
-
-        The user is saying "the performance is BEFORE the most-recent
-        slide change". We (1) send the left press, (2) un-fire the
-        most-recently fired trigger so it can fire again when the
-        music re-enters that region, and (3) seek OLTW back to just
-        BEFORE that measure so we won't immediately re-trigger it
-        on the next live frame.
-        """
-        last = self._find_last_fired_trigger()
-        if last is None or self.warp_lookup is None or self.score_mapper is None:
-            self._execute_action("left", source="manual")
-            return
-
-        measure = int(last["measure"])
-        try:
-            ref_t = self.warp_lookup.measure_to_ref_time(measure, self.score_mapper)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("measure_to_ref_time failed for m=%d: %s", measure, exc)
-            self._execute_action("left", source="manual")
-            return
-
-        self._execute_action("left", source="manual", trigger=last)
-        self.cooldown.unmark_triggered(measure)
-        self._fired_trigger_measures.discard(measure)
-        # Seek to a frame slightly BEFORE the measure's start so the
-        # auto loop won't immediately re-fire on the next OLTW tick.
-        # No post-seek catchup: the operator says the music is BEFORE
-        # this point, so an automatic forward scan would re-defeat
-        # the back-step.
-        fr = self.warp_lookup.feature_config.effective_frame_rate()
-        pre_frame = max(0, int(round(ref_t * fr)) - max(1, int(round(0.2 * fr))))
-        if self.oltw is not None:
-            self.oltw.seek(pre_frame, allow_catchup=False)
-        logger.info(
-            "Manual sync: OLTW re-anchored before measure %d "
-            "(ref_frame=%d, ~%.2fs)",
-            measure, pre_frame, pre_frame / fr,
-        )
 
     def manual_start(self) -> None:
         """Operator start press (L key or GUI 「▶ 演奏開始」 button).
@@ -987,10 +792,10 @@ class AudioScoreFollowerApp:
             self.manual_start()
 
         def _on_next(_e: tk.Event) -> None:
-            self._manual_advance_to_next_trigger()
+            self.trigger_engine.advance_to_next_trigger()
 
         def _on_prev(_e: tk.Event) -> None:
-            self._manual_back_to_prev_trigger()
+            self.trigger_engine.back_to_prev_trigger()
 
         def _on_thr_up(_e: tk.Event) -> None:
             self.adjust_silence_threshold(_THRESHOLD_STEP_DB)
