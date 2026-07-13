@@ -184,6 +184,32 @@ _LAUNCHER_DEFAULTS = {
 }
 
 
+def atomic_write_json(path: Path, data: dict) -> None:
+    """Write ``data`` as UTF-8 JSON (ensure_ascii=False, indent=2) atomically.
+
+    tempfile in the target directory + ``os.replace`` so a partial write
+    can never corrupt an existing file; the temp file is removed on
+    failure. Japanese strings are preserved (ensure_ascii=False); note
+    the file's formatting is normalised to indent=2 on save. Shared by
+    ``save_launcher_settings`` and ``ui.build_window.write_config``.
+    """
+    path = Path(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def read_launcher_settings(config_path: Path) -> dict:
     """Read launcher-relevant state from a config.json without validating it.
 
@@ -255,21 +281,7 @@ def save_launcher_settings(
     if opts.cooldown_seconds is not None:
         settings["cooldown_seconds"] = opts.cooldown_seconds
 
-    config_path = Path(config_path)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(config_path.parent), prefix=config_path.name, suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, config_path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(Path(config_path), data)
     logger.info("Launcher settings saved to %s", config_path)
 
 

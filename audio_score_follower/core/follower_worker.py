@@ -41,6 +41,7 @@ import numpy as np
 from audio_score_follower.core.feature_extractor import (
     FeatureConfig,
     OnsetNormalizer,
+    align_onset_to_cens,
     compute_cens,
     compute_onset,
 )
@@ -287,14 +288,12 @@ class FollowerWorker:
             if self._onset_enabled and self._onset_normalizer is not None:
                 try:
                     onset_raw = compute_onset(ctx, self._cfg)
-                    n = min(cens.shape[1], onset_raw.shape[0])
-                    if n < cens.shape[1]:
+                    if onset_raw.shape[0] < cens.shape[1]:
                         logger.warning(
                             "Live onset frames (%d) < CENS frames (%d); trimming",
                             onset_raw.shape[0], cens.shape[1],
                         )
-                        cens = cens[:, :n]
-                    onset_frames = onset_raw[:n]
+                    cens, onset_frames = align_onset_to_cens(cens, onset_raw)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Live onset compute failed (%s); using CENS-only", exc)
 
@@ -481,14 +480,12 @@ class FileWorker:
             if self._onset_enabled:
                 try:
                     onset_raw = compute_onset(audio, self._cfg)
-                    n_common = min(cens.shape[1], onset_raw.shape[0])
-                    if n_common < cens.shape[1]:
+                    if onset_raw.shape[0] < cens.shape[1]:
                         logger.warning(
                             "FileWorker: onset frames (%d) < CENS frames (%d); trimming",
                             onset_raw.shape[0], cens.shape[1],
                         )
-                        cens = cens[:, :n_common]
-                    onset_all = onset_raw[:n_common]
+                    cens, onset_all = align_onset_to_cens(cens, onset_raw)
                     logger.info("Computed onset for full file: shape=%s", onset_all.shape)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("FileWorker: onset compute failed (%s); CENS-only", exc)

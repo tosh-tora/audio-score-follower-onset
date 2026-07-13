@@ -38,14 +38,11 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import sys
 import threading
 import time
 import tkinter as tk
-from collections import deque
 from pathlib import Path
-from typing import Dict, Optional
 
 # Windows cp932/cp1252 stdout cannot encode em-dashes or Japanese. Force
 # UTF-8 so logging, argparse help, and Japanese error messages survive.
@@ -60,68 +57,32 @@ from audio_score_follower.core.audio_level import AudioLevelMonitor
 from audio_score_follower.core.cooldown_timer import CooldownTimer
 from audio_score_follower.core.follower_worker import FileWorker, FollowerWorker
 from audio_score_follower.core.mic_effects_probe import probe_capture_effects
-from audio_score_follower.core.oltw_follower import (
-    FollowResult,
-    OnlineDTWFollower,
+from audio_score_follower.core.movement_loader import (
+    MovementLoadError,
+    load_movement,
+)
+from audio_score_follower.core.oltw_follower import OnlineDTWFollower
+from audio_score_follower.core.result_handler import (
+    _DISPLAY_CONF_COST_HI,
+    _DISPLAY_CONF_COST_LO,
+    OltwResultHandler,
+    display_confidence_from_cost,  # re-exported for tests / external callers
 )
 from audio_score_follower.core.score_mapper import ScoreMapper
 from audio_score_follower.core.slide_controller import NullSlideController, SlideController
 from audio_score_follower.core.state_manager import AppState
+from audio_score_follower.core.trigger_engine import TriggerEngine
 from audio_score_follower.core.viz_feed import VizFeed, VizThresholds
-from audio_score_follower.core.warp_lookup import (
-    WarpLookup,
-    load_reference_cens,
-    load_reference_onset,
-)
+from audio_score_follower.core.warp_lookup import WarpLookup
 from audio_score_follower.ui.gui_tkinter import FollowerGUI
 from audio_score_follower.ui.viz_window import VizWindow
 
 logger = logging.getLogger(__name__)
 
-# How often the trigger executor checks for measure hits.
-_TRIGGER_POLL_HZ = 20
 # How often we poll the silence gate from the Tk main loop.
 _GATE_POLL_MS = 50
-# Maximum measure jump allowed between consecutive OLTW frames without a
-# preceding user seek. At 200 BPM 4/4 with 4× warp slope (the build-time
-# limit) the measure advances <1 per 0.093s frame — so jumps >3 are anomalous.
-_MAX_FRAME_MEASURE_JUMP = 3
-# Suppress the jump-anomaly alert for this long after a user-initiated seek
-# (jumps right after a seek are expected, not a warp path anomaly).
-_SEEK_GRACE_SEC = 2.0
 # Step size for the operator's runtime silence-threshold nudge (↑/↓ keys).
 _THRESHOLD_STEP_DB = 0.2
-# Minimum smoothed OLTW confidence before triggers are allowed to fire.
-# Acts as the "lock-in" condition that InertiaEngine provided in
-# live-score-sync; below this, alignment hasn't stabilised yet and
-# firing the measure-1 trigger at startup would be spurious.
-_TRIGGER_CONFIDENCE_FLOOR = 0.30
-# Operator-facing (display) confidence: match-quality ramp over the
-# smoothed ABSOLUTE fused local cost. The OLTW's internal confidence is
-# band-relative and floors at ~0.6-0.8 even on unrelated audio (the
-# non-negative chroma cosine floor), which misleads the operator ("piano
-# BGM reads 70%"). This ramp maps smoothed cost LO→HI onto 1→0.
-# Calibrated on 幻想4 measurements (2026-07): same recording p50=0.014,
-# alt performance p50=0.082/p90=0.159, wrong movement p50=0.189,
-# unrelated piano p50=0.300 → same ≈100%, alt ≈40-90%, piano ≈0%.
-# Display only — lock-in / trigger floor / resync keep the internal scale.
-_DISPLAY_CONF_COST_LO = 0.05
-_DISPLAY_CONF_COST_HI = 0.22
-# Frames of cost smoothing for the display ramp (matches the OLTW's own
-# confidence_smoothing default; ~0.46s at 10.77 Hz).
-_DISPLAY_CONF_SMOOTHING = 5
-
-
-def display_confidence_from_cost(smoothed_cost: float) -> float:
-    """Map a smoothed fused local cost to the operator-facing confidence.
-
-    Linear ramp: cost <= LO → 1.0, cost >= HI → 0.0. NaN (frozen frames,
-    where OLTW reports no cost) → 0.0.
-    """
-    if math.isnan(smoothed_cost):
-        return 0.0
-    span = _DISPLAY_CONF_COST_HI - _DISPLAY_CONF_COST_LO
-    return max(0.0, min(1.0, (_DISPLAY_CONF_COST_HI - smoothed_cost) / span))
 
 
 class AudioScoreFollowerApp:
@@ -175,8 +136,6 @@ class AudioScoreFollowerApp:
         # interface so callers don't need to special-case them.
         self.worker: FollowerWorker | FileWorker | None = None
 
-        self._fired_trigger_measures: set[int] = set()
-
         # Manual performance start (mic mode only): the follower stays
         # frozen and ignores the silence gate until the operator presses
         # 「▶ 演奏開始」 (or L). wav/loopback modes auto-start as before.
@@ -192,11 +151,10 @@ class AudioScoreFollowerApp:
         # job (blocking pre-performance noise) is done.
         self._performance_confirmed = not self._mic_mode
 
-        # Runtime jump detection: track previous measure and the wall-clock
-        # time of the most recent user-initiated seek. Jumps right after a
-        # seek are expected; outside the grace period they indicate a warp
-        # path anomaly.
-        self._prev_oltw_measure: int = 0
+        # Wall-clock time of the most recent user-initiated forward seek.
+        # Written by _record_seek (via TriggerEngine.notify_seek), read by
+        # the result handler's jump detector to suppress the expected
+        # post-seek jump during the grace period.
         self._last_seek_time: float = 0.0
 
         if slide_url:
@@ -220,7 +178,7 @@ class AudioScoreFollowerApp:
         # Optional realtime feature/confidence visualiser (--viz). The feed
         # is a pure data channel; the window is a separate Toplevel consumer
         # so a future audience-facing screen can share the same feed. When
-        # disabled, viz_feed stays None and _on_oltw_result skips the push.
+        # disabled, viz_feed stays None and the result handler skips the push.
         self.viz_feed: VizFeed | None = None
         if self.viz:
             self.viz_feed = VizFeed(
@@ -236,19 +194,35 @@ class AudioScoreFollowerApp:
             logger.info("Realtime visualiser enabled (--viz)")
 
         self._workers_stop = threading.Event()
-        self._trigger_thread: threading.Thread | None = None
         self._prev_gate_active = False
 
-        # Diagnostic log throttle: emit one OLTW state log per wall-clock
-        # second. Set from _on_oltw_result, which fires per CENS frame
-        # (~10 Hz) and would otherwise flood the log.
-        self._last_diag_log_sec = 0
+        # Slide triggering + manual overrides live in TriggerEngine. The
+        # per-movement objects (oltw / warp_lookup / score_mapper) are
+        # recreated on each load, so the engine reads them via getters
+        # rather than a captured reference. notify_seek records the seek
+        # time the jump detector uses for its grace period.
+        self.trigger_engine = TriggerEngine(
+            state=self.state,
+            cooldown=self.cooldown,
+            slide_controller=self.slide_controller,
+            stop_event=self._workers_stop,
+            get_oltw=lambda: self.oltw,
+            get_warp_lookup=lambda: self.warp_lookup,
+            get_score_mapper=lambda: self.score_mapper,
+            get_cooldown_seconds=self.config.get_cooldown_seconds,
+            notify_seek=self._record_seek,
+        )
 
-        # Rolling window of fused local costs feeding the operator-facing
-        # display confidence (see display_confidence_from_cost). Only
-        # touched from the OLTW worker thread (_on_oltw_result).
-        self._display_cost_window: deque[float] = deque(
-            maxlen=_DISPLAY_CONF_SMOOTHING
+        # Per-frame OLTW result → AppState / viz / diagnostics. Reads the
+        # per-movement objects via getters and the seek time via a getter
+        # so it always sees the current values.
+        self.result_handler = OltwResultHandler(
+            state=self.state,
+            viz_feed=self.viz_feed,
+            get_oltw=lambda: self.oltw,
+            get_warp_lookup=lambda: self.warp_lookup,
+            get_score_mapper=lambda: self.score_mapper,
+            get_last_seek_time=lambda: self._last_seek_time,
         )
 
         logger.info("Initialisation complete")
@@ -295,10 +269,7 @@ class AudioScoreFollowerApp:
         logger.info("Loading first movement …")
         self._load_current_movement()
 
-        self._trigger_thread = threading.Thread(
-            target=self._trigger_loop, name="trigger-executor", daemon=True
-        )
-        self._trigger_thread.start()
+        self.trigger_engine.start()
 
         if self.input_wav is None and not self.loopback:
             self.root.after(_GATE_POLL_MS, self._check_silence_gate)
@@ -377,104 +348,36 @@ class AudioScoreFollowerApp:
         if movement:
             self._load_movement(movement)
 
-    def _load_movement(self, movement: dict) -> None:
-        xml_raw = movement.get("xml_file")
-        built_raw = movement.get("built_dir")
-        if not xml_raw or not built_raw:
-            logger.error("Movement missing xml_file or built_dir: %s", movement)
-            return
-
-        xml_file = Path(self.config.resolve_path(xml_raw))
-        built_dir = Path(self.config.resolve_path(built_raw))
-
-        if not xml_file.exists():
-            msg = f"楽譜ファイルが見つかりません。\n  → {xml_file}\n  に置いてください"
-            logger.error(msg)
-            self.state.set_load_error(f"ファイルが見つかりません\n{xml_file}")
-            return
-        if not built_dir.exists():
-            msg = (
-                f"ビルド済みリファレンスが見つかりません: {built_dir}\n"
-                f"  asf-build を実行してから再起動してください"
-            )
-            logger.error(msg)
-            self.state.set_load_error(f"asf-build 出力なし\n{built_dir}")
-            return
-
-        logger.info("Loading movement: xml=%s built=%s", xml_file, built_dir)
-
-        # Stop previous worker
+    def _stop_worker(self) -> None:
+        """Stop and drop the current OLTW worker (if any)."""
         if self.worker is not None:
             logger.info("Stopping previous OLTW worker …")
             self.worker.stop()
             self.worker = None
 
+    def _load_movement(self, movement: dict) -> None:
+        # Pure loading / construction lives in movement_loader; app-side
+        # orchestration (worker teardown, mic parking, state updates,
+        # worker wiring) stays here. stop_previous is invoked from inside
+        # the loader at the original point so a bad reload keeps the
+        # current worker running.
         try:
-            self.score_mapper = ScoreMapper(str(xml_file))
-            self.warp_lookup = WarpLookup.load(built_dir)
-            reference_cens = load_reference_cens(built_dir)
-            reference_onset = load_reference_onset(built_dir)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to load movement artifacts: %s", exc)
-            self.state.set_load_error(f"読込失敗: {exc}")
-            return
-
-        logger.info(
-            "Loaded: %s, %s, reference_cens=(%d,%d)",
-            self.score_mapper, self.warp_lookup,
-            reference_cens.shape[0], reference_cens.shape[1],
-        )
-
-        chroma_weight, onset_weight = self.config.get_feature_fusion()
-        onset_enabled = reference_onset is not None and onset_weight > 0.0
-        logger.info(
-            "Feature fusion: %s (chroma=%.2f onset=%.2f)%s",
-            "enabled" if onset_enabled else "disabled",
-            chroma_weight, onset_weight,
-            "" if onset_enabled else
-            " — rebuild with asf-build to generate reference_onset.npy",
-        )
-
-        # Validate warp path consistency before starting OLTW.
-        try:
-            self.warp_lookup.validate(self.score_mapper)
-        except ValueError as exc:
-            logger.error("Warp path validation failed: %s", exc)
-            self.state.set_load_error(
-                f"warp path 検証エラー:\n{exc}\nasf-build をやり直してください。"
+            loaded = load_movement(
+                self.config,
+                movement,
+                mic_mode=self._mic_mode,
+                viz=self.viz,
+                stop_previous=self._stop_worker,
             )
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Warp path validation error: %s", exc)
-            self.state.set_load_error(f"warp path 検証中にエラー: {exc}")
+        except MovementLoadError as exc:
+            if exc.state_message is not None:
+                self.state.set_load_error(exc.state_message)
             return
 
-        oltw_kwargs = self.config.get_oltw_kwargs()
-        if self._mic_mode:
-            # Manual-start correction for a LATE press: widen the
-            # first-frame search window so tracking can land several
-            # seconds into the piece. (Most late-press recovery goes
-            # through the armed post-unfreeze catchup, but this covers
-            # the corner where no freeze preceded the first frame.)
-            fr = self.warp_lookup.feature_config.effective_frame_rate()
-            start_width = int(round(self.config.get_start_search_seconds() * fr))
-            oltw_kwargs["init_search_width"] = max(
-                int(oltw_kwargs.get("init_search_width") or 0), start_width
-            )
-        try:
-            self.oltw = OnlineDTWFollower(
-                reference_cens=reference_cens,
-                feature_config=self.warp_lookup.feature_config,
-                reference_onset=reference_onset,
-                chroma_weight=chroma_weight,
-                onset_weight=onset_weight,
-                capture_viz=self.viz,
-                **oltw_kwargs,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to construct OLTW: %s", exc)
-            self.state.set_load_error(f"OLTW 初期化失敗: {exc}")
-            return
+        self.score_mapper = loaded.score_mapper
+        self.warp_lookup = loaded.warp_lookup
+        self.oltw = loaded.oltw
+        onset_enabled = loaded.onset_enabled
 
         if self._mic_mode:
             # Park until the operator presses 「▶ 演奏開始」. The gate
@@ -489,18 +392,17 @@ class AudioScoreFollowerApp:
             logger.info("Waiting for operator start (▶ 演奏開始 / L key)")
 
         self.cooldown.cleanup_old()
-        self._fired_trigger_measures.clear()
-        self._display_cost_window.clear()
+        self.trigger_engine.reset_for_movement()
+        self.result_handler.reset_for_movement()
 
-        triggers = movement.get("triggers", [])
-        total_measures = self.score_mapper.get_total_measures()
+        triggers = loaded.triggers
         self.state.set_movement(
             movement_id=movement.get("id"),
-            xml_file=str(xml_file),
+            xml_file=str(loaded.xml_file),
             triggers=triggers,
             movement_number=self.config.current_movement_number(),
             total_movements=self.config.total_movements(),
-            total_measures=total_measures,
+            total_measures=loaded.total_measures,
         )
         if triggers:
             self.state.set_next_trigger(min(t["measure"] for t in triggers))
@@ -510,7 +412,7 @@ class AudioScoreFollowerApp:
                 oltw_follower=self.oltw,
                 feature_config=self.warp_lookup.feature_config,
                 input_wav=self.input_wav,
-                on_result=self._on_oltw_result,
+                on_result=self.result_handler.on_result,
                 realtime=True,
                 play_audio=self.play_audio,
                 onset_enabled=onset_enabled,
@@ -520,7 +422,7 @@ class AudioScoreFollowerApp:
                 oltw_follower=self.oltw,
                 feature_config=self.warp_lookup.feature_config,
                 mic_device=self.loopback_device,
-                on_result=self._on_oltw_result,
+                on_result=self.result_handler.on_result,
                 loopback=True,
                 onset_enabled=onset_enabled,
             )
@@ -529,7 +431,7 @@ class AudioScoreFollowerApp:
                 oltw_follower=self.oltw,
                 feature_config=self.warp_lookup.feature_config,
                 mic_device=self.config.get_mic_device(),
-                on_result=self._on_oltw_result,
+                on_result=self.result_handler.on_result,
                 onset_enabled=onset_enabled,
             )
         self.worker.start()
@@ -541,115 +443,6 @@ class AudioScoreFollowerApp:
         threading.Thread(target=_ready_check, daemon=True, name="oltw-ready-check").start()
 
         logger.info("Movement loaded.")
-
-    # ---------------------------------------------------- result callback
-    def _on_oltw_result(self, result: FollowResult) -> None:
-        """Called from the OLTW worker thread per CENS frame."""
-        mapper = self.score_mapper
-        lookup = self.warp_lookup
-        if mapper is None or lookup is None:
-            return
-        try:
-            measure, beat_in_measure, continuous_beat = lookup.ref_to_measure_and_beat(
-                result.ref_time_sec, mapper
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("ref→measure failed: %s", exc)
-            return
-
-        # GUI displays 1-indexed beat-in-measure (downbeat = 1.0).
-        beat_in_measure_display = beat_in_measure + 1.0
-        self.state.update_beat_measure(
-            continuous_beat, measure, beat_in_measure_display
-        )
-        self.state.set_confidence(result.confidence)
-        self.state.set_mismatch(result.is_mismatched)
-        # Operator-facing confidence: absolute match quality from the
-        # smoothed fused cost. Frozen frames report NaN cost → display 0
-        # without polluting the smoothing window.
-        if math.isnan(result.raw_local_cost):
-            display_conf = 0.0
-        else:
-            self._display_cost_window.append(result.raw_local_cost)
-            smoothed = sum(self._display_cost_window) / len(self._display_cost_window)
-            display_conf = display_confidence_from_cost(smoothed)
-        self.state.set_display_confidence(display_conf)
-
-        # Feed the realtime visualiser (--viz only). Reuses the measure and
-        # display confidence already computed above; no-op when disabled.
-        if self.viz_feed is not None:
-            # Ground the "演奏位置さがし" panel in real measure numbers: map
-            # the band edges and the DP peak (reference frames) to measures
-            # via the same warp lookup. ~3 cheap lookups/frame at 10 Hz.
-            frame_rate = lookup.feature_config.effective_frame_rate()
-
-            def _frame_measure(frame: int):
-                try:
-                    return lookup.ref_to_measure_and_beat(
-                        frame / frame_rate, mapper
-                    )[0]
-                except Exception:  # noqa: BLE001 — edge frames may fall off
-                    return None
-
-            self.viz_feed.push(
-                result,
-                measure=measure,
-                display_confidence=display_conf,
-                band_lo_measure=_frame_measure(result.band_lo),
-                band_hi_measure=_frame_measure(max(result.band_lo, result.band_hi - 1)),
-                peak_measure=_frame_measure(result.dp_ref_frame),
-            )
-        # Mirror OLTW follower mode into AppState so the GUI tracking
-        # panel reflects lock-in / inertia transitions in real time.
-        if self.oltw is not None:
-            self.state.set_follower_mode(
-                is_locked_in=self.oltw.is_locked_in,
-                is_in_inertia=self.oltw.is_in_inertia,
-                inertia_elapsed_sec=self.oltw.inertia_elapsed_sec,
-                inertia_cap_sec=self.oltw.max_inertia_seconds,
-            )
-
-        # Runtime jump detection: large measure jumps between consecutive
-        # frames (outside the seek grace period) indicate a warp path
-        # anomaly that should have been caught by asf-build --validate.
-        jump = abs(measure - self._prev_oltw_measure)
-        if (
-            jump > _MAX_FRAME_MEASURE_JUMP
-            and self._prev_oltw_measure != 0  # skip first frame (initialisation)
-            and (time.monotonic() - self._last_seek_time) > _SEEK_GRACE_SEC
-        ):
-            logger.error(
-                "異常な小節ジャンプを検出: %d → %d (+%d 小節) at ref_t=%.2fs。"
-                "warp path の勾配が異常です。asf-build をやり直してください。",
-                self._prev_oltw_measure, measure, jump, result.ref_time_sec,
-            )
-        self._prev_oltw_measure = measure
-
-        # Throttled diagnostic log: emit once per wall-clock second so
-        # `--verbose` doesn't drown in per-frame entries. Lets the
-        # operator watch measure / confidence / cost / band live to
-        # diagnose stuck or skipping behaviour. Includes mic dBFS in
-        # live-mic mode so the user can spot "mic too quiet → noise
-        # dominates chroma → OLTW stuck" failure modes.
-        now_sec = int(time.time())
-        if now_sec != self._last_diag_log_sec:
-            self._last_diag_log_sec = now_sec
-            try:
-                snap = self.state.get_all()
-                mic_db = snap.get("mic_level_db")
-                mic_part = (
-                    f" mic={mic_db:+.0f}dBFS" if mic_db is not None else ""
-                )
-            except Exception:  # noqa: BLE001
-                mic_part = ""
-            logger.info(
-                "OLTW: m=%d β=%.2f conf=%.2f disp=%.2f raw_cost=%.3f "
-                "ref_t=%.1fs band=[%d,%d)%s",
-                measure, beat_in_measure_display, result.confidence,
-                self.state.get_all().get("display_confidence", 0.0),
-                result.raw_local_cost, result.ref_time_sec,
-                result.band_lo, result.band_hi, mic_part,
-            )
 
     # ---------------------------------------------------- silence gate
     def _check_silence_gate(self) -> None:
@@ -699,214 +492,15 @@ class AudioScoreFollowerApp:
         if not self._workers_stop.is_set():
             self.root.after(_GATE_POLL_MS, self._check_silence_gate)
 
-    # ---------------------------------------------------- trigger loop
-    def _trigger_loop(self) -> None:
-        logger.info("Trigger loop started (%.0f Hz)", _TRIGGER_POLL_HZ)
-        interval = 1.0 / _TRIGGER_POLL_HZ
-        while not self._workers_stop.is_set():
-            try:
-                snapshot = self.state.get_all()
-                triggers = self.state.current_triggers
-                current_measure = snapshot["measure"]
+    # ---------------------------------------------------- seek grace
+    def _record_seek(self) -> None:
+        """Record the wall-clock time of a forward re-anchor.
 
-                if not triggers:
-                    time.sleep(interval)
-                    continue
-
-                upcoming = [
-                    t["measure"] for t in triggers
-                    if t["measure"] > current_measure
-                    and t["measure"] not in self._fired_trigger_measures
-                ]
-                self.state.set_next_trigger(min(upcoming) if upcoming else None)
-
-                # Don't fire until OLTW has locked in.
-                if snapshot["confidence"] < _TRIGGER_CONFIDENCE_FLOOR:
-                    time.sleep(interval)
-                    continue
-
-                # Don't fire while the drift detector suspects the count
-                # has lost the performance — advancing slides on a
-                # mistracked position is worse than a late slide the
-                # operator fixes manually.
-                if snapshot.get("is_mismatched"):
-                    time.sleep(interval)
-                    continue
-
-                if snapshot["cooldown_active"]:
-                    time.sleep(interval)
-                    continue
-
-                for trig in triggers:
-                    if trig["measure"] != current_measure:
-                        continue
-                    if current_measure in self._fired_trigger_measures:
-                        continue
-                    if not self.cooldown.should_trigger(current_measure):
-                        continue
-
-                    action = trig.get("action", "right")
-                    self._execute_action(action, source="auto", trigger=trig)
-                    self.cooldown.mark_triggered(current_measure)
-                    self.state.activate_cooldown(self.config.get_cooldown_seconds())
-                    self._fired_trigger_measures.add(current_measure)
-                    break
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Trigger loop error: %s", exc, exc_info=True)
-            time.sleep(interval)
-        logger.info("Trigger loop exiting")
-
-    def _execute_action(
-        self,
-        action: str,
-        *,
-        source: str = "auto",
-        trigger: Optional[Dict] = None,
-    ) -> None:
-        """Send a single slide keypress and log it with provenance.
-
-        Args:
-            action: "right" or "left".
-            source: "auto" (fired by trigger loop from OLTW position) or
-                "manual" (user pressed ← / → / Space). Goes into the
-                log line so post-hoc review can tell which advances
-                were the human compensating for tracking drift.
-            trigger: the trigger dict (with measure, note) when known;
-                included in the log for context.
+        Called by TriggerEngine after a forward seek so the result
+        handler's jump detector suppresses the (expected) post-seek
+        measure jump during the grace period.
         """
-        try:
-            self.slide_controller.press(action)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Slide action %s failed [%s]: %s", action, source, exc, exc_info=True
-            )
-            return
-        if trigger is not None:
-            logger.info(
-                "Slide %s [%s] measure=%d note=%s",
-                action, source, trigger.get("measure"),
-                trigger.get("note", ""),
-            )
-        else:
-            logger.info("Slide %s [%s]", action, source)
-
-    # ----------------------- manual override helpers -----------------
-    def _find_next_pending_trigger(self) -> Optional[Dict]:
-        """Lowest-measure trigger that hasn't been fired yet.
-
-        Returns None when every trigger in the current movement has
-        already fired.
-        """
-        triggers = self.state.current_triggers
-        pending = [
-            t for t in triggers
-            if t["measure"] not in self._fired_trigger_measures
-        ]
-        if not pending:
-            return None
-        return min(pending, key=lambda t: t["measure"])
-
-    def _find_last_fired_trigger(self) -> Optional[Dict]:
-        """Highest-measure trigger that has been fired so far.
-
-        We use "highest measure" rather than "most-recently-fired by
-        wall-clock time" because triggers naturally fire in score order
-        during live performance; if the user has been pressing manual
-        overrides out of order they probably want to undo the latest
-        position in the score, not the latest in time.
-        """
-        if not self._fired_trigger_measures:
-            return None
-        last_measure = max(self._fired_trigger_measures)
-        triggers = self.state.current_triggers
-        for t in triggers:
-            if t["measure"] == last_measure:
-                return t
-        return None
-
-    def _seek_oltw_to_ref_time(
-        self, ref_time_sec: float, *, allow_catchup: bool = True
-    ) -> None:
-        if self.oltw is None or self.warp_lookup is None:
-            return
-        fr = self.warp_lookup.feature_config.effective_frame_rate()
-        target_frame = int(round(ref_time_sec * fr))
-        self.oltw.seek(target_frame, allow_catchup=allow_catchup)
         self._last_seek_time = time.monotonic()
-
-    def _manual_advance_to_next_trigger(self) -> None:
-        """User pressed →: send slide right, then re-sync OLTW.
-
-        The user is saying "the performance is at or past the next
-        trigger measure" — so we (1) send the press, (2) mark that
-        trigger as fired so the auto loop doesn't double-fire, and
-        (3) seek OLTW to that measure's reference time so future
-        auto-triggers fire from the correct downstream context.
-        """
-        nxt = self._find_next_pending_trigger()
-        if nxt is None or self.warp_lookup is None or self.score_mapper is None:
-            # No trigger to consume — fall back to bare slide press.
-            self._execute_action("right", source="manual")
-            return
-
-        measure = int(nxt["measure"])
-        try:
-            ref_t = self.warp_lookup.measure_to_ref_time(measure, self.score_mapper)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("measure_to_ref_time failed for m=%d: %s", measure, exc)
-            self._execute_action("right", source="manual")
-            return
-
-        self._execute_action(nxt.get("action", "right"), source="manual", trigger=nxt)
-        self.cooldown.mark_triggered(measure)
-        self.state.activate_cooldown(self.config.get_cooldown_seconds())
-        self._fired_trigger_measures.add(measure)
-        self._seek_oltw_to_ref_time(ref_t)
-        logger.info(
-            "Manual sync: OLTW re-anchored to measure %d (ref_t=%.2fs)",
-            measure, ref_t,
-        )
-
-    def _manual_back_to_prev_trigger(self) -> None:
-        """User pressed ←: send slide left, then re-sync OLTW backwards.
-
-        The user is saying "the performance is BEFORE the most-recent
-        slide change". We (1) send the left press, (2) un-fire the
-        most-recently fired trigger so it can fire again when the
-        music re-enters that region, and (3) seek OLTW back to just
-        BEFORE that measure so we won't immediately re-trigger it
-        on the next live frame.
-        """
-        last = self._find_last_fired_trigger()
-        if last is None or self.warp_lookup is None or self.score_mapper is None:
-            self._execute_action("left", source="manual")
-            return
-
-        measure = int(last["measure"])
-        try:
-            ref_t = self.warp_lookup.measure_to_ref_time(measure, self.score_mapper)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("measure_to_ref_time failed for m=%d: %s", measure, exc)
-            self._execute_action("left", source="manual")
-            return
-
-        self._execute_action("left", source="manual", trigger=last)
-        self.cooldown.unmark_triggered(measure)
-        self._fired_trigger_measures.discard(measure)
-        # Seek to a frame slightly BEFORE the measure's start so the
-        # auto loop won't immediately re-fire on the next OLTW tick.
-        # No post-seek catchup: the operator says the music is BEFORE
-        # this point, so an automatic forward scan would re-defeat
-        # the back-step.
-        fr = self.warp_lookup.feature_config.effective_frame_rate()
-        pre_frame = max(0, int(round(ref_t * fr)) - max(1, int(round(0.2 * fr))))
-        if self.oltw is not None:
-            self.oltw.seek(pre_frame, allow_catchup=False)
-        logger.info(
-            "Manual sync: OLTW re-anchored before measure %d "
-            "(ref_frame=%d, ~%.2fs)",
-            measure, pre_frame, pre_frame / fr,
-        )
 
     def manual_start(self) -> None:
         """Operator start press (L key or GUI 「▶ 演奏開始」 button).
@@ -987,10 +581,10 @@ class AudioScoreFollowerApp:
             self.manual_start()
 
         def _on_next(_e: tk.Event) -> None:
-            self._manual_advance_to_next_trigger()
+            self.trigger_engine.advance_to_next_trigger()
 
         def _on_prev(_e: tk.Event) -> None:
-            self._manual_back_to_prev_trigger()
+            self.trigger_engine.back_to_prev_trigger()
 
         def _on_thr_up(_e: tk.Event) -> None:
             self.adjust_silence_threshold(_THRESHOLD_STEP_DB)

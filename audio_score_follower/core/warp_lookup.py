@@ -66,12 +66,8 @@ class WarpLookup:
                 f"  Did you run asf-build for this movement?"
             )
         data = np.load(npz_path)
-        cfg = FeatureConfig(
-            sample_rate=int(data["feature_config"][0]),
-            hop_length=int(data["feature_config"][1]),
-            cens_win=int(data["feature_config"][2]),
-            norm=float(data["feature_config"][3]),
-            quant_steps=tuple(int(x) for x in data["feature_config_quant_steps"]),
+        cfg = FeatureConfig.from_npz_arrays(
+            data["feature_config"], data["feature_config_quant_steps"]
         )
         return cls(
             ref_times=data["ref_times"],

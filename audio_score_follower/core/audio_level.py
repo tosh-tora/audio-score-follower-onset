@@ -2,16 +2,14 @@
 """
 audio_level.py - Background Microphone RMS Monitor
 
-pymatchmaker's DTW score follower can keep advancing the alignment position
-even when the microphone is silent (its score-driven tempo prior keeps the
-position moving).  Our derived "confidence" then briefly looks plausible,
-the InertiaEngine locks in, and slides start drifting forward despite no
-music being played.
+A DTW follower has no built-in notion of "nothing is playing": on a silent
+mic it can still drift forward on noise, briefly look confident, and fire
+spurious slide triggers.
 
 This module opens a *separate* sounddevice InputStream just to measure the
-mic's RMS level, exposing ``is_active()`` for the state-sync loop to gate
-the matcher's confidence on.  When the mic is quiet, we force confidence
-to 0 regardless of what the matcher reports.
+mic's RMS level, exposing ``is_active()`` for the silence-gate poll
+(main._check_silence_gate) to freeze/unfreeze the OLTW follower on.  While
+the mic is quiet the follower stays frozen instead of tracking noise.
 """
 
 from __future__ import annotations
@@ -185,7 +183,7 @@ class AudioLevelMonitor:
         ``activation_hold_sec`` continuously; back to False only after
         ``release_hold_sec`` of continuous silence. If the monitor is
         unavailable (failed to open), returns True so that callers fall
-        back to trusting the matcher's confidence.
+        back to trusting the follower's confidence.
         """
         if not self._available:
             return True

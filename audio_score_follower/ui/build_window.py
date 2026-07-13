@@ -25,20 +25,19 @@ Design notes
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import queue
 import subprocess
 import sys
-import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from audio_score_follower.ui.gui_tkinter import _pick_font_family
+from audio_score_follower.launch_options import atomic_write_json
+from audio_score_follower.ui.common import apply_base_style
 
 logger = logging.getLogger(__name__)
 
@@ -170,26 +169,13 @@ def generate_config_dict(score: Path, built_dir: Path, config_dir: Path) -> dict
 def write_config(config_path: Path, config_dict: dict) -> None:
     """Atomically write ``config_dict`` to ``config_path`` (UTF-8, indent 2).
 
-    tempfile + os.replace, ensure_ascii=False — same approach as
-    ``launch_options.save_launcher_settings`` so Japanese notes are kept
-    and a partial write can never corrupt an existing config.
+    Delegates to ``launch_options.atomic_write_json`` (tempfile +
+    os.replace, ensure_ascii=False) so Japanese notes are kept and a
+    partial write can never corrupt an existing config.
     """
     config_path = Path(config_path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(config_path.parent), prefix=config_path.name, suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(config_dict, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, config_path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(config_path, config_dict)
     logger.info("Generated config written to %s", config_path)
 
 
@@ -215,15 +201,16 @@ class BuildWindow:
         self._log_queue: "queue.Queue[tuple]" = queue.Queue()
         self._cancelled = False
         self._generated_config: Optional[Path] = None
+        # True once the operator edits the config name manually (stops the
+        # output→config-name auto-mirror in _on_output_changed).
+        self._config_name_touched = False
+        # Config path to generate after a successful build (None = skip).
+        self._pending_config_path: Optional[Path] = None
 
         self.top = tk.Toplevel(root)
         self.top.title("オフラインビルド作成")
         self.top.geometry(_WINDOW_GEOMETRY)
-        family = _pick_font_family(root)
-        self._font = (family, 12)
-        self._font_small = (family, 10)
-        ttk.Style(self.top).configure(".", font=self._font)
-        self.top.option_add("*Font", self._font)
+        self._font, self._font_small = apply_base_style(self.top, font_source=root)
 
         self._build_widgets()
         self.top.protocol("WM_DELETE_WINDOW", self._on_back)
@@ -380,7 +367,7 @@ class BuildWindow:
     def _on_output_changed(self, *_args) -> None:
         # Mirror the output name into the config name until the operator
         # edits the config name themselves.
-        if not getattr(self, "_config_name_touched", False):
+        if not self._config_name_touched:
             self.var_config_name.set(self.var_output.get().strip())
 
     def _on_gen_config_toggled(self) -> None:
@@ -406,16 +393,16 @@ class BuildWindow:
             messagebox.showerror("入力エラー", "出力名を入力してください", parent=self.top)
             return None
 
-        def _opt_float(var, name):
+        def _opt_float(var):
             raw = var.get().strip()
             if not raw:
                 return None
             return float(raw)
 
         try:
-            score_bpm = _opt_float(self.var_bpm, "BPM")
-            start_offset = _opt_float(self.var_start, "start-offset")
-            end_trim = _opt_float(self.var_endtrim, "end-trim")
+            score_bpm = _opt_float(self.var_bpm)
+            start_offset = _opt_float(self.var_start)
+            end_trim = _opt_float(self.var_endtrim)
             cens_win = int(self.var_cens.get().strip() or _DEFAULT_CENS_WIN)
             hop_length = int(self.var_hop.get().strip() or _DEFAULT_HOP_LENGTH)
             sample_rate = int(self.var_sr.get().strip() or _DEFAULT_SAMPLE_RATE)
@@ -536,7 +523,7 @@ class BuildWindow:
         self._maybe_generate_config()
 
     def _maybe_generate_config(self) -> None:
-        config_path = getattr(self, "_pending_config_path", None)
+        config_path = self._pending_config_path
         if config_path is None:
             messagebox.showinfo(
                 "完了",

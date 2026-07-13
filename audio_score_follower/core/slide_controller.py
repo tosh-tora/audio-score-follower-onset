@@ -243,8 +243,8 @@ class NullSlideController:
 
     def press(self, action: str) -> None:
         # No log here — the canonical "slide press" log is emitted by
-        # AudioScoreFollowerApp._execute_action so it can include the
-        # source tag (manual/auto) and the triggering measure.
+        # TriggerEngine.execute_action so it can include the source tag
+        # (manual/auto) and the triggering measure.
         return None
 
     @property
