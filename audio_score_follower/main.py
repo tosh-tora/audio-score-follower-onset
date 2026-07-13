@@ -38,12 +38,10 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import sys
 import threading
 import time
 import tkinter as tk
-from collections import deque
 from pathlib import Path
 
 # Windows cp932/cp1252 stdout cannot encode em-dashes or Japanese. Force
@@ -59,9 +57,12 @@ from audio_score_follower.core.audio_level import AudioLevelMonitor
 from audio_score_follower.core.cooldown_timer import CooldownTimer
 from audio_score_follower.core.follower_worker import FileWorker, FollowerWorker
 from audio_score_follower.core.mic_effects_probe import probe_capture_effects
-from audio_score_follower.core.oltw_follower import (
-    FollowResult,
-    OnlineDTWFollower,
+from audio_score_follower.core.oltw_follower import OnlineDTWFollower
+from audio_score_follower.core.result_handler import (
+    _DISPLAY_CONF_COST_HI,
+    _DISPLAY_CONF_COST_LO,
+    OltwResultHandler,
+    display_confidence_from_cost,  # re-exported for tests / external callers
 )
 from audio_score_follower.core.score_mapper import ScoreMapper
 from audio_score_follower.core.slide_controller import NullSlideController, SlideController
@@ -80,41 +81,8 @@ logger = logging.getLogger(__name__)
 
 # How often we poll the silence gate from the Tk main loop.
 _GATE_POLL_MS = 50
-# Maximum measure jump allowed between consecutive OLTW frames without a
-# preceding user seek. At 200 BPM 4/4 with 4× warp slope (the build-time
-# limit) the measure advances <1 per 0.093s frame — so jumps >3 are anomalous.
-_MAX_FRAME_MEASURE_JUMP = 3
-# Suppress the jump-anomaly alert for this long after a user-initiated seek
-# (jumps right after a seek are expected, not a warp path anomaly).
-_SEEK_GRACE_SEC = 2.0
 # Step size for the operator's runtime silence-threshold nudge (↑/↓ keys).
 _THRESHOLD_STEP_DB = 0.2
-# Operator-facing (display) confidence: match-quality ramp over the
-# smoothed ABSOLUTE fused local cost. The OLTW's internal confidence is
-# band-relative and floors at ~0.6-0.8 even on unrelated audio (the
-# non-negative chroma cosine floor), which misleads the operator ("piano
-# BGM reads 70%"). This ramp maps smoothed cost LO→HI onto 1→0.
-# Calibrated on 幻想4 measurements (2026-07): same recording p50=0.014,
-# alt performance p50=0.082/p90=0.159, wrong movement p50=0.189,
-# unrelated piano p50=0.300 → same ≈100%, alt ≈40-90%, piano ≈0%.
-# Display only — lock-in / trigger floor / resync keep the internal scale.
-_DISPLAY_CONF_COST_LO = 0.05
-_DISPLAY_CONF_COST_HI = 0.22
-# Frames of cost smoothing for the display ramp (matches the OLTW's own
-# confidence_smoothing default; ~0.46s at 10.77 Hz).
-_DISPLAY_CONF_SMOOTHING = 5
-
-
-def display_confidence_from_cost(smoothed_cost: float) -> float:
-    """Map a smoothed fused local cost to the operator-facing confidence.
-
-    Linear ramp: cost <= LO → 1.0, cost >= HI → 0.0. NaN (frozen frames,
-    where OLTW reports no cost) → 0.0.
-    """
-    if math.isnan(smoothed_cost):
-        return 0.0
-    span = _DISPLAY_CONF_COST_HI - _DISPLAY_CONF_COST_LO
-    return max(0.0, min(1.0, (_DISPLAY_CONF_COST_HI - smoothed_cost) / span))
 
 
 class AudioScoreFollowerApp:
@@ -183,11 +151,10 @@ class AudioScoreFollowerApp:
         # job (blocking pre-performance noise) is done.
         self._performance_confirmed = not self._mic_mode
 
-        # Runtime jump detection: track previous measure and the wall-clock
-        # time of the most recent user-initiated seek. Jumps right after a
-        # seek are expected; outside the grace period they indicate a warp
-        # path anomaly.
-        self._prev_oltw_measure: int = 0
+        # Wall-clock time of the most recent user-initiated forward seek.
+        # Written by _record_seek (via TriggerEngine.notify_seek), read by
+        # the result handler's jump detector to suppress the expected
+        # post-seek jump during the grace period.
         self._last_seek_time: float = 0.0
 
         if slide_url:
@@ -211,7 +178,7 @@ class AudioScoreFollowerApp:
         # Optional realtime feature/confidence visualiser (--viz). The feed
         # is a pure data channel; the window is a separate Toplevel consumer
         # so a future audience-facing screen can share the same feed. When
-        # disabled, viz_feed stays None and _on_oltw_result skips the push.
+        # disabled, viz_feed stays None and the result handler skips the push.
         self.viz_feed: VizFeed | None = None
         if self.viz:
             self.viz_feed = VizFeed(
@@ -246,16 +213,16 @@ class AudioScoreFollowerApp:
             notify_seek=self._record_seek,
         )
 
-        # Diagnostic log throttle: emit one OLTW state log per wall-clock
-        # second. Set from _on_oltw_result, which fires per CENS frame
-        # (~10 Hz) and would otherwise flood the log.
-        self._last_diag_log_sec = 0
-
-        # Rolling window of fused local costs feeding the operator-facing
-        # display confidence (see display_confidence_from_cost). Only
-        # touched from the OLTW worker thread (_on_oltw_result).
-        self._display_cost_window: deque[float] = deque(
-            maxlen=_DISPLAY_CONF_SMOOTHING
+        # Per-frame OLTW result → AppState / viz / diagnostics. Reads the
+        # per-movement objects via getters and the seek time via a getter
+        # so it always sees the current values.
+        self.result_handler = OltwResultHandler(
+            state=self.state,
+            viz_feed=self.viz_feed,
+            get_oltw=lambda: self.oltw,
+            get_warp_lookup=lambda: self.warp_lookup,
+            get_score_mapper=lambda: self.score_mapper,
+            get_last_seek_time=lambda: self._last_seek_time,
         )
 
         logger.info("Initialisation complete")
@@ -494,7 +461,7 @@ class AudioScoreFollowerApp:
 
         self.cooldown.cleanup_old()
         self.trigger_engine.reset_for_movement()
-        self._display_cost_window.clear()
+        self.result_handler.reset_for_movement()
 
         triggers = movement.get("triggers", [])
         total_measures = self.score_mapper.get_total_measures()
@@ -514,7 +481,7 @@ class AudioScoreFollowerApp:
                 oltw_follower=self.oltw,
                 feature_config=self.warp_lookup.feature_config,
                 input_wav=self.input_wav,
-                on_result=self._on_oltw_result,
+                on_result=self.result_handler.on_result,
                 realtime=True,
                 play_audio=self.play_audio,
                 onset_enabled=onset_enabled,
@@ -524,7 +491,7 @@ class AudioScoreFollowerApp:
                 oltw_follower=self.oltw,
                 feature_config=self.warp_lookup.feature_config,
                 mic_device=self.loopback_device,
-                on_result=self._on_oltw_result,
+                on_result=self.result_handler.on_result,
                 loopback=True,
                 onset_enabled=onset_enabled,
             )
@@ -533,7 +500,7 @@ class AudioScoreFollowerApp:
                 oltw_follower=self.oltw,
                 feature_config=self.warp_lookup.feature_config,
                 mic_device=self.config.get_mic_device(),
-                on_result=self._on_oltw_result,
+                on_result=self.result_handler.on_result,
                 onset_enabled=onset_enabled,
             )
         self.worker.start()
@@ -545,115 +512,6 @@ class AudioScoreFollowerApp:
         threading.Thread(target=_ready_check, daemon=True, name="oltw-ready-check").start()
 
         logger.info("Movement loaded.")
-
-    # ---------------------------------------------------- result callback
-    def _on_oltw_result(self, result: FollowResult) -> None:
-        """Called from the OLTW worker thread per CENS frame."""
-        mapper = self.score_mapper
-        lookup = self.warp_lookup
-        if mapper is None or lookup is None:
-            return
-        try:
-            measure, beat_in_measure, continuous_beat = lookup.ref_to_measure_and_beat(
-                result.ref_time_sec, mapper
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("ref→measure failed: %s", exc)
-            return
-
-        # GUI displays 1-indexed beat-in-measure (downbeat = 1.0).
-        beat_in_measure_display = beat_in_measure + 1.0
-        self.state.update_beat_measure(
-            continuous_beat, measure, beat_in_measure_display
-        )
-        self.state.set_confidence(result.confidence)
-        self.state.set_mismatch(result.is_mismatched)
-        # Operator-facing confidence: absolute match quality from the
-        # smoothed fused cost. Frozen frames report NaN cost → display 0
-        # without polluting the smoothing window.
-        if math.isnan(result.raw_local_cost):
-            display_conf = 0.0
-        else:
-            self._display_cost_window.append(result.raw_local_cost)
-            smoothed = sum(self._display_cost_window) / len(self._display_cost_window)
-            display_conf = display_confidence_from_cost(smoothed)
-        self.state.set_display_confidence(display_conf)
-
-        # Feed the realtime visualiser (--viz only). Reuses the measure and
-        # display confidence already computed above; no-op when disabled.
-        if self.viz_feed is not None:
-            # Ground the "演奏位置さがし" panel in real measure numbers: map
-            # the band edges and the DP peak (reference frames) to measures
-            # via the same warp lookup. ~3 cheap lookups/frame at 10 Hz.
-            frame_rate = lookup.feature_config.effective_frame_rate()
-
-            def _frame_measure(frame: int):
-                try:
-                    return lookup.ref_to_measure_and_beat(
-                        frame / frame_rate, mapper
-                    )[0]
-                except Exception:  # noqa: BLE001 — edge frames may fall off
-                    return None
-
-            self.viz_feed.push(
-                result,
-                measure=measure,
-                display_confidence=display_conf,
-                band_lo_measure=_frame_measure(result.band_lo),
-                band_hi_measure=_frame_measure(max(result.band_lo, result.band_hi - 1)),
-                peak_measure=_frame_measure(result.dp_ref_frame),
-            )
-        # Mirror OLTW follower mode into AppState so the GUI tracking
-        # panel reflects lock-in / inertia transitions in real time.
-        if self.oltw is not None:
-            self.state.set_follower_mode(
-                is_locked_in=self.oltw.is_locked_in,
-                is_in_inertia=self.oltw.is_in_inertia,
-                inertia_elapsed_sec=self.oltw.inertia_elapsed_sec,
-                inertia_cap_sec=self.oltw.max_inertia_seconds,
-            )
-
-        # Runtime jump detection: large measure jumps between consecutive
-        # frames (outside the seek grace period) indicate a warp path
-        # anomaly that should have been caught by asf-build --validate.
-        jump = abs(measure - self._prev_oltw_measure)
-        if (
-            jump > _MAX_FRAME_MEASURE_JUMP
-            and self._prev_oltw_measure != 0  # skip first frame (initialisation)
-            and (time.monotonic() - self._last_seek_time) > _SEEK_GRACE_SEC
-        ):
-            logger.error(
-                "異常な小節ジャンプを検出: %d → %d (+%d 小節) at ref_t=%.2fs。"
-                "warp path の勾配が異常です。asf-build をやり直してください。",
-                self._prev_oltw_measure, measure, jump, result.ref_time_sec,
-            )
-        self._prev_oltw_measure = measure
-
-        # Throttled diagnostic log: emit once per wall-clock second so
-        # `--verbose` doesn't drown in per-frame entries. Lets the
-        # operator watch measure / confidence / cost / band live to
-        # diagnose stuck or skipping behaviour. Includes mic dBFS in
-        # live-mic mode so the user can spot "mic too quiet → noise
-        # dominates chroma → OLTW stuck" failure modes.
-        now_sec = int(time.time())
-        if now_sec != self._last_diag_log_sec:
-            self._last_diag_log_sec = now_sec
-            try:
-                snap = self.state.get_all()
-                mic_db = snap.get("mic_level_db")
-                mic_part = (
-                    f" mic={mic_db:+.0f}dBFS" if mic_db is not None else ""
-                )
-            except Exception:  # noqa: BLE001
-                mic_part = ""
-            logger.info(
-                "OLTW: m=%d β=%.2f conf=%.2f disp=%.2f raw_cost=%.3f "
-                "ref_t=%.1fs band=[%d,%d)%s",
-                measure, beat_in_measure_display, result.confidence,
-                self.state.get_all().get("display_confidence", 0.0),
-                result.raw_local_cost, result.ref_time_sec,
-                result.band_lo, result.band_hi, mic_part,
-            )
 
     # ---------------------------------------------------- silence gate
     def _check_silence_gate(self) -> None:
@@ -707,9 +565,9 @@ class AudioScoreFollowerApp:
     def _record_seek(self) -> None:
         """Record the wall-clock time of a forward re-anchor.
 
-        Called by TriggerEngine after a forward seek so _on_oltw_result's
-        jump detector suppresses the (expected) post-seek measure jump
-        during the grace period.
+        Called by TriggerEngine after a forward seek so the result
+        handler's jump detector suppresses the (expected) post-seek
+        measure jump during the grace period.
         """
         self._last_seek_time = time.monotonic()
 

@@ -41,6 +41,9 @@ from audio_score_follower.core.feature_extractor import (  # noqa: E402
     compute_onset,
 )
 from audio_score_follower.core.oltw_follower import OnlineDTWFollower  # noqa: E402
+from audio_score_follower.core.result_handler import (  # noqa: E402
+    _MAX_FRAME_MEASURE_JUMP as _JUMP_ANOMALY_MEASURES,
+)
 from audio_score_follower.core.score_mapper import ScoreMapper  # noqa: E402
 from audio_score_follower.core.trigger_engine import (  # noqa: E402
     _TRIGGER_CONFIDENCE_FLOOR,
@@ -52,10 +55,6 @@ from audio_score_follower.core.warp_lookup import (  # noqa: E402
 )
 
 logger = logging.getLogger("eval_tracking")
-
-# Matches main._MAX_FRAME_MEASURE_JUMP — jumps beyond this are the
-# anomaly the runtime detector flags.
-_JUMP_ANOMALY_MEASURES = 3
 
 
 def parse_args() -> argparse.Namespace:
