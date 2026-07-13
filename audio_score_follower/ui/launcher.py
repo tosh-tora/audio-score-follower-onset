@@ -51,27 +51,45 @@ _DEFAULT_DEVICE_LABEL = "既定のデバイス"
 _MEASURE_POLL_MS = 60
 
 
-def list_input_devices() -> list[tuple[int, str, str]]:
-    """Enumerate input-capable devices as (index, raw_name, display_label).
+def _list_devices(
+    channel_key: str, *, wasapi_only: bool, warn_label: str
+) -> list[tuple[int, str, str]]:
+    """Shared device enumerator behind the two public list_* wrappers.
 
-    Returns [] on any failure — PortAudio initialisation can be hostile
-    (same defensive stance as AudioLevelMonitor); the launcher falls
-    back to a manual-entry field in that case.
+    Returns (index, raw_name, display_label) tuples, or [] on any
+    failure — PortAudio initialisation can be hostile (same defensive
+    stance as AudioLevelMonitor); the launcher falls back to a
+    manual-entry field in that case.
     """
     try:
         import sounddevice as sd
 
         hostapis = sd.query_hostapis()
+        wasapi_ids = (
+            {i for i, api in enumerate(hostapis) if "WASAPI" in api["name"].upper()}
+            if wasapi_only
+            else None
+        )
         out = []
         for idx, dev in enumerate(sd.query_devices()):
-            if dev.get("max_input_channels", 0) <= 0:
+            if dev.get(channel_key, 0) <= 0:
                 continue
-            api = hostapis[dev["hostapi"]]["name"] if hostapis else "?"
+            if wasapi_ids is not None and dev["hostapi"] not in wasapi_ids:
+                continue
+            if wasapi_only:
+                api = "WASAPI"
+            else:
+                api = hostapis[dev["hostapi"]]["name"] if hostapis else "?"
             out.append((idx, dev["name"], f"{idx}: {dev['name']} [{api}]"))
         return out
     except BaseException as exc:  # noqa: BLE001
-        logger.warning("Input device enumeration failed: %s", exc)
+        logger.warning("%s device enumeration failed: %s", warn_label, exc)
         return []
+
+
+def list_input_devices() -> list[tuple[int, str, str]]:
+    """Enumerate input-capable devices as (index, raw_name, display_label)."""
+    return _list_devices("max_input_channels", wasapi_only=False, warn_label="Input")
 
 
 def list_output_devices_wasapi() -> list[tuple[int, str, str]]:
@@ -79,26 +97,8 @@ def list_output_devices_wasapi() -> list[tuple[int, str, str]]:
 
     Loopback capture is a WASAPI-only feature, so other host APIs
     (MME/DirectSound duplicates of the same hardware) are filtered out.
-    Returns [] on any failure.
     """
-    try:
-        import sounddevice as sd
-
-        hostapis = sd.query_hostapis()
-        wasapi_ids = {
-            i for i, api in enumerate(hostapis) if "WASAPI" in api["name"].upper()
-        }
-        out = []
-        for idx, dev in enumerate(sd.query_devices()):
-            if dev.get("max_output_channels", 0) <= 0:
-                continue
-            if dev["hostapi"] not in wasapi_ids:
-                continue
-            out.append((idx, dev["name"], f"{idx}: {dev['name']} [WASAPI]"))
-        return out
-    except BaseException as exc:  # noqa: BLE001
-        logger.warning("Output device enumeration failed: %s", exc)
-        return []
+    return _list_devices("max_output_channels", wasapi_only=True, warn_label="Output")
 
 
 class _DevicePicker:
