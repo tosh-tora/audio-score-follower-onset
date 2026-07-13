@@ -57,6 +57,10 @@ from audio_score_follower.core.audio_level import AudioLevelMonitor
 from audio_score_follower.core.cooldown_timer import CooldownTimer
 from audio_score_follower.core.follower_worker import FileWorker, FollowerWorker
 from audio_score_follower.core.mic_effects_probe import probe_capture_effects
+from audio_score_follower.core.movement_loader import (
+    MovementLoadError,
+    load_movement,
+)
 from audio_score_follower.core.oltw_follower import OnlineDTWFollower
 from audio_score_follower.core.result_handler import (
     _DISPLAY_CONF_COST_HI,
@@ -69,11 +73,7 @@ from audio_score_follower.core.slide_controller import NullSlideController, Slid
 from audio_score_follower.core.state_manager import AppState
 from audio_score_follower.core.trigger_engine import TriggerEngine
 from audio_score_follower.core.viz_feed import VizFeed, VizThresholds
-from audio_score_follower.core.warp_lookup import (
-    WarpLookup,
-    load_reference_cens,
-    load_reference_onset,
-)
+from audio_score_follower.core.warp_lookup import WarpLookup
 from audio_score_follower.ui.gui_tkinter import FollowerGUI
 from audio_score_follower.ui.viz_window import VizWindow
 
@@ -348,104 +348,36 @@ class AudioScoreFollowerApp:
         if movement:
             self._load_movement(movement)
 
-    def _load_movement(self, movement: dict) -> None:
-        xml_raw = movement.get("xml_file")
-        built_raw = movement.get("built_dir")
-        if not xml_raw or not built_raw:
-            logger.error("Movement missing xml_file or built_dir: %s", movement)
-            return
-
-        xml_file = Path(self.config.resolve_path(xml_raw))
-        built_dir = Path(self.config.resolve_path(built_raw))
-
-        if not xml_file.exists():
-            msg = f"楽譜ファイルが見つかりません。\n  → {xml_file}\n  に置いてください"
-            logger.error(msg)
-            self.state.set_load_error(f"ファイルが見つかりません\n{xml_file}")
-            return
-        if not built_dir.exists():
-            msg = (
-                f"ビルド済みリファレンスが見つかりません: {built_dir}\n"
-                f"  asf-build を実行してから再起動してください"
-            )
-            logger.error(msg)
-            self.state.set_load_error(f"asf-build 出力なし\n{built_dir}")
-            return
-
-        logger.info("Loading movement: xml=%s built=%s", xml_file, built_dir)
-
-        # Stop previous worker
+    def _stop_worker(self) -> None:
+        """Stop and drop the current OLTW worker (if any)."""
         if self.worker is not None:
             logger.info("Stopping previous OLTW worker …")
             self.worker.stop()
             self.worker = None
 
+    def _load_movement(self, movement: dict) -> None:
+        # Pure loading / construction lives in movement_loader; app-side
+        # orchestration (worker teardown, mic parking, state updates,
+        # worker wiring) stays here. stop_previous is invoked from inside
+        # the loader at the original point so a bad reload keeps the
+        # current worker running.
         try:
-            self.score_mapper = ScoreMapper(str(xml_file))
-            self.warp_lookup = WarpLookup.load(built_dir)
-            reference_cens = load_reference_cens(built_dir)
-            reference_onset = load_reference_onset(built_dir)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to load movement artifacts: %s", exc)
-            self.state.set_load_error(f"読込失敗: {exc}")
-            return
-
-        logger.info(
-            "Loaded: %s, %s, reference_cens=(%d,%d)",
-            self.score_mapper, self.warp_lookup,
-            reference_cens.shape[0], reference_cens.shape[1],
-        )
-
-        chroma_weight, onset_weight = self.config.get_feature_fusion()
-        onset_enabled = reference_onset is not None and onset_weight > 0.0
-        logger.info(
-            "Feature fusion: %s (chroma=%.2f onset=%.2f)%s",
-            "enabled" if onset_enabled else "disabled",
-            chroma_weight, onset_weight,
-            "" if onset_enabled else
-            " — rebuild with asf-build to generate reference_onset.npy",
-        )
-
-        # Validate warp path consistency before starting OLTW.
-        try:
-            self.warp_lookup.validate(self.score_mapper)
-        except ValueError as exc:
-            logger.error("Warp path validation failed: %s", exc)
-            self.state.set_load_error(
-                f"warp path 検証エラー:\n{exc}\nasf-build をやり直してください。"
+            loaded = load_movement(
+                self.config,
+                movement,
+                mic_mode=self._mic_mode,
+                viz=self.viz,
+                stop_previous=self._stop_worker,
             )
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Warp path validation error: %s", exc)
-            self.state.set_load_error(f"warp path 検証中にエラー: {exc}")
+        except MovementLoadError as exc:
+            if exc.state_message is not None:
+                self.state.set_load_error(exc.state_message)
             return
 
-        oltw_kwargs = self.config.get_oltw_kwargs()
-        if self._mic_mode:
-            # Manual-start correction for a LATE press: widen the
-            # first-frame search window so tracking can land several
-            # seconds into the piece. (Most late-press recovery goes
-            # through the armed post-unfreeze catchup, but this covers
-            # the corner where no freeze preceded the first frame.)
-            fr = self.warp_lookup.feature_config.effective_frame_rate()
-            start_width = int(round(self.config.get_start_search_seconds() * fr))
-            oltw_kwargs["init_search_width"] = max(
-                int(oltw_kwargs.get("init_search_width") or 0), start_width
-            )
-        try:
-            self.oltw = OnlineDTWFollower(
-                reference_cens=reference_cens,
-                feature_config=self.warp_lookup.feature_config,
-                reference_onset=reference_onset,
-                chroma_weight=chroma_weight,
-                onset_weight=onset_weight,
-                capture_viz=self.viz,
-                **oltw_kwargs,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to construct OLTW: %s", exc)
-            self.state.set_load_error(f"OLTW 初期化失敗: {exc}")
-            return
+        self.score_mapper = loaded.score_mapper
+        self.warp_lookup = loaded.warp_lookup
+        self.oltw = loaded.oltw
+        onset_enabled = loaded.onset_enabled
 
         if self._mic_mode:
             # Park until the operator presses 「▶ 演奏開始」. The gate
@@ -463,15 +395,14 @@ class AudioScoreFollowerApp:
         self.trigger_engine.reset_for_movement()
         self.result_handler.reset_for_movement()
 
-        triggers = movement.get("triggers", [])
-        total_measures = self.score_mapper.get_total_measures()
+        triggers = loaded.triggers
         self.state.set_movement(
             movement_id=movement.get("id"),
-            xml_file=str(xml_file),
+            xml_file=str(loaded.xml_file),
             triggers=triggers,
             movement_number=self.config.current_movement_number(),
             total_movements=self.config.total_movements(),
-            total_measures=total_measures,
+            total_measures=loaded.total_measures,
         )
         if triggers:
             self.state.set_next_trigger(min(t["measure"] for t in triggers))
