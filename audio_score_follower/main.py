@@ -350,13 +350,19 @@ class AudioScoreFollowerApp:
         self._load_movement(movement)
 
     def _load_next_movement(self) -> None:
+        prev_idx = self.config.current_movement_idx
         if not self.config.next_movement():
             logger.warning("Already at last movement")
             self.state.set_next_trigger(None)
             return
         movement = self.config.get_current_movement()
-        if movement:
-            self._load_movement(movement)
+        if not (movement and self._load_movement(movement)):
+            # Load failed (or no movement): roll the index back so the
+            # internal movement counter stays in sync with the GUI. Otherwise
+            # the index silently advances past a movement that never loaded,
+            # and the next N press skips the following one.
+            logger.warning("Next-movement load failed; reverting to movement %d", prev_idx + 1)
+            self.config.current_movement_idx = prev_idx
 
     def _stop_worker(self) -> None:
         """Stop and drop the current OLTW worker (if any)."""
@@ -365,12 +371,13 @@ class AudioScoreFollowerApp:
             self.worker.stop()
             self.worker = None
 
-    def _load_movement(self, movement: dict) -> None:
+    def _load_movement(self, movement: dict) -> bool:
         # Pure loading / construction lives in movement_loader; app-side
         # orchestration (worker teardown, mic parking, state updates,
         # worker wiring) stays here. stop_previous is invoked from inside
         # the loader at the original point so a bad reload keeps the
-        # current worker running.
+        # current worker running. Returns True on success so callers can
+        # keep the movement index in sync with what actually loaded.
         try:
             loaded = load_movement(
                 self.config,
@@ -382,7 +389,7 @@ class AudioScoreFollowerApp:
         except MovementLoadError as exc:
             if exc.state_message is not None:
                 self.state.set_load_error(exc.state_message)
-            return
+            return False
 
         self.score_mapper = loaded.score_mapper
         self.warp_lookup = loaded.warp_lookup
@@ -455,6 +462,7 @@ class AudioScoreFollowerApp:
         threading.Thread(target=_ready_check, daemon=True, name="oltw-ready-check").start()
 
         logger.info("Movement loaded.")
+        return True
 
     # ---------------------------------------------------- silence gate
     def _check_silence_gate(self) -> None:
@@ -639,18 +647,26 @@ class AudioScoreFollowerApp:
         def _on_thr_down(_e: tk.Event) -> None:
             self.adjust_silence_threshold(-_THRESHOLD_STEP_DB)
 
-        self.root.bind("<KeyPress-n>", _on_n)
-        self.root.bind("<KeyPress-N>", _on_n)
-        self.root.bind("<KeyPress-r>", _on_r)
-        self.root.bind("<KeyPress-R>", _on_r)
-        self.root.bind("<KeyPress-l>", _on_l)
-        self.root.bind("<KeyPress-L>", _on_l)
-        self.root.bind("<KeyPress-Right>", _on_next)
-        self.root.bind("<KeyPress-space>", _on_next)
-        self.root.bind("<KeyPress-Left>", _on_prev)
-        self.root.bind("<KeyPress-Up>", _on_thr_up)
-        self.root.bind("<KeyPress-Down>", _on_thr_down)
-        logger.info("Keys bound: N R L → ← Space ↑ ↓")
+        # bind_all (not root.bind): the hotkeys must fire no matter which of
+        # the app's Tk windows holds keyboard focus. With --viz the visualiser
+        # is a separate Toplevel whose bindtags do NOT include the main root,
+        # so a root-only binding goes dead the moment the operator clicks into
+        # the viz window — N/R/L/arrows silently do nothing until focus returns
+        # to the main window. The "all" bindtag is present on every widget in
+        # the interpreter, so bind_all covers both windows. (No Entry widgets
+        # exist in the follow GUI, so intercepting plain keys is safe here.)
+        self.root.bind_all("<KeyPress-n>", _on_n)
+        self.root.bind_all("<KeyPress-N>", _on_n)
+        self.root.bind_all("<KeyPress-r>", _on_r)
+        self.root.bind_all("<KeyPress-R>", _on_r)
+        self.root.bind_all("<KeyPress-l>", _on_l)
+        self.root.bind_all("<KeyPress-L>", _on_l)
+        self.root.bind_all("<KeyPress-Right>", _on_next)
+        self.root.bind_all("<KeyPress-space>", _on_next)
+        self.root.bind_all("<KeyPress-Left>", _on_prev)
+        self.root.bind_all("<KeyPress-Up>", _on_thr_up)
+        self.root.bind_all("<KeyPress-Down>", _on_thr_down)
+        logger.info("Keys bound (app-wide): N R L → ← Space ↑ ↓")
 
 
 def main() -> int:

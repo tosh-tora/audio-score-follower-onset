@@ -132,6 +132,15 @@ class FollowerGUI:
         )
         self.label_movement.pack(pady=(2, 0))
 
+        # 「次の楽章」インジケータ。N キーで送れる次の楽章があるか、
+        # それとも最終楽章で N が効かないのかを常時可視化する（押しても
+        # 無反応で「壊れた?」と不安になるのを防ぐ）。
+        next_font = font.Font(family=family, size=_CONFIDENCE_FONT_SIZE)
+        self.label_next_movement = tk.Label(
+            self.root, text="", font=next_font, bg="#f0f0f0", fg="#555",
+        )
+        self.label_next_movement.pack(pady=(0, 0))
+
         # ファイル名 or エラーメッセージ（小さめ）
         file_font = font.Font(family=family, size=_CONFIDENCE_FONT_SIZE)
         self.label_file = tk.Label(
@@ -395,6 +404,17 @@ class FollowerGUI:
             mv_num = state.get('movement_number', 1)
             mv_total = state.get('total_movements', 1)
             self.label_movement.config(text=f"第{mv_num}楽章 / 全{mv_total}楽章")
+
+            # 「次の楽章」インジケータ: 次があれば番号を、無ければ最終楽章で
+            # N が効かないことを明示する。
+            if mv_num < mv_total:
+                self.label_next_movement.config(
+                    text=f"次の楽章: 第{mv_num + 1}楽章（N キーで移動）", fg="#555"
+                )
+            else:
+                self.label_next_movement.config(
+                    text="次の楽章: なし（最終楽章）", fg="#999"
+                )
 
             # ファイル名 or ロードエラーメッセージ
             load_error = state.get('load_error')
