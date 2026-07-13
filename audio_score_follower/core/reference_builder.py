@@ -54,6 +54,7 @@ import numpy as np
 
 from audio_score_follower.core.feature_extractor import (
     FeatureConfig,
+    align_onset_to_cens,
     compute_cens,
     compute_onset,
     normalize_onset_global,
@@ -395,8 +396,7 @@ def detect_start_offset_sec(
     def _features(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         cens = compute_cens(audio, cfg)
         onset = normalize_onset_global(compute_onset(audio, cfg))
-        n = min(cens.shape[1], onset.shape[0])
-        return cens[:, :n], onset[:n]
+        return align_onset_to_cens(cens, onset)
 
     sc_cens, sc_onset = _features(score_audio)
     win_frames = int(_HEAD_DETECT_WINDOW_SEC * fps)
@@ -585,11 +585,7 @@ def build_reference(
         ref_times=ref_times,
         score_times=score_times,
         score_bpm=np.float32(score_bpm),
-        feature_config=np.array(
-            [cfg.sample_rate, cfg.hop_length, cfg.cens_win, cfg.norm],
-            dtype=np.float32,
-        ),
-        feature_config_quant_steps=np.array(cfg.quant_steps, dtype=np.int32),
+        **cfg.to_npz_arrays(),
     )
     logger.info("Saved warping path → %s", warp_path)
 

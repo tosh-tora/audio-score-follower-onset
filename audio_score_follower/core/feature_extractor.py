@@ -85,6 +85,49 @@ class FeatureConfig:
             norm=float(d.get("norm", 2.0)),
         )
 
+    def to_npz_arrays(self) -> dict[str, np.ndarray]:
+        """Serialise to the array pair stored in ``warping_path.npz``.
+
+        The layout is positional and MUST stay byte-identical — existing
+        built artifacts are reloaded via :meth:`from_npz_arrays`. This is
+        the single owner of that on-disk schema (writer in
+        reference_builder, reader in warp_lookup both route through here).
+        """
+        return {
+            "feature_config": np.array(
+                [self.sample_rate, self.hop_length, self.cens_win, self.norm],
+                dtype=np.float32,
+            ),
+            "feature_config_quant_steps": np.array(self.quant_steps, dtype=np.int32),
+        }
+
+    @classmethod
+    def from_npz_arrays(
+        cls, feature_config: np.ndarray, feature_config_quant_steps: np.ndarray
+    ) -> "FeatureConfig":
+        """Reconstruct from the :meth:`to_npz_arrays` array pair."""
+        return cls(
+            sample_rate=int(feature_config[0]),
+            hop_length=int(feature_config[1]),
+            cens_win=int(feature_config[2]),
+            norm=float(feature_config[3]),
+            quant_steps=tuple(int(x) for x in feature_config_quant_steps),
+        )
+
+
+def align_onset_to_cens(
+    cens: np.ndarray, onset: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Truncate ``cens`` (12, N) and ``onset`` (M,) to their common frame count.
+
+    Onset and CENS extraction can disagree by a frame due to STFT edge
+    handling; the fused DP cost indexes both by frame, so callers clip to
+    ``min(N, M)``. Callers that want a warning log it themselves (the
+    wording differs per call site), then pass the pair through here.
+    """
+    n = min(cens.shape[1], onset.shape[0])
+    return cens[:, :n], onset[:n]
+
 
 def compute_cens(
     audio: np.ndarray,

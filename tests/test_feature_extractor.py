@@ -8,6 +8,7 @@ import pytest
 from audio_score_follower.core.feature_extractor import (
     FeatureConfig,
     OnsetNormalizer,
+    align_onset_to_cens,
     compute_cens,
     compute_onset,
     fused_local_cost,
@@ -23,6 +24,35 @@ def test_config_roundtrip():
     assert cfg2.hop_length == 1024
     assert cfg2.cens_win == 21
     assert cfg2.norm == 1.5
+
+
+def test_config_npz_arrays_roundtrip():
+    cfg = FeatureConfig(
+        sample_rate=44100, hop_length=1024, cens_win=21, norm=1.5,
+        quant_steps=(40, 20, 10, 5),
+    )
+    arrays = cfg.to_npz_arrays()
+    # On-disk schema is positional and must stay byte-identical to what
+    # older built artifacts contain.
+    assert arrays["feature_config"].dtype == np.float32
+    assert list(arrays["feature_config"]) == [44100, 1024, 21, 1.5]
+    assert arrays["feature_config_quant_steps"].dtype == np.int32
+    cfg2 = FeatureConfig.from_npz_arrays(
+        arrays["feature_config"], arrays["feature_config_quant_steps"]
+    )
+    assert cfg2 == cfg
+
+
+def test_align_onset_to_cens_truncates_to_common_length():
+    cens = np.ones((12, 10), dtype=np.float32)
+    onset = np.arange(8, dtype=np.float32)
+    c2, o2 = align_onset_to_cens(cens, onset)
+    assert c2.shape == (12, 8)
+    assert o2.shape == (8,)
+    # Longer onset than cens → clip onset instead.
+    c3, o3 = align_onset_to_cens(np.ones((12, 5)), np.arange(9))
+    assert c3.shape == (12, 5)
+    assert o3.shape == (5,)
 
 
 def test_config_default_frame_rate():
