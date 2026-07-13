@@ -23,6 +23,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from audio_score_follower.launch_options import (
+    DEFAULT_SILENCE_MARGIN_DB,
     INPUT_SOURCE_LOOPBACK,
     INPUT_SOURCE_MIC,
     INPUT_SOURCE_WAV,
@@ -44,7 +45,7 @@ from audio_score_follower.ui.common import apply_base_style
 
 logger = logging.getLogger(__name__)
 
-_WINDOW_GEOMETRY = "760x780"
+_WINDOW_GEOMETRY = "760x840"
 _DEFAULT_DEVICE_LABEL = "既定のデバイス"
 # Poll interval for the silence-threshold measurement. The monitor's RMS
 # block is 1024/16000 ≈ 64ms, so 60ms samples each block roughly once.
@@ -303,35 +304,51 @@ class _LauncherWindow:
         self.label_measure.grid(
             row=1, column=0, columnspan=3, sticky="w", padx=8
         )
+        # 測定マージン (Issue #41): 無音測定の閾値式に足す余白。式は
+        # median + (median - p10) + margin。会場で閾値が高すぎ/低すぎと
+        # 感じたときに操作者が調整・保存できる。
+        ttk.Label(frm_adv, text="無音測定マージン (dB):").grid(
+            row=2, column=0, sticky="w", padx=8, pady=4
+        )
+        self.var_margin = tk.StringVar(value=str(DEFAULT_SILENCE_MARGIN_DB))
+        ttk.Spinbox(
+            frm_adv, textvariable=self.var_margin,
+            from_=-20.0, to=20.0, increment=0.5, width=8,
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(
+            frm_adv,
+            text="無音測定の閾値に足す余白。小さくすると弱音でも開始しやすくなる",
+            foreground="#888", font=self._font_small,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=8)
         self.button_check_nc = ttk.Button(
             frm_adv, text="マイクのノイズキャンセル検知", command=self._on_check_nc
         )
-        self.button_check_nc.grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        self.button_check_nc.grid(row=4, column=0, sticky="w", padx=8, pady=4)
         self.label_nc = ttk.Label(
             frm_adv, text="", font=self._font_small, wraplength=680, justify="left",
         )
-        self.label_nc.grid(row=3, column=0, columnspan=3, sticky="w", padx=8)
+        self.label_nc.grid(row=5, column=0, columnspan=3, sticky="w", padx=8)
         self.button_open_sound_settings = ttk.Button(
             frm_adv, text="サウンド設定を開く", command=self._on_open_sound_settings,
         )
         self._nc_settings_button_visible = False
 
         ttk.Label(frm_adv, text="トリガ間隔 cooldown_seconds (秒):").grid(
-            row=4, column=0, sticky="w", padx=8, pady=4
+            row=6, column=0, sticky="w", padx=8, pady=4
         )
         self.var_cooldown = tk.StringVar(value="3.0")
         ttk.Spinbox(
             frm_adv, textvariable=self.var_cooldown,
             from_=0.0, to=60.0, increment=0.5, width=8,
-        ).grid(row=4, column=1, sticky="w", padx=8, pady=4)
+        ).grid(row=6, column=1, sticky="w", padx=8, pady=4)
         self.var_verbose = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frm_adv, text="詳細ログ (-v)", variable=self.var_verbose
-        ).grid(row=5, column=0, sticky="w", padx=8, pady=4)
+        ).grid(row=7, column=0, sticky="w", padx=8, pady=4)
         self.var_viz = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frm_adv, text="特徴量・確信度モニタを開く (--viz)", variable=self.var_viz
-        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=8, pady=4)
 
         # --- buttons -------------------------------------------------------
         frm_btn = ttk.Frame(body)
@@ -411,6 +428,7 @@ class _LauncherWindow:
         self.var_verbose.set(bool(saved["verbose"]))
         self.var_viz.set(bool(saved["viz"]))
         self.var_silence.set(str(saved["silence_threshold_db"]))
+        self.var_margin.set(str(saved["silence_margin_db"]))
         self.var_cooldown.set(str(saved["cooldown_seconds"]))
         self.pick_mic.restore(saved["mic_device"], saved["mic_device_name"])
         self.pick_loopback.restore(
@@ -478,7 +496,17 @@ class _LauncherWindow:
         monitor.stop()
         self.button_measure.configure(text="無音測定")
         try:
-            result = compute_silence_threshold(self._measure_samples)
+            margin_db = float(self.var_margin.get())
+        except ValueError:
+            self.label_measure.configure(
+                text="測定失敗: 無音測定マージンの数値が不正です",
+                foreground="#c00",
+            )
+            return
+        try:
+            result = compute_silence_threshold(
+                self._measure_samples, margin_db=margin_db
+            )
         except ValueError as exc:
             self.label_measure.configure(text=f"測定失敗: {exc}", foreground="#c00")
             return
@@ -487,13 +515,15 @@ class _LauncherWindow:
             text=(
                 f"閾値を {result.threshold_db:.1f} dBFS に設定しました "
                 f"(中央値 {result.median_db:.1f} / p10 {result.p10_db:.1f} / "
-                f"n={result.count})"
+                f"マージン {margin_db:+.1f} / n={result.count})"
             ),
             foreground="#080",
         )
         logger.info(
-            "Silence measurement: threshold=%.1f dBFS (median=%.1f p10=%.1f n=%d)",
-            result.threshold_db, result.median_db, result.p10_db, result.count,
+            "Silence measurement: threshold=%.1f dBFS "
+            "(median=%.1f p10=%.1f margin=%.1f n=%d)",
+            result.threshold_db, result.median_db, result.p10_db,
+            margin_db, result.count,
         )
 
     def _abort_measure(self) -> None:
@@ -536,7 +566,7 @@ class _LauncherWindow:
         show_settings_button = report.has_noise_suppression
         if show_settings_button and not self._nc_settings_button_visible:
             self.button_open_sound_settings.grid(
-                row=2, column=1, columnspan=2, sticky="w", padx=8, pady=4
+                row=4, column=1, columnspan=2, sticky="w", padx=8, pady=4
             )
             self._nc_settings_button_visible = True
         elif not show_settings_button and self._nc_settings_button_visible:
@@ -578,6 +608,7 @@ class _LauncherWindow:
         try:
             silence = float(self.var_silence.get())
             cooldown = float(self.var_cooldown.get())
+            margin = float(self.var_margin.get())
         except ValueError:
             messagebox.showerror(
                 "入力エラー", "詳細設定の数値が不正です", parent=self.root
@@ -596,6 +627,7 @@ class _LauncherWindow:
             verbose=bool(self.var_verbose.get()),
             silence_threshold_db=silence,
             cooldown_seconds=cooldown,
+            silence_margin_db=margin,
             viz=bool(self.var_viz.get()),
         )
 

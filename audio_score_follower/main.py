@@ -157,6 +157,15 @@ class AudioScoreFollowerApp:
         # post-seek jump during the grace period.
         self._last_seek_time: float = 0.0
 
+        # 見切りスタート (Issue #41): monotonic time of the operator's
+        # first start press. If the silence gate has not opened within
+        # start_gate_timeout_sec of the press (quiet opening below the
+        # threshold), _check_silence_gate confirms the performance and
+        # unfreezes anyway — the press itself is the operator saying
+        # "the music is starting". None until the press.
+        self._start_press_time: float | None = None
+        self._start_gate_timeout_sec = self.config.get_start_gate_timeout_sec()
+
         if slide_url:
             self.slide_controller = SlideController(slide_url=slide_url)
         else:
@@ -173,6 +182,7 @@ class AudioScoreFollowerApp:
             self.root,
             self.state,
             on_start=self.manual_start,
+            on_adjust_threshold=self.adjust_silence_threshold,
         )
 
         # Optional realtime feature/confidence visualiser (--viz). The feed
@@ -386,9 +396,11 @@ class AudioScoreFollowerApp:
             # between worker start and the first poll.
             self._performance_started = False
             self._performance_confirmed = False
+            self._start_press_time = None
             self.oltw.freeze()
             self._prev_gate_active = True
             self.state.set_waiting_for_start(True)
+            self.state.set_awaiting_first_sound(False)
             logger.info("Waiting for operator start (▶ 演奏開始 / L key)")
 
         self.cooldown.cleanup_old()
@@ -478,12 +490,38 @@ class AudioScoreFollowerApp:
                     # performance is underway. Release the gate for the
                     # rest of the movement (one-shot).
                     self._performance_confirmed = True
+                    self.state.set_awaiting_first_sound(False)
                     logger.info(
                         "Performance confirmed (first sustained sound "
                         "after start press) — silence gate released; "
                         "tracking now governed by the DP alone"
                     )
                 self._prev_gate_active = gate_active
+            elif (
+                gate_active
+                and self.oltw is not None
+                and self._start_gate_timeout_sec > 0
+                and self._start_press_time is not None
+                and time.monotonic() - self._start_press_time
+                    >= self._start_gate_timeout_sec
+            ):
+                # 見切りスタート (Issue #41): the gate never opened —
+                # the opening is quieter than the threshold. The
+                # operator's press is trusted over the meter: confirm
+                # the performance and unfreeze. Deliberately NOT
+                # force_lock_in(): lock-in on unheard input would arm
+                # inertia over potential silence; the latch engages on
+                # its own once real music is confidently tracked.
+                if self.oltw.is_frozen:
+                    self.oltw.unfreeze()
+                self._performance_confirmed = True
+                self.state.set_awaiting_first_sound(False)
+                logger.info(
+                    "見切りスタート: gate did not open within %.1fs of the "
+                    "start press (level below threshold) — performance "
+                    "confirmed, tracking started anyway",
+                    self._start_gate_timeout_sec,
+                )
 
             self.state.set_mic_level(mic_db, gate_active, mic_available)
         except Exception as exc:  # noqa: BLE001
@@ -510,8 +548,11 @@ class AudioScoreFollowerApp:
         sustained sound — that crossing confirms the performance is
         underway and releases the gate for good (Issue #13: quiet
         openings straddle the threshold, and repeated pre-lock-in
-        freezes rewind the follower forever). An EARLY press costs
-        nothing (the follower stays frozen until sustained sound), a
+        freezes rewind the follower forever). If the gate never opens
+        within ``start_gate_timeout_sec`` of the press (opening quieter
+        than the threshold), tracking starts anyway — 見切りスタート,
+        Issue #41. An EARLY press therefore costs nothing only until
+        the timeout fires; press at (or just after) the downbeat. A
         LATE press is corrected by the armed post-unfreeze catchup /
         widened initial search (``start_search_seconds``). Lock-in
         still latches automatically once real music is confidently
@@ -531,11 +572,17 @@ class AudioScoreFollowerApp:
             return
         if self._mic_mode and not self._performance_started:
             self._performance_started = True
+            self._start_press_time = time.monotonic()
             self.state.set_waiting_for_start(False)
+            self.state.set_awaiting_first_sound(
+                True, self._start_gate_timeout_sec
+            )
             logger.info(
                 "Performance start pressed — silence gate governs "
-                "tracking until the first sustained sound, then "
-                "releases (early/late press auto-corrected)"
+                "tracking until the first sustained sound or the "
+                "%.1fs start-gate timeout (見切りスタート), whichever "
+                "comes first",
+                self._start_gate_timeout_sec,
             )
             return
         if self.oltw.is_locked_in:

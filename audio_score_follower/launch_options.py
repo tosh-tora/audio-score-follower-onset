@@ -33,6 +33,14 @@ _VALID_INPUT_SOURCES = (INPUT_SOURCE_MIC, INPUT_SOURCE_LOOPBACK, INPUT_SOURCE_WA
 # Directory that bare --input-wav filenames resolve into.
 _REFERENCE_AUDIO_DIR = Path("data") / "reference_audio"
 
+# Default margin (dB) for the 無音測定 threshold formula, and the sanity
+# range the launcher accepts for the user-editable value. The formula
+# already adapts to the venue's ambient spread via (median - p10);
+# anything beyond ±20 dB of extra margin means a broken input, not
+# tuning.
+DEFAULT_SILENCE_MARGIN_DB = 2.0
+SILENCE_MARGIN_DB_RANGE = (-20.0, 20.0)
+
 DeviceSpec = Union[int, str, None]
 
 
@@ -68,6 +76,12 @@ class LaunchOptions:
     verbose: bool = False
     silence_threshold_db: Optional[float] = None
     cooldown_seconds: Optional[float] = None
+    # Margin (dB) added by the 無音測定 threshold formula
+    # (compute_silence_threshold). Launcher-only measurement tuning —
+    # the app never reads it at runtime — persisted in the
+    # settings.launcher block so a venue-specific calibration survives
+    # relaunches (Issue #41).
+    silence_margin_db: float = DEFAULT_SILENCE_MARGIN_DB
     # Operator/dev diagnostic: open the realtime feature/confidence
     # visualiser. Settable from both the CLI (--viz) and the launcher
     # checkbox, and persisted in the settings.launcher block.
@@ -143,6 +157,14 @@ def validate(opts: LaunchOptions) -> list[str]:
             errors.append(f"--input-wav not found: {opts.input_wav}")
     if opts.play_audio and opts.input_source != INPUT_SOURCE_WAV:
         errors.append("--play-audio は --input-wav と組み合わせて使用してください")
+    lo, hi = SILENCE_MARGIN_DB_RANGE
+    if not math.isfinite(opts.silence_margin_db) or not (
+        lo <= opts.silence_margin_db <= hi
+    ):
+        errors.append(
+            f"無音測定マージンが不正です: {opts.silence_margin_db!r} "
+            f"({lo:.0f}〜{hi:.0f} dB の範囲で指定してください)"
+        )
     return errors
 
 
@@ -181,6 +203,7 @@ _LAUNCHER_DEFAULTS = {
     "viz": False,
     "mic_device_name": None,
     "loopback_device_name": None,
+    "silence_margin_db": DEFAULT_SILENCE_MARGIN_DB,
 }
 
 
@@ -271,6 +294,7 @@ def save_launcher_settings(
         "viz": bool(opts.viz),
         "mic_device_name": mic_device_name,
         "loopback_device_name": loopback_device_name,
+        "silence_margin_db": float(opts.silence_margin_db),
     }
     if opts.input_source == INPUT_SOURCE_MIC:
         settings["mic_device"] = opts.mic_device
@@ -302,7 +326,7 @@ class SilenceMeasurement:
 
 
 def compute_silence_threshold(
-    samples_db, margin_db: float = 2.0
+    samples_db, margin_db: float = DEFAULT_SILENCE_MARGIN_DB
 ) -> SilenceMeasurement:
     """Derive silence_threshold_db from ambient-noise dBFS samples.
 
