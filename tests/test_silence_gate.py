@@ -13,6 +13,7 @@ Tk を起動せず ``object.__new__`` で AudioScoreFollowerApp の骨組みだ�
 from __future__ import annotations
 
 import threading
+import time
 
 from audio_score_follower.core.state_manager import AppState
 from audio_score_follower.main import AudioScoreFollowerApp
@@ -66,6 +67,8 @@ def _make_app() -> AudioScoreFollowerApp:
     app._performance_started = False
     app._performance_confirmed = False
     app._prev_gate_active = True
+    app._start_press_time = None
+    app._start_gate_timeout_sec = 3.0
     app._workers_stop = threading.Event()
     app._workers_stop.set()  # suppress root.after rescheduling
     return app
@@ -147,3 +150,99 @@ def test_monitor_unavailable_confirms_on_first_poll_after_start():
 
     assert app.oltw.frozen is False
     assert app._performance_confirmed is True
+
+
+# ---------------------------------------------------------------- 見切りスタート
+# Issue #41: 冒頭が閾値未満だと gate が永遠に開かず追随が始まらなかった。
+# 開始押下から start_gate_timeout_sec 経っても gate が閉じたままなら、
+# 操作者の押下を信じて演奏確定 + unfreeze する。
+
+
+def test_start_gate_timeout_confirms_and_unfreezes():
+    """Gate never opened within the timeout → 見切りスタート."""
+    app = _make_app()
+    app._performance_started = True
+    app._start_press_time = time.monotonic() - 10.0  # pressed long ago
+    app.audio_monitor.active = False  # opening quieter than the threshold
+
+    app._check_silence_gate()
+
+    assert app.oltw.frozen is False
+    assert app.oltw.unfreeze_calls == 1
+    assert app._performance_confirmed is True
+    # NOT force-locked: _FakeOltw has no force_lock_in, so calling it
+    # would have raised AttributeError before reaching these asserts.
+
+
+def test_start_gate_timeout_not_elapsed_stays_frozen():
+    """Within the timeout window the gate still governs (early press)."""
+    app = _make_app()
+    app._performance_started = True
+    app._start_press_time = time.monotonic()  # just pressed
+    app.audio_monitor.active = False
+
+    app._check_silence_gate()
+
+    assert app.oltw.frozen is True
+    assert app._performance_confirmed is False
+
+
+def test_start_gate_timeout_zero_disables():
+    """timeout=0 → legacy behaviour: wait for sustained sound forever."""
+    app = _make_app()
+    app._start_gate_timeout_sec = 0.0
+    app._performance_started = True
+    app._start_press_time = time.monotonic() - 60.0
+    app.audio_monitor.active = False
+
+    app._check_silence_gate()
+
+    assert app.oltw.frozen is True
+    assert app._performance_confirmed is False
+
+
+def test_gate_open_before_timeout_uses_normal_path():
+    """Sound within the timeout → the normal first-sound confirmation
+    fires (not the timeout branch) and clears the awaiting flag."""
+    app = _make_app()
+    app._performance_started = True
+    app._start_press_time = time.monotonic()  # timeout not elapsed
+    app.audio_monitor.active = True
+    app.state.set_awaiting_first_sound(True, 3.0)
+
+    app._check_silence_gate()
+
+    assert app.oltw.frozen is False
+    assert app._performance_confirmed is True
+    assert app.state.get_all()["awaiting_first_sound"] is False
+
+
+def test_no_refreeze_after_timeout_confirmation():
+    """One-shot governance holds after a 見切り confirmation too: later
+    silence must not freeze (same as the sustained-sound path)."""
+    app = _make_app()
+    app._performance_started = True
+    app._start_press_time = time.monotonic() - 10.0
+    app.audio_monitor.active = False
+    app._check_silence_gate()
+    assert app._performance_confirmed is True
+
+    # Still silent on the next polls — no freeze, no extra unfreeze.
+    app._check_silence_gate()
+    app._check_silence_gate()
+    assert app.oltw.freeze_calls == 0
+    assert app.oltw.unfreeze_calls == 1
+    assert app.oltw.frozen is False
+
+
+def test_timeout_ignored_before_start_press():
+    """No press yet (_start_press_time None) → timeout can't fire."""
+    app = _make_app()
+    app._performance_started = False
+    app._start_press_time = None
+    app.audio_monitor.active = False
+
+    app._check_silence_gate()
+
+    assert app.oltw.frozen is True
+    assert app._performance_confirmed is False

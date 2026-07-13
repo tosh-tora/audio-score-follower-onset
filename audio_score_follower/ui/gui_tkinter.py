@@ -48,6 +48,11 @@ _MODE_COLOR_FLASH = ("#2255ff", "white")      # blue bg for start-button flash
 # Window geometry scaled ~2x to match the large pit-readable fonts.
 _WINDOW_GEOMETRY = "1400x1000"
 
+# dB step for the silence-threshold −/＋ buttons next to the mic level.
+# Coarser than the ↑/↓ keys (±0.2 dB) — a click is a deliberate nudge,
+# keys auto-repeat for fine adjustment.
+_THRESHOLD_BUTTON_STEP_DB = 1.0
+
 
 class FollowerGUI:
     """
@@ -62,6 +67,7 @@ class FollowerGUI:
         state: AppState,
         *,
         on_start: Optional[Callable[[], None]] = None,
+        on_adjust_threshold: Optional[Callable[[float], None]] = None,
     ):
         """
         Initialize GUI.
@@ -74,10 +80,17 @@ class FollowerGUI:
                 ``AudioScoreFollowerApp.manual_start``. Optional;
                 passes a no-op if omitted so the GUI can run standalone
                 in tests.
+            on_adjust_threshold: callback fired with a dB delta when
+                the operator clicks the silence-threshold −/＋ buttons
+                next to the mic level readout. Wired by ``main.py`` to
+                ``AudioScoreFollowerApp.adjust_silence_threshold``
+                (no-op in wav/loopback modes where no gate runs).
+                Optional for standalone/test use.
         """
         self.root = root
         self.state = state
         self._on_start = on_start or (lambda: None)
+        self._on_adjust_threshold = on_adjust_threshold or (lambda _d: None)
 
         self.root.title("Sequential Live Follower")
         self.root.geometry(_WINDOW_GEOMETRY)
@@ -118,6 +131,15 @@ class FollowerGUI:
             self.root, text="楽章読込中…", font=movement_font, bg="#f0f0f0", fg="#333"
         )
         self.label_movement.pack(pady=(2, 0))
+
+        # 「次の楽章」インジケータ。N キーで送れる次の楽章があるか、
+        # それとも最終楽章で N が効かないのかを常時可視化する（押しても
+        # 無反応で「壊れた?」と不安になるのを防ぐ）。
+        next_font = font.Font(family=family, size=_CONFIDENCE_FONT_SIZE)
+        self.label_next_movement = tk.Label(
+            self.root, text="", font=next_font, bg="#f0f0f0", fg="#555",
+        )
+        self.label_next_movement.pack(pady=(0, 0))
 
         # ファイル名 or エラーメッセージ（小さめ）
         file_font = font.Font(family=family, size=_CONFIDENCE_FONT_SIZE)
@@ -189,10 +211,33 @@ class FollowerGUI:
         # マイクレベル — 確信度バーの直下に置く。確信度はマイク入力に直結する
         # ので並べて確認できると運用しやすい。下にある要素（クールダウン等）が
         # ウィンドウ高さの関係で見切れても、入力レベルだけは見えるようにする。
+        # 閾値の −/＋ ボタンを併設（Issue #41: ↑/↓ キーだけでは発見性が低い。
+        # wav/loopback ではコールバック側が no-op なので disable する）。
+        self.mic_frame = tk.Frame(self.root, bg="#f0f0f0")
+        self.mic_frame.pack(pady=2)
         self.label_mic_level = tk.Label(
-            self.root, text="マイク: -- dBFS", font=(family, _COOLDOWN_FONT_SIZE), bg="#f0f0f0", fg="#444"
+            self.mic_frame, text="マイク: -- dBFS", font=(family, _COOLDOWN_FONT_SIZE), bg="#f0f0f0", fg="#444"
         )
-        self.label_mic_level.pack(pady=2)
+        self.label_mic_level.pack(side=tk.LEFT)
+        self.button_thr_down = tk.Button(
+            self.mic_frame,
+            text="− 閾値",
+            font=(family, _HINT_FONT_SIZE),
+            command=lambda: self._on_adjust_threshold(-_THRESHOLD_BUTTON_STEP_DB),
+            padx=6,
+        )
+        self.button_thr_down.pack(side=tk.LEFT, padx=(16, 4))
+        self.button_thr_up = tk.Button(
+            self.mic_frame,
+            text="＋ 閾値",
+            font=(family, _HINT_FONT_SIZE),
+            command=lambda: self._on_adjust_threshold(_THRESHOLD_BUTTON_STEP_DB),
+            padx=6,
+        )
+        self.button_thr_up.pack(side=tk.LEFT, padx=4)
+        # Track enabled/disabled so we only reconfigure on change
+        # (100ms poll — pitfall #6).
+        self._thr_buttons_enabled = True
 
         # ----- 追随モード表示パネル + 楽章開始ボタン -----
         # 「いま OLTW が音を追えているのか / 慣性で進めているのか / 慣性 cap
@@ -304,6 +349,19 @@ class FollowerGUI:
         if waiting_for_start:
             bg, fg = _MODE_COLOR_WAITING
             text = "⏸ 開始待ち（▶ 演奏開始 を押してください）"
+        elif state.get('awaiting_first_sound', False) and not is_locked:
+            # Start pressed, performance not confirmed yet (Issue #41):
+            # tell the operator what happens if the opening stays below
+            # the gate threshold.
+            bg, fg = _MODE_COLOR_WAITING
+            timeout = float(state.get('start_gate_timeout_sec', 0.0))
+            if timeout > 0:
+                text = (
+                    f"🎧 音を待っています"
+                    f"（無音でも {timeout:.0f} 秒後に自動開始）"
+                )
+            else:
+                text = "🎧 音を待っています（閾値超えの音で開始）"
         elif not is_locked:
             bg, fg = _MODE_COLOR_WAITING
             text = "🎧 音を待っています（曲の捕捉中）"
@@ -347,6 +405,17 @@ class FollowerGUI:
             mv_total = state.get('total_movements', 1)
             self.label_movement.config(text=f"第{mv_num}楽章 / 全{mv_total}楽章")
 
+            # 「次の楽章」インジケータ: 次があれば番号を、無ければ最終楽章で
+            # N が効かないことを明示する。
+            if mv_num < mv_total:
+                self.label_next_movement.config(
+                    text=f"次の楽章: 第{mv_num + 1}楽章（N キーで移動）", fg="#555"
+                )
+            else:
+                self.label_next_movement.config(
+                    text="次の楽章: なし（最終楽章）", fg="#999"
+                )
+
             # ファイル名 or ロードエラーメッセージ
             load_error = state.get('load_error')
             if load_error:
@@ -386,7 +455,7 @@ class FollowerGUI:
             if mismatched != self._mismatch_visible:
                 self._mismatch_visible = mismatched
                 if mismatched:
-                    self.label_mismatch.pack(pady=4, before=self.label_mic_level)
+                    self.label_mismatch.pack(pady=4, before=self.mic_frame)
                 else:
                     self.label_mismatch.pack_forget()
 
@@ -397,7 +466,7 @@ class FollowerGUI:
                 self._mic_effects_visible = mic_warning_active
                 if mic_warning_active:
                     self.label_mic_effects.config(text=mic_warning)
-                    self.label_mic_effects.pack(pady=4, before=self.label_mic_level)
+                    self.label_mic_effects.pack(pady=4, before=self.mic_frame)
                 else:
                     self.label_mic_effects.pack_forget()
 
@@ -435,6 +504,14 @@ class FollowerGUI:
                 mic_text = f"マイク: {mic_db:.1f} dBFS{thr_part}  ✓ 入力検出"
                 mic_color = "#2a7"
             self.label_mic_level.config(text=mic_text, fg=mic_color)
+
+            # 閾値 −/＋ ボタンは gate が動くモード（マイク監視あり）でのみ
+            # 有効。差分時のみ config（落とし穴 #6）。
+            if mic_available != self._thr_buttons_enabled:
+                self._thr_buttons_enabled = mic_available
+                btn_state = tk.NORMAL if mic_available else tk.DISABLED
+                self.button_thr_down.config(state=btn_state)
+                self.button_thr_up.config(state=btn_state)
 
         except Exception as e:
             logger.error(f"GUI update error: {e}")

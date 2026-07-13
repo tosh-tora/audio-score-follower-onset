@@ -196,6 +196,32 @@ class ConfigLoader:
         """
         return self.settings.get("start_search_seconds", 10.0)
 
+    def get_start_gate_timeout_sec(self) -> float:
+        """Deadline (seconds) for the silence gate to open after the
+        operator's start press before tracking starts anyway (見切り).
+
+        Issue #41: a quiet opening can sit below the gate threshold
+        forever, so 「▶ 演奏開始」 alone never started tracking. The
+        operator's press is a strong statement that the music is
+        starting; if the gate has not seen sustained sound within this
+        many seconds of the press, the performance is confirmed and the
+        follower unfreezes anyway (lock-in still latches only once real
+        music is confidently tracked). Trade-off: pressing early now
+        lets the DP run on ambient noise once the timeout fires — press
+        at (or just after) the downbeat. 0 disables the timeout (legacy:
+        wait for sustained sound indefinitely).
+        """
+        raw = self.settings.get("start_gate_timeout_sec", 3.0)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "settings.start_gate_timeout_sec must be a number; "
+                "got %r — using default 3.0", raw,
+            )
+            return 3.0
+        return max(0.0, value)
+
     def get_gate_release_sec(self) -> float:
         """Sustained silence required before the silence gate CLOSES.
 

@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from audio_score_follower.launch_options import (
+    DEFAULT_SILENCE_MARGIN_DB,
     INPUT_SOURCE_LOOPBACK,
     INPUT_SOURCE_MIC,
     INPUT_SOURCE_WAV,
@@ -86,6 +87,39 @@ class TestEffectiveInputWav:
 
 
 # ---------------------------------------------------------------- config loader
+class TestConfigLoaderStartGateTimeout:
+    """settings.start_gate_timeout_sec — 見切りスタート deadline (Issue #41)."""
+
+    def _loader_with(self, config_file, tmp_path, value):
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+        data["settings"]["start_gate_timeout_sec"] = value
+        path = tmp_path / "config_timeout.json"
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        from audio_score_follower.config.loader import ConfigLoader
+        return ConfigLoader(str(path))
+
+    def test_default(self, config_file):
+        from audio_score_follower.config.loader import ConfigLoader
+        loader = ConfigLoader(str(config_file))
+        assert loader.get_start_gate_timeout_sec() == 3.0
+
+    def test_settings_override(self, config_file, tmp_path):
+        loader = self._loader_with(config_file, tmp_path, 7.5)
+        assert loader.get_start_gate_timeout_sec() == 7.5
+
+    def test_zero_disables(self, config_file, tmp_path):
+        loader = self._loader_with(config_file, tmp_path, 0)
+        assert loader.get_start_gate_timeout_sec() == 0.0
+
+    def test_negative_clamps_to_zero(self, config_file, tmp_path):
+        loader = self._loader_with(config_file, tmp_path, -2.0)
+        assert loader.get_start_gate_timeout_sec() == 0.0
+
+    def test_non_numeric_falls_back_to_default(self, config_file, tmp_path):
+        loader = self._loader_with(config_file, tmp_path, "fast")
+        assert loader.get_start_gate_timeout_sec() == 3.0
+
+
 class TestConfigLoaderStartSearch:
     def test_default(self, config_file):
         from audio_score_follower.config.loader import ConfigLoader
@@ -166,6 +200,19 @@ class TestValidate:
 
     def test_happy_mic(self, config_file):
         assert validate(_mic_opts(config_file)) == []
+
+    def test_margin_out_of_range(self, config_file):
+        errors = validate(_mic_opts(config_file, silence_margin_db=25.0))
+        assert any("無音測定マージン" in e for e in errors)
+        errors = validate(_mic_opts(config_file, silence_margin_db=-25.0))
+        assert any("無音測定マージン" in e for e in errors)
+
+    def test_margin_non_finite(self, config_file):
+        errors = validate(_mic_opts(config_file, silence_margin_db=math.nan))
+        assert any("無音測定マージン" in e for e in errors)
+
+    def test_margin_in_range_ok(self, config_file):
+        assert validate(_mic_opts(config_file, silence_margin_db=-3.0)) == []
 
     def test_happy_loopback(self, config_file):
         opts = LaunchOptions(
@@ -322,6 +369,19 @@ class TestReadLauncherSettings:
         path.write_text("{ oops", encoding="utf-8")
         with pytest.raises(ValueError, match="JSON 構文エラー"):
             read_launcher_settings(path)
+
+    def test_margin_default_without_launcher_block(self, config_file):
+        saved = read_launcher_settings(config_file)
+        assert saved["silence_margin_db"] == DEFAULT_SILENCE_MARGIN_DB
+
+    def test_margin_round_trip(self, config_file):
+        opts = _mic_opts(config_file, silence_margin_db=0.5)
+        save_launcher_settings(config_file, opts)
+        saved = read_launcher_settings(config_file)
+        assert saved["silence_margin_db"] == 0.5
+        launcher = json.loads(config_file.read_text(encoding="utf-8"))[
+            "settings"]["launcher"]
+        assert launcher["silence_margin_db"] == 0.5
 
 
 # ---------------------------------------------------------------- silence threshold

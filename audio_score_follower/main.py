@@ -157,6 +157,15 @@ class AudioScoreFollowerApp:
         # post-seek jump during the grace period.
         self._last_seek_time: float = 0.0
 
+        # 見切りスタート (Issue #41): monotonic time of the operator's
+        # first start press. If the silence gate has not opened within
+        # start_gate_timeout_sec of the press (quiet opening below the
+        # threshold), _check_silence_gate confirms the performance and
+        # unfreezes anyway — the press itself is the operator saying
+        # "the music is starting". None until the press.
+        self._start_press_time: float | None = None
+        self._start_gate_timeout_sec = self.config.get_start_gate_timeout_sec()
+
         if slide_url:
             self.slide_controller = SlideController(slide_url=slide_url)
         else:
@@ -173,6 +182,7 @@ class AudioScoreFollowerApp:
             self.root,
             self.state,
             on_start=self.manual_start,
+            on_adjust_threshold=self.adjust_silence_threshold,
         )
 
         # Optional realtime feature/confidence visualiser (--viz). The feed
@@ -340,13 +350,19 @@ class AudioScoreFollowerApp:
         self._load_movement(movement)
 
     def _load_next_movement(self) -> None:
+        prev_idx = self.config.current_movement_idx
         if not self.config.next_movement():
             logger.warning("Already at last movement")
             self.state.set_next_trigger(None)
             return
         movement = self.config.get_current_movement()
-        if movement:
-            self._load_movement(movement)
+        if not (movement and self._load_movement(movement)):
+            # Load failed (or no movement): roll the index back so the
+            # internal movement counter stays in sync with the GUI. Otherwise
+            # the index silently advances past a movement that never loaded,
+            # and the next N press skips the following one.
+            logger.warning("Next-movement load failed; reverting to movement %d", prev_idx + 1)
+            self.config.current_movement_idx = prev_idx
 
     def _stop_worker(self) -> None:
         """Stop and drop the current OLTW worker (if any)."""
@@ -355,12 +371,13 @@ class AudioScoreFollowerApp:
             self.worker.stop()
             self.worker = None
 
-    def _load_movement(self, movement: dict) -> None:
+    def _load_movement(self, movement: dict) -> bool:
         # Pure loading / construction lives in movement_loader; app-side
         # orchestration (worker teardown, mic parking, state updates,
         # worker wiring) stays here. stop_previous is invoked from inside
         # the loader at the original point so a bad reload keeps the
-        # current worker running.
+        # current worker running. Returns True on success so callers can
+        # keep the movement index in sync with what actually loaded.
         try:
             loaded = load_movement(
                 self.config,
@@ -372,7 +389,7 @@ class AudioScoreFollowerApp:
         except MovementLoadError as exc:
             if exc.state_message is not None:
                 self.state.set_load_error(exc.state_message)
-            return
+            return False
 
         self.score_mapper = loaded.score_mapper
         self.warp_lookup = loaded.warp_lookup
@@ -386,9 +403,11 @@ class AudioScoreFollowerApp:
             # between worker start and the first poll.
             self._performance_started = False
             self._performance_confirmed = False
+            self._start_press_time = None
             self.oltw.freeze()
             self._prev_gate_active = True
             self.state.set_waiting_for_start(True)
+            self.state.set_awaiting_first_sound(False)
             logger.info("Waiting for operator start (▶ 演奏開始 / L key)")
 
         self.cooldown.cleanup_old()
@@ -443,6 +462,7 @@ class AudioScoreFollowerApp:
         threading.Thread(target=_ready_check, daemon=True, name="oltw-ready-check").start()
 
         logger.info("Movement loaded.")
+        return True
 
     # ---------------------------------------------------- silence gate
     def _check_silence_gate(self) -> None:
@@ -478,12 +498,38 @@ class AudioScoreFollowerApp:
                     # performance is underway. Release the gate for the
                     # rest of the movement (one-shot).
                     self._performance_confirmed = True
+                    self.state.set_awaiting_first_sound(False)
                     logger.info(
                         "Performance confirmed (first sustained sound "
                         "after start press) — silence gate released; "
                         "tracking now governed by the DP alone"
                     )
                 self._prev_gate_active = gate_active
+            elif (
+                gate_active
+                and self.oltw is not None
+                and self._start_gate_timeout_sec > 0
+                and self._start_press_time is not None
+                and time.monotonic() - self._start_press_time
+                    >= self._start_gate_timeout_sec
+            ):
+                # 見切りスタート (Issue #41): the gate never opened —
+                # the opening is quieter than the threshold. The
+                # operator's press is trusted over the meter: confirm
+                # the performance and unfreeze. Deliberately NOT
+                # force_lock_in(): lock-in on unheard input would arm
+                # inertia over potential silence; the latch engages on
+                # its own once real music is confidently tracked.
+                if self.oltw.is_frozen:
+                    self.oltw.unfreeze()
+                self._performance_confirmed = True
+                self.state.set_awaiting_first_sound(False)
+                logger.info(
+                    "見切りスタート: gate did not open within %.1fs of the "
+                    "start press (level below threshold) — performance "
+                    "confirmed, tracking started anyway",
+                    self._start_gate_timeout_sec,
+                )
 
             self.state.set_mic_level(mic_db, gate_active, mic_available)
         except Exception as exc:  # noqa: BLE001
@@ -510,8 +556,11 @@ class AudioScoreFollowerApp:
         sustained sound — that crossing confirms the performance is
         underway and releases the gate for good (Issue #13: quiet
         openings straddle the threshold, and repeated pre-lock-in
-        freezes rewind the follower forever). An EARLY press costs
-        nothing (the follower stays frozen until sustained sound), a
+        freezes rewind the follower forever). If the gate never opens
+        within ``start_gate_timeout_sec`` of the press (opening quieter
+        than the threshold), tracking starts anyway — 見切りスタート,
+        Issue #41. An EARLY press therefore costs nothing only until
+        the timeout fires; press at (or just after) the downbeat. A
         LATE press is corrected by the armed post-unfreeze catchup /
         widened initial search (``start_search_seconds``). Lock-in
         still latches automatically once real music is confidently
@@ -531,11 +580,17 @@ class AudioScoreFollowerApp:
             return
         if self._mic_mode and not self._performance_started:
             self._performance_started = True
+            self._start_press_time = time.monotonic()
             self.state.set_waiting_for_start(False)
+            self.state.set_awaiting_first_sound(
+                True, self._start_gate_timeout_sec
+            )
             logger.info(
                 "Performance start pressed — silence gate governs "
-                "tracking until the first sustained sound, then "
-                "releases (early/late press auto-corrected)"
+                "tracking until the first sustained sound or the "
+                "%.1fs start-gate timeout (見切りスタート), whichever "
+                "comes first",
+                self._start_gate_timeout_sec,
             )
             return
         if self.oltw.is_locked_in:
@@ -592,18 +647,26 @@ class AudioScoreFollowerApp:
         def _on_thr_down(_e: tk.Event) -> None:
             self.adjust_silence_threshold(-_THRESHOLD_STEP_DB)
 
-        self.root.bind("<KeyPress-n>", _on_n)
-        self.root.bind("<KeyPress-N>", _on_n)
-        self.root.bind("<KeyPress-r>", _on_r)
-        self.root.bind("<KeyPress-R>", _on_r)
-        self.root.bind("<KeyPress-l>", _on_l)
-        self.root.bind("<KeyPress-L>", _on_l)
-        self.root.bind("<KeyPress-Right>", _on_next)
-        self.root.bind("<KeyPress-space>", _on_next)
-        self.root.bind("<KeyPress-Left>", _on_prev)
-        self.root.bind("<KeyPress-Up>", _on_thr_up)
-        self.root.bind("<KeyPress-Down>", _on_thr_down)
-        logger.info("Keys bound: N R L → ← Space ↑ ↓")
+        # bind_all (not root.bind): the hotkeys must fire no matter which of
+        # the app's Tk windows holds keyboard focus. With --viz the visualiser
+        # is a separate Toplevel whose bindtags do NOT include the main root,
+        # so a root-only binding goes dead the moment the operator clicks into
+        # the viz window — N/R/L/arrows silently do nothing until focus returns
+        # to the main window. The "all" bindtag is present on every widget in
+        # the interpreter, so bind_all covers both windows. (No Entry widgets
+        # exist in the follow GUI, so intercepting plain keys is safe here.)
+        self.root.bind_all("<KeyPress-n>", _on_n)
+        self.root.bind_all("<KeyPress-N>", _on_n)
+        self.root.bind_all("<KeyPress-r>", _on_r)
+        self.root.bind_all("<KeyPress-R>", _on_r)
+        self.root.bind_all("<KeyPress-l>", _on_l)
+        self.root.bind_all("<KeyPress-L>", _on_l)
+        self.root.bind_all("<KeyPress-Right>", _on_next)
+        self.root.bind_all("<KeyPress-space>", _on_next)
+        self.root.bind_all("<KeyPress-Left>", _on_prev)
+        self.root.bind_all("<KeyPress-Up>", _on_thr_up)
+        self.root.bind_all("<KeyPress-Down>", _on_thr_down)
+        logger.info("Keys bound (app-wide): N R L → ← Space ↑ ↓")
 
 
 def main() -> int:

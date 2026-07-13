@@ -90,6 +90,15 @@ class AppState:
         # Always False in wav/loopback modes (auto-start).
         self.waiting_for_start: bool = False
 
+        # Mic-mode start pressed but the performance is not confirmed
+        # yet: the silence gate is waiting for the first sustained
+        # sound, or the start-gate timeout (見切りスタート, Issue #41)
+        # will fire. ``start_gate_timeout_sec`` mirrors the configured
+        # timeout so the GUI can tell the operator what will happen
+        # (0 = timeout disabled).
+        self.awaiting_first_sound: bool = False
+        self.start_gate_timeout_sec: float = 0.0
+
         # One-shot startup warning from mic_effects_probe (mic mode only):
         # non-None while the selected mic's OS-level noise suppression
         # was detected active (or could not be confirmed absent). None =
@@ -124,6 +133,8 @@ class AppState:
                 'mic_monitor_available': self.mic_monitor_available,
                 'silence_threshold_db': self.silence_threshold_db,
                 'waiting_for_start': self.waiting_for_start,
+                'awaiting_first_sound': self.awaiting_first_sound,
+                'start_gate_timeout_sec': self.start_gate_timeout_sec,
                 'mic_effects_warning': self.mic_effects_warning,
                 'is_locked_in': self.is_locked_in,
                 'is_in_inertia': self.is_in_inertia,
@@ -249,6 +260,22 @@ class AppState:
         """Update the mic-mode manual-start waiting flag."""
         with self._lock:
             self.waiting_for_start = waiting
+
+    def set_awaiting_first_sound(
+        self, awaiting: bool, timeout_sec: float = 0.0
+    ):
+        """Update the post-press / pre-confirmation flag (Issue #41).
+
+        Args:
+            awaiting: True from the operator's start press until the
+                performance is confirmed (first sustained sound or the
+                start-gate timeout).
+            timeout_sec: configured ``start_gate_timeout_sec`` for GUI
+                display (0 = timeout disabled).
+        """
+        with self._lock:
+            self.awaiting_first_sound = awaiting
+            self.start_gate_timeout_sec = timeout_sec
 
     def set_mic_effects_warning(self, message: Optional[str]) -> None:
         """Record (or clear) the startup mic-noise-suppression warning."""
