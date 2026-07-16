@@ -41,6 +41,13 @@ _REFERENCE_AUDIO_DIR = Path("data") / "reference_audio"
 DEFAULT_SILENCE_MARGIN_DB = 2.0
 SILENCE_MARGIN_DB_RANGE = (-20.0, 20.0)
 
+# Default silence-gate threshold when the operator hasn't measured one.
+# The threshold depends on the specific mic and venue, so it is NOT
+# persisted to / read from config.json — it is measured per session in
+# the launcher (無音測定) and passed to the app in memory. This constant
+# is only the launcher form's starting value and the app's fallback.
+DEFAULT_SILENCE_THRESHOLD_DB = -55.0
+
 DeviceSpec = Union[int, str, None]
 
 
@@ -53,9 +60,13 @@ class LaunchOptions:
     --loopback conflict is structurally impossible here. main() derives
     ``loopback=(input_source == INPUT_SOURCE_LOOPBACK)`` for the app.
 
-    ``silence_threshold_db`` / ``cooldown_seconds`` are launcher-only
-    tuning fields; None means "leave the config value untouched" (the
-    CLI has no flags for them).
+    ``silence_threshold_db`` is a per-session value measured in the
+    launcher (無音測定) and handed to the app in memory — it is
+    deliberately NOT persisted to / read from config.json because it
+    depends on the specific mic and venue ambient level. None means "no
+    session value" → the app uses ``DEFAULT_SILENCE_THRESHOLD_DB`` (CLI
+    mode has no flag; adjust at runtime with ↑/↓). ``cooldown_seconds``
+    is still a launcher-only config field (None = leave config untouched).
 
     ``input_wav`` may be non-None even when ``input_source`` is not
     "wav": the launcher keeps the last-used file path in its form (and
@@ -260,7 +271,10 @@ def read_launcher_settings(config_path: Path) -> dict:
     merged.update({k: launcher[k] for k in _LAUNCHER_DEFAULTS if k in launcher})
     merged["mic_device"] = settings.get("mic_device")
     merged["loopback_device"] = settings.get("loopback_device")
-    merged["silence_threshold_db"] = settings.get("silence_threshold_db", -55.0)
+    # The silence threshold is mic/venue-dependent and no longer linked to
+    # config: never read it back: the launcher form always starts at the
+    # default and the operator re-measures per session.
+    merged["silence_threshold_db"] = DEFAULT_SILENCE_THRESHOLD_DB
     merged["cooldown_seconds"] = settings.get("cooldown_seconds", 3.0)
     return merged
 
@@ -300,8 +314,11 @@ def save_launcher_settings(
         settings["mic_device"] = opts.mic_device
     elif opts.input_source == INPUT_SOURCE_LOOPBACK:
         settings["loopback_device"] = opts.loopback_device
-    if opts.silence_threshold_db is not None:
-        settings["silence_threshold_db"] = opts.silence_threshold_db
+    # The silence threshold is mic/venue-dependent and no longer persisted.
+    # Actively drop any legacy value so a config carried between venues can
+    # never silently reapply a stale threshold (it is passed to the app in
+    # memory instead — see LaunchOptions.silence_threshold_db).
+    settings.pop("silence_threshold_db", None)
     if opts.cooldown_seconds is not None:
         settings["cooldown_seconds"] = opts.cooldown_seconds
 

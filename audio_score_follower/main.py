@@ -100,6 +100,7 @@ class AudioScoreFollowerApp:
         play_audio: bool = False,
         loopback: bool = False,
         loopback_device=None,
+        silence_threshold_db: float | None = None,
         viz: bool = False,
     ) -> None:
         logger.info(
@@ -121,10 +122,21 @@ class AudioScoreFollowerApp:
             else self.config.get_loopback_device()
         )
 
+        # Silence-gate threshold is a per-session value that depends on the
+        # actual mic and venue ambient level — it is deliberately NOT read
+        # from / persisted to config.json. The launcher measures it (無音測定)
+        # and passes it here in memory; CLI mode leaves it None and falls back
+        # to the default (adjust at runtime with ↑/↓ or the ± buttons).
+        self._silence_threshold_db = (
+            silence_threshold_db
+            if silence_threshold_db is not None
+            else launch_options.DEFAULT_SILENCE_THRESHOLD_DB
+        )
+
         self.state = AppState()
         self.cooldown = CooldownTimer(self.config.get_cooldown_seconds())
         self.audio_monitor = AudioLevelMonitor(
-            threshold_db=self.config.get_silence_threshold_db(),
+            threshold_db=self._silence_threshold_db,
             device=self.config.get_mic_device(),
             activation_hold_sec=self.config.get_gate_activation_sec(),
             release_hold_sec=self.config.get_gate_release_sec(),
@@ -250,12 +262,10 @@ class AudioScoreFollowerApp:
     def run(self) -> None:
         if self.input_wav is None and not self.loopback:
             logger.info("Launching AudioLevelMonitor …")
-            # Surface the configured gate threshold so the GUI can show
-            # it next to the live dBFS readout — the operator can then
-            # see at a glance whether ambient noise sits above it.
-            self.state.set_silence_threshold(
-                self.config.get_silence_threshold_db()
-            )
+            # Surface the session gate threshold so the GUI can show it
+            # next to the live dBFS readout — the operator can then see at
+            # a glance whether ambient noise sits above it.
+            self.state.set_silence_threshold(self._silence_threshold_db)
             self._check_mic_effects()
             try:
                 self.audio_monitor.start()
@@ -829,6 +839,7 @@ def main() -> int:
             play_audio=opts.play_audio,
             loopback=(opts.input_source == launch_options.INPUT_SOURCE_LOOPBACK),
             loopback_device=opts.loopback_device,
+            silence_threshold_db=opts.silence_threshold_db,
             viz=opts.viz,
         )
         app.run()

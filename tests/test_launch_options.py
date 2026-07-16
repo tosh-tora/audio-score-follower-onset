@@ -10,6 +10,7 @@ import pytest
 
 from audio_score_follower.launch_options import (
     DEFAULT_SILENCE_MARGIN_DB,
+    DEFAULT_SILENCE_THRESHOLD_DB,
     INPUT_SOURCE_LOOPBACK,
     INPUT_SOURCE_MIC,
     INPUT_SOURCE_WAV,
@@ -303,8 +304,25 @@ class TestPersistence:
         assert launcher["play_audio"] is True
         assert launcher["verbose"] is True
         assert launcher["slide_url"] == "https://slides"
-        assert settings["silence_threshold_db"] == -50.0
+        # Silence threshold is mic/venue-dependent and NOT persisted, even
+        # when the LaunchOptions carries a value.
+        assert "silence_threshold_db" not in settings
         assert settings["cooldown_seconds"] == 4.0
+
+    def test_silence_threshold_never_persisted_and_legacy_key_removed(
+        self, config_file
+    ):
+        # config_file fixture ships a legacy settings.silence_threshold_db
+        # (-48.0); saving must drop it so a config carried between venues
+        # can't silently reapply a stale threshold.
+        before = json.loads(config_file.read_text(encoding="utf-8"))
+        assert before["settings"]["silence_threshold_db"] == -48.0
+        save_launcher_settings(config_file, _mic_opts(config_file, silence_threshold_db=-40.0))
+        settings = json.loads(config_file.read_text(encoding="utf-8"))["settings"]
+        assert "silence_threshold_db" not in settings
+        # Unrelated keys survive untouched.
+        assert settings["custom_key"] == "keep-me"
+        assert settings["oltw_kwargs"] == {"search_width": 300}
 
     def test_only_active_source_device_key_written(self, config_file):
         # mic mode: loopback_device must NOT be touched
@@ -346,8 +364,10 @@ class TestReadLauncherSettings:
         assert saved["input_source"] == INPUT_SOURCE_MIC
         assert saved["slide_url"] is None
         assert saved["play_audio"] is False
-        # flat keys come from the existing settings
-        assert saved["silence_threshold_db"] == -48.0
+        # The silence threshold is not read back from config (mic/venue
+        # dependent) — always the default, ignoring the fixture's -48.0.
+        assert saved["silence_threshold_db"] == DEFAULT_SILENCE_THRESHOLD_DB
+        # cooldown is still a config-backed flat key
         assert saved["cooldown_seconds"] == 5.0
         assert saved["mic_device"] is None
 
