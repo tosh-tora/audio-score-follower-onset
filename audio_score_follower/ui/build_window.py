@@ -146,7 +146,6 @@ def generate_config_dict(score: Path, built_dir: Path, config_dir: Path) -> dict
     return {
         "settings": {
             "cooldown_seconds": 3.0,
-            "silence_threshold_db": -55.0,
             "mic_device": None,
         },
         "movements": [

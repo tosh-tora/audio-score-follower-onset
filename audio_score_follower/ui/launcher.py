@@ -24,6 +24,7 @@ from typing import Optional
 
 from audio_score_follower.launch_options import (
     DEFAULT_SILENCE_MARGIN_DB,
+    DEFAULT_SILENCE_THRESHOLD_DB,
     INPUT_SOURCE_LOOPBACK,
     INPUT_SOURCE_MIC,
     INPUT_SOURCE_WAV,
@@ -284,10 +285,10 @@ class _LauncherWindow:
         # --- tuning / verbose ---------------------------------------------
         frm_adv = ttk.LabelFrame(body, text="詳細設定")
         frm_adv.pack(fill="x", **pad)
-        ttk.Label(frm_adv, text="無音判定閾値 silence_threshold_db (dBFS):").grid(
+        ttk.Label(frm_adv, text="無音判定閾値 (dBFS・毎回測定):").grid(
             row=0, column=0, sticky="w", padx=8, pady=4
         )
-        self.var_silence = tk.StringVar(value="-55.0")
+        self.var_silence = tk.StringVar(value=str(DEFAULT_SILENCE_THRESHOLD_DB))
         ttk.Spinbox(
             frm_adv, textvariable=self.var_silence,
             from_=-120.0, to=0.0, increment=1.0, width=8,
@@ -298,7 +299,8 @@ class _LauncherWindow:
         self.button_measure.grid(row=0, column=2, sticky="w", padx=8, pady=4)
         self.label_measure = ttk.Label(
             frm_adv,
-            text="無音（暗騒音のみ）の状態でマイクから測定し、閾値を自動設定します",
+            text=("無音（暗騒音のみ）の状態でマイクから測定し、閾値を自動設定します"
+                  "（マイク・会場依存のため config には保存されません。毎回測定してください）"),
             foreground="#888", font=self._font_small,
         )
         self.label_measure.grid(

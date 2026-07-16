@@ -30,7 +30,6 @@ class ConfigLoader:
         {
           "settings": {
             "cooldown_seconds": 3.0,
-            "silence_threshold_db": -55.0,
             "mic_device": null,
             "loopback_device": null,
             "launcher": {"...": "ランチャー GUI (ui/launcher.py) が保存する起動
@@ -77,10 +76,9 @@ class ConfigLoader:
         self._validate()
 
         logger.info(
-            "Config loaded: %d movements, cooldown=%.1fs, silence_threshold=%.1f dBFS",
+            "Config loaded: %d movements, cooldown=%.1fs",
             len(self.movements),
             self.get_cooldown_seconds(),
-            self.get_silence_threshold_db(),
         )
 
     def resolve_path(self, relative_or_absolute: str) -> str:
@@ -166,8 +164,10 @@ class ConfigLoader:
     def get_cooldown_seconds(self) -> float:
         return self.settings.get("cooldown_seconds", 3.0)
 
-    def get_silence_threshold_db(self) -> float:
-        return self.settings.get("silence_threshold_db", -55.0)
+    # NOTE: there is intentionally no get_silence_threshold_db(). The gate
+    # threshold is mic/venue-dependent and no longer stored in config — the
+    # launcher measures it per session and passes it to the app in memory
+    # (see main.AudioScoreFollowerApp / launch_options.DEFAULT_SILENCE_THRESHOLD_DB).
 
     def get_gate_activation_sec(self) -> float:
         """Sustained sound required before the silence gate OPENS.
