@@ -25,9 +25,11 @@
   3. mismatch フラグが立っていない（`state.is_mismatched` — 「mismatch 検知 + 有界前方リカバリ」参照）
   4. `CooldownTimer.should_trigger()`（`settings.cooldown_seconds`、既定 3.0s）が許可
   5. その小節が未発火（`_fired_trigger_measures` で重複防止）
+  6. **演奏終了していない**（`state.performance_ended` — 「■ 演奏終了」/ E で立つ。下記）
 - `_TRIGGER_CONFIDENCE_FLOOR` (0.30) は `lock_in_confidence` (0.45) より意図的に低い: 旧 live-score-sync の InertiaEngine が担っていた「整列が安定するまで発火しない」ガードの代替で、起動直後の measure-1 誤発火だけを防げばよいため
 - `--slide-url` 省略時は `NullSlideController`（no-op）で**ドライラン**起動する
 - 手動オーバライド: →/Space キーで「次の未発火トリガーへ進めて発火済みにマーク + OLTW を seek」（`TriggerEngine.advance_to_next_trigger`）、← で直前の発火を取り消して戻る（`back_to_prev_trigger`。発火順は小節順管理）
+- **演奏終了（「■ 演奏終了」ボタン / E キー、`main.end_performance`、Issue #44）**: 演奏が終わっても follower は追随を続け拍手・環境音で小節が進みトリガーが出てしまう。押下で **OLTW ワーカーを停止**（`_stop_worker` でフレーム供給を絶つ）+ `state.performance_ended=True`（トリガーループが発火抑止）。`freeze()` は使わない（lock-in 後は慣性進行を始めてしまい停止にならない — 「二段構えの lock-in」参照）。当該楽章に対して終端的で、再追随は R（再ロード）/ N（次楽章）。フラグは `_load_movement` / `AppState.set_movement` でクリア。GUI は `⏹ 演奏終了（停止中）` を表示し start/end ボタンを非表示。silence gate poll は `_performance_ended` 時に freeze/unfreeze を発行しない（レベル表示は継続）
 
 「**スライドが送られない / 二重に送られる**」系の問題は `TriggerEngine`（`core/trigger_engine.py`）と `CooldownTimer`、Playwright 側の問題は `core/slide_controller.py` を見る。
 

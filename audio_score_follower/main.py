@@ -29,6 +29,9 @@ Keys (on the operator GUI window):
     L            : force OLTW lock-in (operator says "music has started";
                    arms inertia mode immediately so silence-gate freezes
                    become inertia progression instead of position-fix)
+    E            : end performance (operator says "music has stopped";
+                   drops the OLTW worker so tracking + triggers halt.
+                   Re-follow with R / N)
     → / Space    : manual slide advance
     ←            : manual slide back
     ↑ / ↓        : nudge silence-gate threshold by ±0.2 dB (mic mode only)
@@ -150,6 +153,11 @@ class AudioScoreFollowerApp:
         # pressed start, any threshold crossing means music, so the gate's
         # job (blocking pre-performance noise) is done.
         self._performance_confirmed = not self._mic_mode
+        # Operator pressed 「■ 演奏終了」 (or E): the OLTW worker is stopped
+        # so no more frames feed the follower (measure count freezes) and
+        # triggers are suppressed. Terminal for the movement — cleared on
+        # the next _load_movement. Applies to every input mode.
+        self._performance_ended = False
 
         # Wall-clock time of the most recent user-initiated forward seek.
         # Written by _record_seek (via TriggerEngine.notify_seek), read by
@@ -182,6 +190,7 @@ class AudioScoreFollowerApp:
             self.root,
             self.state,
             on_start=self.manual_start,
+            on_end=self.end_performance,
             on_adjust_threshold=self.adjust_silence_threshold,
         )
 
@@ -290,7 +299,7 @@ class AudioScoreFollowerApp:
 
         logger.info(
             "Ready. N=next movement, R=reload, L=force lock-in, "
-            "→/Space=manual next slide, ←=manual back."
+            "E=end performance, →/Space=manual next slide, ←=manual back."
         )
         self.root.protocol("WM_DELETE_WINDOW", self._on_gui_closing)
         try:
@@ -396,6 +405,10 @@ class AudioScoreFollowerApp:
         self.oltw = loaded.oltw
         onset_enabled = loaded.onset_enabled
 
+        # A (re)load resumes tracking: clear any prior 「■ 演奏終了」 stop
+        # (all modes). set_movement() clears the state-side flag too.
+        self._performance_ended = False
+
         if self._mic_mode:
             # Park until the operator presses 「▶ 演奏開始」. The gate
             # poll keeps the follower frozen while _performance_started
@@ -471,7 +484,12 @@ class AudioScoreFollowerApp:
             mic_db = self.audio_monitor.get_level_db()
             gate_active = mic_available and not self.audio_monitor.is_active()
 
-            if not self._performance_started:
+            if self._performance_ended:
+                # Operator pressed 「■ 演奏終了」: the worker is stopped, so
+                # leave the follower alone (no freeze/unfreeze) and just
+                # keep the level display live below.
+                pass
+            elif not self._performance_started:
                 # Waiting for the operator's start press: hold the
                 # follower frozen regardless of the gate, but keep the
                 # level display live. _prev_gate_active stays True so
@@ -578,6 +596,12 @@ class AudioScoreFollowerApp:
         if self.oltw is None:
             logger.warning("start pressed but OLTW not initialised yet")
             return
+        if self._performance_ended:
+            # Follower stopped by 「■ 演奏終了」 — the worker is gone, so a
+            # start press here would only force_lock_in a dead follower.
+            # Re-follow via R (reload) or N (next movement) instead.
+            logger.info("start pressed but performance ended — press R/N to re-follow")
+            return
         if self._mic_mode and not self._performance_started:
             self._performance_started = True
             self._start_press_time = time.monotonic()
@@ -598,6 +622,40 @@ class AudioScoreFollowerApp:
             return
         self.oltw.force_lock_in()
         logger.info("Manual lock-in triggered by operator")
+
+    def end_performance(self) -> None:
+        """Operator end press (E key or GUI 「■ 演奏終了」 button).
+
+        The follower keeps tracking after the music stops (applause and
+        ambient noise advance the measure count and can fire triggers on
+        the way, Issue #44). This is the operator's hard stop: we drop the
+        OLTW worker so no more frames feed the follower — the measure count
+        freezes and triggers are suppressed (TriggerEngine skips firing
+        while ``state.performance_ended``). ``freeze()`` is deliberately
+        NOT used: after lock-in it arms inertia progression (see CLAUDE.md
+        「二段構えの lock-in」), which would keep advancing rather than stop.
+
+        Terminal for the current movement. Re-follow with R (reload) or N
+        (next movement); both rebuild the worker and reset this flag.
+
+        Public (no leading underscore) so the GUI can wire a button click
+        directly to it.
+        """
+        if self._performance_ended:
+            logger.info("end pressed but performance already ended (no-op)")
+            return
+        if self.worker is None:
+            logger.info("end pressed but no follower worker is running (no-op)")
+            return
+        self._performance_ended = True
+        self._stop_worker()
+        self.state.set_performance_ended(True)
+        # Clear the mic-mode start-waiting flags so the GUI doesn't show a
+        # start affordance under the ended banner.
+        self.state.set_waiting_for_start(False)
+        self.state.set_awaiting_first_sound(False)
+        self.state.set_next_trigger(None)
+        logger.info("Performance ended by operator — follower stopped; press R/N to re-follow")
 
     def adjust_silence_threshold(self, delta_db: float) -> None:
         """Nudge the silence-gate threshold at runtime (↑/↓ keys).
@@ -635,6 +693,9 @@ class AudioScoreFollowerApp:
         def _on_l(_e: tk.Event) -> None:
             self.manual_start()
 
+        def _on_e(_e: tk.Event) -> None:
+            self.end_performance()
+
         def _on_next(_e: tk.Event) -> None:
             self.trigger_engine.advance_to_next_trigger()
 
@@ -661,12 +722,14 @@ class AudioScoreFollowerApp:
         self.root.bind_all("<KeyPress-R>", _on_r)
         self.root.bind_all("<KeyPress-l>", _on_l)
         self.root.bind_all("<KeyPress-L>", _on_l)
+        self.root.bind_all("<KeyPress-e>", _on_e)
+        self.root.bind_all("<KeyPress-E>", _on_e)
         self.root.bind_all("<KeyPress-Right>", _on_next)
         self.root.bind_all("<KeyPress-space>", _on_next)
         self.root.bind_all("<KeyPress-Left>", _on_prev)
         self.root.bind_all("<KeyPress-Up>", _on_thr_up)
         self.root.bind_all("<KeyPress-Down>", _on_thr_down)
-        logger.info("Keys bound (app-wide): N R L → ← Space ↑ ↓")
+        logger.info("Keys bound (app-wide): N R L E → ← Space ↑ ↓")
 
 
 def main() -> int:
