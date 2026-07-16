@@ -288,10 +288,22 @@ class AudioScoreFollowerApp:
 
         logger.info("Launching SlideController …")
         self.slide_controller.start()
-        if not self.slide_controller.wait_ready(timeout=30.0):
-            logger.error(
-                "SlideController not ready: %s", self.slide_controller.last_error
-            )
+        ready = self.slide_controller.wait_ready(timeout=30.0)
+        slide_error = self.slide_controller.last_error
+        if slide_error is not None:
+            if isinstance(slide_error, ImportError):
+                warning = (
+                    "スライド操作の準備に失敗しました: Playwright が未インストールです。\n"
+                    "venv で `pip install playwright` と `playwright install chromium` を実行してください。"
+                )
+            else:
+                warning = f"スライド操作の準備に失敗しました: {slide_error}"
+            logger.error("SlideController failed: %s", slide_error)
+            self.state.set_slide_controller_warning(warning)
+        elif not ready:
+            warning = "スライドの読み込みが30秒以内に完了しませんでした。URL を確認してください。"
+            logger.error(warning)
+            self.state.set_slide_controller_warning(warning)
 
         self._bind_keys()
 

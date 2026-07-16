@@ -147,7 +147,7 @@ class SlideController:
         except ImportError as exc:
             self._fatal_error = exc
             logger.error(
-                "Playwright is not installed. Inside WSL2, run:\n"
+                "Playwright is not installed. In the project venv, run:\n"
                 "    pip install playwright\n"
                 "    playwright install chromium"
             )

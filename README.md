@@ -76,6 +76,10 @@ pip install -e ".[dev]"
 playwright install chromium
 ```
 
+**注意**: `pip install -e ".[dev]"` で Playwright 本体は入るが、Chromium 実体は別途
+`playwright install chromium` が必須（上記コマンドに含まれている）。この手順を
+飛ばすと `--slide-url` 起動時にブラウザが開かず、GUI にオレンジの警告バナーが表示される。
+
 **synctoolbox の注意**: 上記 `pip install` で synctoolbox は古い numpy / pandas / music21 を
 要求して解決に失敗することがある (1.4.1 時点)。失敗した場合は `--no-deps` で入れ直す:
 

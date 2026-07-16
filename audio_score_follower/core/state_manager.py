@@ -111,6 +111,11 @@ class AppState:
         # no warning to show. Set once at startup, not polled live.
         self.mic_effects_warning: Optional[str] = None
 
+        # One-shot startup warning when SlideController failed to become ready
+        # (Playwright not installed, browser launch/goto failure, or 30s
+        # timeout). None = no warning to show. Set once at startup.
+        self.slide_controller_warning: Optional[str] = None
+
     def get_all(self) -> dict:
         """
         Atomically get snapshot of all state.
@@ -143,6 +148,7 @@ class AppState:
                 'awaiting_first_sound': self.awaiting_first_sound,
                 'start_gate_timeout_sec': self.start_gate_timeout_sec,
                 'mic_effects_warning': self.mic_effects_warning,
+                'slide_controller_warning': self.slide_controller_warning,
                 'is_locked_in': self.is_locked_in,
                 'is_in_inertia': self.is_in_inertia,
                 'inertia_elapsed_sec': self.inertia_elapsed_sec,
@@ -299,6 +305,11 @@ class AppState:
         """Record (or clear) the startup mic-noise-suppression warning."""
         with self._lock:
             self.mic_effects_warning = message
+
+    def set_slide_controller_warning(self, message: Optional[str]) -> None:
+        """Record (or clear) the startup SlideController failure warning."""
+        with self._lock:
+            self.slide_controller_warning = message
 
     def set_follower_mode(
         self,
