@@ -13,12 +13,14 @@ than capturing (soon-stale) references. A ``notify_seek`` callback lets
 the app record the wall-clock time of forward re-anchors so its jump
 detector can suppress the expected post-seek jump.
 
-Firing conditions (all AND, unchanged from the original inline loop):
+Firing conditions (all AND):
   1. current measure == a trigger measure
   2. smoothed confidence >= _TRIGGER_CONFIDENCE_FLOOR
   3. not flagged as mismatched
   4. CooldownTimer.should_trigger() allows it
   5. that measure hasn't fired yet (_fired_trigger_measures)
+  6. the operator hasn't ended the performance (state.performance_ended,
+     Issue #44 — 「■ 演奏終了」 / E stops the worker + suppresses triggers)
 """
 
 from __future__ import annotations
@@ -97,6 +99,14 @@ class TriggerEngine:
                 current_measure = snapshot["measure"]
 
                 if not triggers:
+                    time.sleep(interval)
+                    continue
+
+                # Operator pressed 「■ 演奏終了」 (Issue #44): the follower
+                # worker is stopped, so the measure count is stale. Suppress
+                # firing and clear the next-trigger display.
+                if snapshot.get("performance_ended"):
+                    self.state.set_next_trigger(None)
                     time.sleep(interval)
                     continue
 

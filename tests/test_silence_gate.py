@@ -66,6 +66,7 @@ def _make_app() -> AudioScoreFollowerApp:
     app.state = AppState()
     app._performance_started = False
     app._performance_confirmed = False
+    app._performance_ended = False
     app._prev_gate_active = True
     app._start_press_time = None
     app._start_gate_timeout_sec = 3.0

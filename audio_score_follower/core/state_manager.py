@@ -90,6 +90,12 @@ class AppState:
         # Always False in wav/loopback modes (auto-start).
         self.waiting_for_start: bool = False
 
+        # Operator pressed 「■ 演奏終了」 (or E): the follower worker has
+        # been stopped so tracking no longer advances, and triggers are
+        # suppressed. Terminal for the current movement — reset to False
+        # on the next movement (re)load. Applies to every input mode.
+        self.performance_ended: bool = False
+
         # Mic-mode start pressed but the performance is not confirmed
         # yet: the silence gate is waiting for the first sustained
         # sound, or the start-gate timeout (見切りスタート, Issue #41)
@@ -133,6 +139,7 @@ class AppState:
                 'mic_monitor_available': self.mic_monitor_available,
                 'silence_threshold_db': self.silence_threshold_db,
                 'waiting_for_start': self.waiting_for_start,
+                'performance_ended': self.performance_ended,
                 'awaiting_first_sound': self.awaiting_first_sound,
                 'start_gate_timeout_sec': self.start_gate_timeout_sec,
                 'mic_effects_warning': self.mic_effects_warning,
@@ -229,6 +236,7 @@ class AppState:
             self.is_mismatched = False
             self.cooldown_active = False
             self.next_trigger_measure = None
+            self.performance_ended = False
 
     def set_mic_level(
         self,
@@ -260,6 +268,16 @@ class AppState:
         """Update the mic-mode manual-start waiting flag."""
         with self._lock:
             self.waiting_for_start = waiting
+
+    def set_performance_ended(self, ended: bool):
+        """Update the operator-ended flag (「■ 演奏終了」 / E key).
+
+        True after the operator stops the follower; suppresses trigger
+        firing and drives the GUI 'ended' mode. Reset by set_movement()
+        on the next (re)load.
+        """
+        with self._lock:
+            self.performance_ended = bool(ended)
 
     def set_awaiting_first_sound(
         self, awaiting: bool, timeout_sec: float = 0.0

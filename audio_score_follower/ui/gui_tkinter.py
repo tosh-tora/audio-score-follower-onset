@@ -67,6 +67,7 @@ class FollowerGUI:
         state: AppState,
         *,
         on_start: Optional[Callable[[], None]] = None,
+        on_end: Optional[Callable[[], None]] = None,
         on_adjust_threshold: Optional[Callable[[float], None]] = None,
     ):
         """
@@ -80,6 +81,11 @@ class FollowerGUI:
                 ``AudioScoreFollowerApp.manual_start``. Optional;
                 passes a no-op if omitted so the GUI can run standalone
                 in tests.
+            on_end: callback fired when the operator clicks the
+                "■ 演奏終了" button. Wired by ``main.py`` to
+                ``AudioScoreFollowerApp.end_performance`` (stops the
+                follower so tracking/triggers halt). Optional; no-op if
+                omitted.
             on_adjust_threshold: callback fired with a dB delta when
                 the operator clicks the silence-threshold −/＋ buttons
                 next to the mic level readout. Wired by ``main.py`` to
@@ -90,6 +96,7 @@ class FollowerGUI:
         self.root = root
         self.state = state
         self._on_start = on_start or (lambda: None)
+        self._on_end = on_end or (lambda: None)
         self._on_adjust_threshold = on_adjust_threshold or (lambda _d: None)
 
         self.root.title("Sequential Live Follower")
@@ -275,6 +282,20 @@ class FollowerGUI:
         # on every 100ms poll tick).
         self._button_visible = True
 
+        # 「■ 演奏終了」 button (Issue #44): the follower keeps tracking after
+        # the music stops, so the operator needs an explicit halt. Shown
+        # while the performance is running; hidden while waiting-for-start
+        # and after the performance has ended. Packed to the RIGHT before
+        # the start button so it sits inboard of it.
+        self.button_end = tk.Button(
+            self.mode_frame,
+            text="■ 演奏終了",
+            font=(family, _BUTTON_FONT_SIZE, "bold"),
+            command=self._on_end_clicked,
+            padx=12, pady=6,
+        )
+        self._end_button_visible = False
+
         # 次のトリガー
         trigger_font = font.Font(family=family, size=_TRIGGER_FONT_SIZE)
         self.label_next_trigger = tk.Label(
@@ -294,7 +315,8 @@ class FollowerGUI:
             text=(
                 "→/Space: スライドを進める   ←: スライドを戻す   "
                 "N: 次の楽章   R: 現在の楽章を再ロード   "
-                "L / ボタン: 演奏開始（押しズレ±数秒は自動補正）"
+                "L / ボタン: 演奏開始（押しズレ±数秒は自動補正）   "
+                "E / ボタン: 演奏終了（追随を停止）"
             ),
             font=(family, _HINT_FONT_SIZE),
             bg="#f0f0f0",
@@ -313,6 +335,16 @@ class FollowerGUI:
         # Schedule a 1-second flash so the operator sees the click landed.
         now_ms = int(self.root.tk.call("clock", "milliseconds"))
         self._flash_until_ms = now_ms + 1000
+
+    def _on_end_clicked(self) -> None:
+        """Button handler — forward to the end-performance callback. The
+        'ended' mode is rendered on the next poll from the state flag, so
+        no flash is needed here (the panel visibly changes to the stopped
+        banner)."""
+        try:
+            self._on_end()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("end_performance callback raised: %s", exc, exc_info=True)
 
     def _render_follower_mode(self, state: dict) -> None:
         """Render the follower-mode panel based on the AppState snapshot.
@@ -343,10 +375,16 @@ class FollowerGUI:
         is_locked = state.get('is_locked_in', False)
         in_inertia = state.get('is_in_inertia', False)
         waiting_for_start = state.get('waiting_for_start', False)
+        performance_ended = state.get('performance_ended', False)
         elapsed = float(state.get('inertia_elapsed_sec', 0.0))
         cap = float(state.get('inertia_cap_sec', 10.0))
 
-        if waiting_for_start:
+        if performance_ended:
+            # Operator pressed 「■ 演奏終了」: follower stopped. Wins over
+            # every tracking state (is_locked may still be latched).
+            bg, fg = _MODE_COLOR_WAITING
+            text = "⏹ 演奏終了（停止中）— R で再追随 / N で次の楽章"
+        elif waiting_for_start:
             bg, fg = _MODE_COLOR_WAITING
             text = "⏸ 開始待ち（▶ 演奏開始 を押してください）"
         elif state.get('awaiting_first_sound', False) and not is_locked:
@@ -384,14 +422,36 @@ class FollowerGUI:
 
         self.label_mode.config(text=text, bg=bg, fg=fg)
 
-        # Hide the "▶ 楽章開始" button after lock-in so the panel stops
-        # showing a control that has no effect. Re-show it if lock-in
-        # somehow drops (e.g. movement reload via R clears _locked_in).
-        should_show_button = not is_locked
-        if should_show_button and not self._button_visible:
+        # Button visibility (差分時のみ pack/forget — pitfall #6):
+        #   ended            → neither (re-follow is R / N)
+        #   waiting-for-start→ start only
+        #   running          → end always; start while pre-lock-in so the
+        #                      2nd press can still force lock-in
+        # The "▶ 演奏開始" button hides after lock-in because it becomes a
+        # no-op there; it re-shows if lock-in drops (e.g. reload via R).
+        if performance_ended:
+            show_start = False
+            show_end = False
+        elif waiting_for_start:
+            show_start = True
+            show_end = False
+        else:
+            show_start = not is_locked
+            show_end = True
+
+        # Both pack to the RIGHT of the mode label; relative order is
+        # cosmetic (only pre-lock-in shows both at once).
+        if show_end and not self._end_button_visible:
+            self.button_end.pack(side=tk.RIGHT, padx=(10, 0))
+            self._end_button_visible = True
+        elif not show_end and self._end_button_visible:
+            self.button_end.pack_forget()
+            self._end_button_visible = False
+
+        if show_start and not self._button_visible:
             self.button_start.pack(side=tk.RIGHT, padx=(10, 0))
             self._button_visible = True
-        elif not should_show_button and self._button_visible:
+        elif not show_start and self._button_visible:
             self.button_start.pack_forget()
             self._button_visible = False
 
